@@ -82,6 +82,13 @@ class Processor:
                         version_id: str | None = None
                         if rule_mode:
                             span = validated.candidate.evidence[0]
+                            subject_key = validated.candidate.subject
+                            previous = self.repository.db.execute(
+                                """SELECT v.statement, v.status FROM memories m
+                                JOIN memory_versions v ON v.id=m.current_version_id AND v.namespace_id=m.namespace_id
+                                WHERE m.namespace_id=? AND m.kind=? AND m.subject_key=?""",
+                                (namespace_id, validated.candidate.kind, subject_key),
+                            ).fetchone()
                             rule = RuleCandidate(
                                 validated.candidate.kind, validated.candidate.subject, validated.candidate.statement, span.start_offset, span.end_offset
                             )
@@ -90,12 +97,12 @@ class Processor:
                                 "SELECT current_version_id FROM memories WHERE id=? AND namespace_id=?", (memory_id, namespace_id)
                             ).fetchone()
                             version_id = cast(str | None, row["current_version_id"] if row else None)
-                            action = (
-                                "INSERT"
-                                if version_id
-                                and not self.repository.db.execute("SELECT 1 FROM memory_versions WHERE memory_id=? AND version>1", (memory_id,)).fetchone()
-                                else "SUPERSEDE"
-                            )
+                            if previous and previous["status"] == "active" and previous["statement"] == validated.candidate.statement:
+                                action = "REINFORCE"
+                            elif previous:
+                                action = "SUPERSEDE"
+                            else:
+                                action = "INSERT"
                         else:
                             reconciled_memory_id, action, reconciled_version_id = self.repository.reconcile_candidate(namespace_id, event, validated, run_id)
                             memory_id = reconciled_memory_id

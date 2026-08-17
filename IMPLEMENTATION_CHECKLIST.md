@@ -54,3 +54,4 @@
 - [x] Bounded limit/offset pagination for inspection collections
 - [x] Rule-only extraction for declared outcome/constraint/procedure/attempt/task/question kinds
 - [x] Conservative sentence-start declarative fact extraction with speculation rejection
+- [x] Rule-mode reconciliation audit correctly records INSERT versus REINFORCE
