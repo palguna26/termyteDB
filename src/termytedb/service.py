@@ -134,6 +134,11 @@ def create_app(
             raise HTTPException(status_code=404, detail="event not found")
         return event
 
+    @app.get("/v1/evidence", response_model=list[dict[str, object]])
+    def evidence(namespace_id: str = Query(...), limit: int = Query(100, ge=1, le=100), offset: int = Query(0, ge=0)) -> list[dict[str, object]]:
+        require_namespace(namespace_id)
+        return engine.evidence(namespace_id, limit, offset)
+
     @app.post("/v1/search")
     def search(request: SearchRequest) -> list[SearchResult]:
         require_namespace(request.namespace_id)
