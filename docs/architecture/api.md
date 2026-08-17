@@ -6,19 +6,31 @@ The stable interface is framework-neutral and uses namespace-scoped IDs.
 POST /v1/events
 POST /v1/events:batch
 POST /v1/process
+POST /v1/jobs/{job_id}/cancel
+GET  /v1/jobs
 POST /v1/search
 POST /v1/context
+GET  /v1/context/requests
+GET  /v1/extraction/runs
+GET  /v1/extraction/decisions
 GET  /v1/events/{event_id}?namespace_id=...
 GET  /v1/memories/{memory_id}?namespace_id=...
 GET  /v1/memories/{memory_id}/history?namespace_id=...
 POST /v1/memories/{memory_id}/invalidate
 POST /v1/feedback
+GET  /v1/feedback?namespace_id=...
+GET  /v1/episodes?namespace_id=...
+PATCH /v1/episodes/{episode_id}
 GET  /v1/export?namespace_id=...
 POST /v1/import?namespace_id=...
 GET  /v1/integrity
 GET  /health
 GET  /ready
 ```
+
+FastAPI generates the contract at `/openapi.json` and the interactive
+documentation at `/docs`. The required versioned operation set is covered by
+the service contract test.
 
 Python:
 

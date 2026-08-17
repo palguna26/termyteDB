@@ -5,6 +5,18 @@ from fastapi.testclient import TestClient
 from termytedb.service import create_app
 
 
+def test_openapi_contract_contains_versioned_operations(tmp_path):
+    client = TestClient(create_app(str(tmp_path / "openapi.sqlite")))
+    schema = client.get("/openapi.json").json()
+    paths = schema["paths"]
+    required = {
+        ("/v1/events", "post"), ("/v1/events:batch", "post"), ("/v1/process", "post"),
+        ("/v1/search", "post"), ("/v1/context", "post"), ("/v1/export", "get"),
+        ("/v1/import", "post"), ("/v1/integrity", "get"), ("/ready", "get"),
+    }
+    assert required.issubset({(path, method) for path, operations in paths.items() for method in operations})
+
+
 def test_http_vertical_slice(tmp_path):
     client = TestClient(create_app(str(tmp_path / "api.sqlite")))
     event = {

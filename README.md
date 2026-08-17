@@ -50,6 +50,7 @@ python -m termytedb.evaluation tests/fixtures/extraction_cases.jsonl
 python -m termytedb.evaluation tests/fixtures/retrieval_cases.jsonl --retrieval
 python -m termytedb.evaluation tests/fixtures/continuation_cases.jsonl --continuation
 python -m termytedb.evaluation tests/fixtures/longmemeval_cases.jsonl --longmemeval
+python -m termytedb.evaluation tests/fixtures/reconciliation_cases.jsonl --reconciliation
 ```
 
 See [docs/release-readiness.md](docs/release-readiness.md) for verified scope and limitations.
