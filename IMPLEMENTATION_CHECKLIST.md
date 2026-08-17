@@ -61,3 +61,4 @@
 - [x] Production-path reconciliation evaluator with labelled action fixtures
 - [x] Namespace-scoped durable job cancellation and bounded processing timeout
 - [x] Integrity detection for tampered canonical event payloads
+- [x] Integrity-aware readiness endpoint with unhealthy-store response

@@ -231,6 +231,9 @@ def create_app(
 
     @app.get("/ready")
     def ready() -> dict[str, str]:
+        report = check_database(engine.database)
+        if not report.ok:
+            raise HTTPException(status_code=503, detail="database is not ready")
         return {"status": "ready"}
 
     @app.get("/v1/integrity")
