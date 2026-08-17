@@ -10,7 +10,9 @@ LongMemEval-s gets an adapter that transforms each item into the same event/evid
 
 Milestone 2 adds `tests/fixtures/extraction_cases.jsonl` with 50 labelled cases and `python -m termytedb.evaluation <fixture>`. The command reports a deterministic rule-only baseline. Reconciliation and temporal scores remain zero until labelled state transitions are run through the model-provider harness.
 
-The retrieval evaluator accepts JSONL cases containing `query`, `evidence`, and `expected_statement`. `python -m termytedb.evaluation <fixture> --retrieval` writes Recall@k, MRR, NDCG@k, elapsed time, and case count after using the production ingest, process, and search path. The checked-in four-case smoke fixture measured Recall@5=1.0, MRR=1.0, and NDCG@5=1.0 locally; this is a regression fixture, not a general quality claim.
+The retrieval evaluator accepts JSONL cases containing `query`, `evidence`, and `expected_statement`. `python -m termytedb.evaluation <fixture> --retrieval` writes Recall@k, Precision@k, MRR, NDCG@k, elapsed time, and case count after using the production ingest, process, and search path. The checked-in four-case smoke fixture measured Recall@5=1.0, MRR=1.0, and NDCG@5=1.0 locally; this is a regression fixture, not a general quality claim.
+
+Namespace isolation fixtures run with `python -m termytedb.evaluation <fixture> --isolation` and exercise separate namespaces through production search and context assembly. They report search/context leak counts and a zero-leak result.
 
 Reconciliation fixtures contain ordered event text and expected actions. `python -m termytedb.evaluation <fixture> --reconciliation` runs the production ingest and processing path and reports reconciliation accuracy. The checked-in fixture covers INSERT, REINFORCE, and DISPUTE; it is a deterministic regression fixture, not a broad quality claim.
 

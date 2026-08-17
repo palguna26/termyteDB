@@ -71,6 +71,7 @@ def evaluate_retrieval_fixture(path: str | Path) -> dict[str, float | int]:
             engine.ingest({"namespace_id": namespace, "idempotency_key": f"fixture-{index}", "type": "conversation", "payload": event})
         engine.process(namespace, limit=max(1, len(cases)))
         hits: list[int] = []
+        precisions: list[float] = []
         ndcgs: list[float] = []
         reciprocal = 0.0
         for case in cases:
@@ -78,6 +79,7 @@ def evaluate_retrieval_fixture(path: str | Path) -> dict[str, float | int]:
             expected = str(case["expected_statement"]).casefold()
             relevance = [int(expected in result.statement.casefold()) for result in results]
             hits.append(int(any(relevance)))
+            precisions.append(sum(relevance) / max(1, int(case.get("k", 5))))
             ndcgs.append(_ndcg(relevance, 1))
             if 1 in relevance:
                 reciprocal += 1 / (relevance.index(1) + 1)
@@ -88,9 +90,31 @@ def evaluate_retrieval_fixture(path: str | Path) -> dict[str, float | int]:
         "cases": total,
         "elapsed_ms": round(elapsed_ms, 3),
         "recall_at_k": round(sum(hits) / total, 4) if total else 0.0,
+        "precision_at_k": round(sum(precisions) / total, 4) if total else 0.0,
         "mrr": round(reciprocal / total, 4) if total else 0.0,
         "ndcg_at_k": round(sum(ndcgs) / total, 4) if total else 0.0,
     }
+
+
+def evaluate_isolation_fixture(path: str | Path) -> dict[str, float | int]:
+    """Measure namespace filtering through production search and context paths."""
+    cases = [json.loads(line) for line in Path(path).read_text(encoding="utf-8").splitlines() if line.strip()]
+    search_leaks = context_leaks = 0
+    with tempfile.TemporaryDirectory(prefix="termytedb-isolation-") as directory:
+        engine = TermyteDB(Path(directory) / "isolation.sqlite")
+        for index, case in enumerate(cases):
+            owner = str(case["owner_namespace"])
+            other = str(case["other_namespace"])
+            engine.ingest({"namespace_id": owner, "idempotency_key": f"owner-{index}", "type": "decision", "payload": {"text": case["owner_text"]}})
+            engine.ingest({"namespace_id": other, "idempotency_key": f"other-{index}", "type": "decision", "payload": {"text": case["other_text"]}})
+            engine.process(owner)
+            engine.process(other)
+            query = str(case["query"])
+            other_marker = str(case["other_text"]).casefold()
+            search_leaks += sum(int(other_marker in result.statement.casefold()) for result in engine.search(owner, query))
+            context_leaks += int(any(other_marker in result.statement.casefold() for result in engine.context(owner, query).results))
+        engine.close()
+    return {"cases": len(cases), "search_leaks": search_leaks, "context_leaks": context_leaks, "leakage_free": int(search_leaks == 0 and context_leaks == 0)}
 
 
 def evaluate_reconciliation_fixture(path: str | Path) -> dict[str, float | int]:
@@ -407,12 +431,15 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("fixture", type=Path)
     parser.add_argument("--retrieval", action="store_true", help="run the production retrieval fixture instead of extraction")
+    parser.add_argument("--isolation", action="store_true", help="run the production namespace isolation fixture")
     parser.add_argument("--continuation", action="store_true", help="run the production continuation fixture")
     parser.add_argument("--longmemeval", action="store_true", help="run the LongMemEval-shaped production adapter")
     parser.add_argument("--reconciliation", action="store_true", help="run the production reconciliation fixture")
     parser.add_argument("--temporal", action="store_true", help="run the production temporal fixture")
     arguments = parser.parse_args()
-    if arguments.temporal:
+    if arguments.isolation:
+        result = evaluate_isolation_fixture(arguments.fixture)
+    elif arguments.temporal:
         result = evaluate_temporal_fixture(arguments.fixture)
     elif arguments.reconciliation:
         result = evaluate_reconciliation_fixture(arguments.fixture)
