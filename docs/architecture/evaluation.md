@@ -11,3 +11,5 @@ LongMemEval-s gets an adapter that transforms each item into the same event/evid
 Milestone 2 adds `tests/fixtures/extraction_cases.jsonl` with 50 labelled cases and `python -m termytedb.evaluation <fixture>`. The command reports a deterministic rule-only baseline. Reconciliation and temporal scores remain zero until labelled state transitions are run through the model-provider harness.
 
 The retrieval evaluator accepts JSONL cases containing `query`, `evidence`, and `expected_statement`. `python -m termytedb.evaluation <fixture> --retrieval` writes Recall@k, MRR, NDCG@k, elapsed time, and case count after using the production ingest, process, and search path. The checked-in four-case smoke fixture measured Recall@5=1.0, MRR=1.0, and NDCG@5=1.0 locally; this is a regression fixture, not a general quality claim.
+
+Continuation fixtures run with `python -m termytedb.evaluation <fixture> --continuation`. The checked-in synthetic fixture measured no-memory completion `0.0`, previous-summary completion `0.0`, and TermyteDB completion `1.0`; raw history also reached `1.0`. This demonstrates the harness and production path only, not a general agent-quality claim.
