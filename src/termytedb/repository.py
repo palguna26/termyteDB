@@ -747,7 +747,7 @@ class Repository:
             return []
         placeholders = ",".join("?" for _ in candidate_ids)
         rows = self.db.execute(
-            f"""SELECT m.id, m.kind, v.id AS version_id, v.statement, v.status
+            f"""SELECT m.id, m.kind, m.confidence, v.id AS version_id, v.statement, v.status
             FROM memory_versions v JOIN memories m ON m.id=v.memory_id AND m.namespace_id=?
             WHERE v.namespace_id=? AND v.id IN ({placeholders}) AND (? OR (v.status='active' AND m.status='active' AND v.valid_to IS NULL
               AND (v.valid_until IS NULL OR julianday(v.valid_until) > julianday('now'))))""",
@@ -757,20 +757,33 @@ class Repository:
             rows,
             key=lambda row: (-(0.6 * lexical.get(row["version_id"], 0.0) + 0.4 * vector.get(row["version_id"], 0.0)), row["version_id"]),
         )[:limit]
-        return [
-            SearchResult(
-                memory_id=uuid.UUID(row["id"]),
-                memory_version_id=uuid.UUID(row["version_id"]),
-                statement=row["statement"],
-                kind=row["kind"],
-                score=round(0.6 * lexical.get(row["version_id"], 0.0) + 0.4 * vector.get(row["version_id"], 0.0), 6),
-                lexical_score=round(lexical.get(row["version_id"], 0.0), 6),
-                vector_score=round(vector.get(row["version_id"], 0.0), 6),
-                status=row["status"],
-                citations=self._citations(namespace_id, row["version_id"]),
+        query_terms = {term.casefold() for term in query.split()}
+        results: list[SearchResult] = []
+        for row in ranked:
+            citations = self._citations(namespace_id, row["version_id"])
+            lexical_score = round(lexical.get(row["version_id"], 0.0), 6)
+            vector_score = round(vector.get(row["version_id"], 0.0), 6)
+            results.append(
+                SearchResult(
+                    memory_id=uuid.UUID(row["id"]),
+                    memory_version_id=uuid.UUID(row["version_id"]),
+                    statement=row["statement"],
+                    kind=row["kind"],
+                    score=round(0.6 * lexical_score + 0.4 * vector_score, 6),
+                    lexical_score=lexical_score,
+                    vector_score=vector_score,
+                    component_scores={
+                        "confidence": round(float(row["confidence"]), 6),
+                        "evidence_quality": round(min(1.0, len(citations) / 3), 6),
+                        "memory_type_signal": float(row["kind"].casefold() in query_terms),
+                        "temporal_signal": float(row["status"] == "active"),
+                        "staleness_penalty": float(row["status"] != "active"),
+                    },
+                    status=row["status"],
+                    citations=citations,
+                )
             )
-            for row in ranked
-        ]
+        return results
 
     def _citations(self, namespace_id: str, version_id: str) -> list[EvidenceCitation]:
         rows = self.db.execute(

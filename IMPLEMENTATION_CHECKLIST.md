@@ -76,3 +76,4 @@
 - [x] Local operations CLI for initialization, export/import, backup, and integrity
 - [x] Local benchmark command using the production performance path
 - [x] Production-path temporal evaluator for stale rejection and historical state
+- [x] Explainable retrieval component signals for confidence, evidence, type, and temporal status

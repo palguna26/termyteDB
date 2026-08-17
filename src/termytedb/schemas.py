@@ -189,6 +189,7 @@ class SearchResult(BaseModel):
     score: float
     lexical_score: float = 0.0
     vector_score: float = 0.0
+    component_scores: dict[str, float] = Field(default_factory=dict)
     status: str
     citations: list[EvidenceCitation]
 
