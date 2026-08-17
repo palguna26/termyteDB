@@ -188,6 +188,7 @@ class ContextRequest(SearchRequest):
 
 
 class ContextResponse(BaseModel):
+    request_id: UUID | None = None
     namespace_id: str
     query: str
     abstained: bool

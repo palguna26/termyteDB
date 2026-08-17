@@ -97,6 +97,9 @@ class TermyteDB:
     def jobs(self, namespace_id: str) -> list[dict[str, Any]]:
         return self.repository.list_jobs(namespace_id)
 
+    def context_requests(self, namespace_id: str) -> list[dict[str, Any]]:
+        return self.repository.list_context_requests(namespace_id)
+
     def process(self, namespace_id: str, limit: int = 100, lease_seconds: int = 30) -> ProcessResponse:
         processed, failed, dead, accepted, rejected = self.processor.process_namespace(namespace_id, limit, lease_seconds)
         return ProcessResponse(processed=processed, failed=failed, dead_lettered=dead, accepted=accepted, rejected=rejected)
@@ -114,6 +117,7 @@ class TermyteDB:
 
     def context(self, namespace_id: str, query: str, token_budget: int = 500, limit: int = 10) -> ContextResponse:
         result = build_context(self.repository, namespace_id, query, limit, token_budget)
+        result.request_id = UUID(self.repository.record_context_request(namespace_id, query, token_budget, result))
         log(
             self.logger,
             logging.INFO,

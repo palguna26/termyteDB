@@ -48,3 +48,4 @@
 - [x] Optional HTTP namespace authorization boundary over all namespace-bearing routes
 - [x] Integrity detection and deterministic repair for both FTS and embedding indexes
 - [x] Context score-floor abstention, deduplication, token diagnostics, and exclusion reasons
+- [x] Persisted namespace-scoped context selection audit with restart and deletion coverage

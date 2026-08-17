@@ -108,6 +108,11 @@ def create_app(
         require_namespace(request.namespace_id)
         return engine.context(request.namespace_id, request.query, request.token_budget, request.limit)
 
+    @app.get("/v1/context/requests")
+    def context_requests(namespace_id: str = Query(...)) -> list[dict[str, object]]:
+        require_namespace(namespace_id)
+        return engine.context_requests(namespace_id)
+
     @app.get("/v1/memories/{memory_id}")
     def get_memory(memory_id: str, namespace_id: str) -> MemoryResponse:
         require_namespace(namespace_id)

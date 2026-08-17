@@ -217,6 +217,31 @@ class Repository:
     def list_jobs(self, namespace_id: str) -> list[dict[str, Any]]:
         return [dict(row) for row in self.db.execute("SELECT * FROM processing_jobs WHERE namespace_id=? ORDER BY created_at, id", (namespace_id,)).fetchall()]
 
+    def record_context_request(self, namespace_id: str, query: str, token_budget: int, response: Any) -> str:
+        request_id = str(uuid.uuid4())
+        with self.db.lock, self.db.connection:
+            self.db.execute(
+                """INSERT INTO context_requests
+                (id, namespace_id, query, token_budget, selected_json, token_count, abstained, diagnostics_json, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    request_id, namespace_id, query, token_budget,
+                    json.dumps([str(item.memory_version_id) for item in response.results], separators=(",", ":")),
+                    response.token_count, int(response.abstained), json.dumps(response.diagnostics, sort_keys=True, separators=(",", ":")), iso(),
+                ),
+            )
+        return request_id
+
+    def list_context_requests(self, namespace_id: str) -> list[dict[str, Any]]:
+        rows = self.db.execute("SELECT * FROM context_requests WHERE namespace_id=? ORDER BY created_at, id", (namespace_id,)).fetchall()
+        result = []
+        for row in rows:
+            item = dict(row)
+            item["selected_json"] = json.loads(item["selected_json"])
+            item["diagnostics_json"] = json.loads(item["diagnostics_json"])
+            result.append(item)
+        return result
+
     def claim_jobs(self, namespace_id: str, limit: int, lease_seconds: int) -> list[sqlite3.Row]:
         # SQLite computes the lease consistently and avoids client clock formatting issues.
         with self.db.connection:
@@ -686,7 +711,7 @@ class Repository:
 
     def export_namespace(self, namespace_id: str) -> dict[str, Any]:
         tables = (
-            "namespaces", "events", "artifacts", "memories", "memory_versions", "evidence_refs", "processing_jobs",
+            "namespaces", "events", "artifacts", "memories", "memory_versions", "evidence_refs", "processing_jobs", "context_requests",
             "extraction_runs", "extraction_decisions", "episodes", "episode_events", "memory_embeddings", "feedback",
         )
         result: dict[str, Any] = {
@@ -705,7 +730,7 @@ class Repository:
         if not isinstance(namespace_rows, list) or not any(row.get("id") == namespace_id for row in namespace_rows):
             raise ValueError("export namespace does not match requested namespace")
         ordered = (
-            "namespaces", "events", "artifacts", "memories", "extraction_runs", "memory_versions", "processing_jobs",
+            "namespaces", "events", "artifacts", "memories", "extraction_runs", "memory_versions", "processing_jobs", "context_requests",
             "evidence_refs", "extraction_decisions", "episodes", "episode_events", "memory_embeddings", "feedback",
         )
         counts: dict[str, int] = {}
@@ -764,6 +789,7 @@ class Repository:
             self.db.execute("DELETE FROM episodes WHERE namespace_id=?", (namespace_id,))
             self.db.execute("DELETE FROM memory_embeddings WHERE namespace_id=?", (namespace_id,))
             self.db.execute("DELETE FROM feedback WHERE namespace_id=?", (namespace_id,))
+            self.db.execute("DELETE FROM context_requests WHERE namespace_id=?", (namespace_id,))
             self.db.execute("DELETE FROM artifacts WHERE namespace_id=?", (namespace_id,))
             for table in ("evidence_refs", "memory_versions", "memories", "processing_jobs", "events"):
                 self.db.execute(f"DELETE FROM {table} WHERE namespace_id=?", (namespace_id,))

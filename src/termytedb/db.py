@@ -232,6 +232,20 @@ MIGRATIONS: tuple[str, ...] = (
     );
     CREATE INDEX artifacts_namespace_event_idx ON artifacts(namespace_id, event_id);
     """,
+    """
+    CREATE TABLE context_requests (
+      id TEXT PRIMARY KEY,
+      namespace_id TEXT NOT NULL REFERENCES namespaces(id),
+      query TEXT NOT NULL,
+      token_budget INTEGER NOT NULL,
+      selected_json TEXT NOT NULL,
+      token_count INTEGER NOT NULL,
+      abstained INTEGER NOT NULL,
+      diagnostics_json TEXT NOT NULL,
+      created_at TEXT NOT NULL
+    );
+    CREATE INDEX context_requests_namespace_created_idx ON context_requests(namespace_id, created_at);
+    """,
 )
 
 
