@@ -22,3 +22,10 @@ def test_operations_cli_supports_init_export_import_backup_and_integrity(tmp_pat
     restored = TermyteDB(backup)
     assert restored.search("ops", "SQLite")
     restored.close()
+
+
+def test_operations_cli_benchmark_reports_metrics(capsys):
+    assert main(["benchmark", "--events", "2"]) == 0
+    output = json.loads(capsys.readouterr().out)
+    assert output["event_count"] == 2
+    assert output["concurrent_namespace_count"] == 4

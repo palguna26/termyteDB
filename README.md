@@ -50,6 +50,7 @@ python -m termytedb.operations export --database .\memory.sqlite --namespace dem
 python -m termytedb.operations import --database .\restored.sqlite --namespace demo --input .\demo.json
 python -m termytedb.operations backup --database .\memory.sqlite --output .\memory.backup.sqlite
 python -m termytedb.operations integrity --database .\memory.sqlite
+python -m termytedb.operations benchmark --events 100
 ```
 
 Inspection collections support `limit` (1–100) and `offset` pagination.

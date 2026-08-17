@@ -6,6 +6,7 @@ from collections.abc import Sequence
 from pathlib import Path
 
 from .engine import TermyteDB
+from .evaluation import run_performance_benchmark
 from .integrity import check_database, repair_fts
 
 
@@ -34,7 +35,13 @@ def main(arguments: Sequence[str] | None = None) -> int:
     integrity.add_argument("--database", required=True, type=Path)
     integrity.add_argument("--repair-fts", action="store_true")
 
+    benchmark = subparsers.add_parser("benchmark", help="run the local production benchmark")
+    benchmark.add_argument("--events", type=int, default=100)
+
     args = parser.parse_args(arguments)
+    if args.command == "benchmark":
+        print(json.dumps(run_performance_benchmark(args.events), sort_keys=True))
+        return 0
     if args.command == "init":
         db = TermyteDB(args.database)
         db.close()
