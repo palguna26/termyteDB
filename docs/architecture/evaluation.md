@@ -9,3 +9,5 @@ The continuation benchmark packages a repository snapshot, Agent A task/trajecto
 LongMemEval-s gets an adapter that transforms each item into the same event/evidence pipeline, pins model/embedding versions, records seeds/configuration, and emits raw predictions plus metrics. No benchmark-specific shortcut may bypass production processing.
 
 Milestone 2 adds `tests/fixtures/extraction_cases.jsonl` with 50 labelled cases and `python -m termytedb.evaluation <fixture>`. The command reports a deterministic rule-only baseline. Reconciliation and temporal scores remain zero until labelled state transitions are run through the model-provider harness.
+
+The retrieval evaluator accepts JSONL cases containing `query`, `evidence`, and `expected_statement`. `python -m termytedb.evaluation <fixture> --retrieval` writes Recall@k, MRR, NDCG@k, elapsed time, and case count after using the production ingest, process, and search path. The checked-in four-case smoke fixture measured Recall@5=1.0, MRR=1.0, and NDCG@5=1.0 locally; this is a regression fixture, not a general quality claim.

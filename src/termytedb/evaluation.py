@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 import json
+import math
+import tempfile
 import time
 from pathlib import Path
+from typing import Any
 
+from .engine import TermyteDB
 from .extractor import extract
 
 
@@ -41,12 +45,58 @@ def evaluate_rule_fixture(path: str | Path) -> dict[str, float | int]:
     }
 
 
+def _ndcg(relevance: list[int], ideal_count: int) -> float:
+    dcg = sum(value / math.log2(index + 2) for index, value in enumerate(relevance))
+    ideal = sum(1 / math.log2(index + 2) for index in range(min(ideal_count, len(relevance))))
+    return dcg / ideal if ideal else 0.0
+
+
+def evaluate_retrieval_fixture(path: str | Path) -> dict[str, float | int]:
+    """Run labelled retrieval cases through the production ingest/process/search path."""
+    cases = [json.loads(line) for line in Path(path).read_text(encoding="utf-8").splitlines() if line.strip()]
+    started = time.perf_counter()
+    with tempfile.TemporaryDirectory(prefix="termytedb-eval-") as directory:
+        engine = TermyteDB(Path(directory) / "evaluation.sqlite")
+        namespace = "evaluation"
+        for index, event in enumerate(_events(cases)):
+            engine.ingest({"namespace_id": namespace, "idempotency_key": f"fixture-{index}", "type": "conversation", "payload": event})
+        engine.process(namespace, limit=max(1, len(cases)))
+        hits: list[int] = []
+        ndcgs: list[float] = []
+        reciprocal = 0.0
+        for case in cases:
+            results = engine.search(namespace, case["query"], int(case.get("k", 5)))
+            expected = str(case["expected_statement"]).casefold()
+            relevance = [int(expected in result.statement.casefold()) for result in results]
+            hits.append(int(any(relevance)))
+            ndcgs.append(_ndcg(relevance, 1))
+            if 1 in relevance:
+                reciprocal += 1 / (relevance.index(1) + 1)
+        engine.close()
+    elapsed_ms = (time.perf_counter() - started) * 1000
+    total = len(cases)
+    return {
+        "cases": total,
+        "elapsed_ms": round(elapsed_ms, 3),
+        "recall_at_k": round(sum(hits) / total, 4) if total else 0.0,
+        "mrr": round(reciprocal / total, 4) if total else 0.0,
+        "ndcg_at_k": round(sum(ndcgs) / total, 4) if total else 0.0,
+    }
+
+
+def _events(cases: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [{"text": case["evidence"]} for case in cases]
+
+
 def main() -> None:
     import argparse
 
     parser = argparse.ArgumentParser()
     parser.add_argument("fixture", type=Path)
-    print(json.dumps(evaluate_rule_fixture(parser.parse_args().fixture), sort_keys=True))
+    parser.add_argument("--retrieval", action="store_true", help="run the production retrieval fixture instead of extraction")
+    arguments = parser.parse_args()
+    result = evaluate_retrieval_fixture(arguments.fixture) if arguments.retrieval else evaluate_rule_fixture(arguments.fixture)
+    print(json.dumps(result, sort_keys=True))
 
 
 if __name__ == "__main__":

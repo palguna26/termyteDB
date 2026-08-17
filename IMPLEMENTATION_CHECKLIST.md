@@ -34,3 +34,4 @@
 - [x] Health and readiness endpoints
 - [x] Repository installs cleanly for pytest via configured source path
 - [x] Persistent deterministic episode construction with late-event handling
+- [x] Production-path labelled retrieval evaluator with Recall@k, MRR, and NDCG@k
