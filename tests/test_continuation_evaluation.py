@@ -24,3 +24,21 @@ def test_continuation_runner_rejects_unsafe_repository_paths(tmp_path):
 
     with pytest.raises(ValueError, match="relative and contained"):
         evaluate_continuation_fixture(fixture)
+
+
+def test_continuation_runner_executes_allowlisted_verification_command(tmp_path):
+    import json
+
+    fixture = tmp_path / "executable.jsonl"
+    script = 'from pathlib import Path\nassert Path("src/value.txt").read_text() == "ok\\n"\n'
+    case = {
+        "snapshot_id": "x", "initial_task": "a", "continuation_task": "b", "verification": "c",
+        "events": ["Decision: keep the value."], "expected": "keep the value",
+        "repository_snapshot": {"verify.py": script},
+        "resulting_repository": {"src/value.txt": "ok\n", "verify.py": script},
+        "verification_tests": [{"path": "src/value.txt", "contains": "ok"}],
+        "verification_commands": [["python", "verify.py"]],
+    }
+    fixture.write_text(json.dumps(case) + "\n", encoding="utf-8")
+    result = evaluate_continuation_fixture(fixture)
+    assert result["repository_fixture_verification_rate"] == 1.0

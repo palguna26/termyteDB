@@ -3,6 +3,9 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
+import subprocess
+import sys
 import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -221,7 +224,7 @@ def evaluate_continuation_fixture(path: str | Path) -> dict[str, Any]:
 
 
 def _verify_repository_fixture(case: dict[str, Any]) -> bool:
-    """Verify declarative snapshot/result/test data without running shell commands."""
+    """Verify fixture state and optionally run bounded, shell-free test commands."""
     snapshot = case["repository_snapshot"]
     result = case["resulting_repository"]
     tests = case["verification_tests"]
@@ -238,6 +241,36 @@ def _verify_repository_fixture(case: dict[str, Any]) -> bool:
             raise ValueError("verification_tests require path and contains strings")
         if test["path"] not in result or test["contains"] not in result[test["path"]]:
             return False
+    commands = case.get("verification_commands", [])
+    if not isinstance(commands, list) or len(commands) > 8:
+        raise ValueError("verification_commands must contain at most 8 command arrays")
+    if commands:
+        with tempfile.TemporaryDirectory(prefix="termytedb-verification-") as directory:
+            root = Path(directory).resolve()
+            for relative_path, content in result.items():
+                target = (root / relative_path).resolve()
+                if root not in target.parents:
+                    raise ValueError("repository fixture paths must be relative and contained")
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(content, encoding="utf-8")
+            for command in commands:
+                if not isinstance(command, list) or not command or not all(isinstance(part, str) and part for part in command):
+                    raise ValueError("verification_commands must contain non-empty string arrays")
+                executable = Path(command[0]).name.casefold()
+                if executable not in {"python", "python.exe", "python3", "pytest", "pytest.exe"}:
+                    raise ValueError("verification command executable is not allowed")
+                argv = ([sys.executable, "-m", "pytest", *command[1:]] if executable.startswith("pytest") else [sys.executable, *command[1:]])
+                completed = subprocess.run(
+                    argv,
+                    cwd=root,
+                    env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                    check=False,
+                )
+                if completed.returncode != 0:
+                    return False
     return True
 
 

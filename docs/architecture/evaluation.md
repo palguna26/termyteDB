@@ -16,7 +16,7 @@ Reconciliation fixtures contain ordered event text and expected actions. `python
 
 Temporal fixtures provide labelled validity intervals. `python -m termytedb.evaluation <fixture> --temporal` runs the real provider, reconciliation, and retrieval path and reports stale-memory rejection plus historical temporal-state accuracy.
 
-Continuation fixtures run with `python -m termytedb.evaluation <fixture> --continuation`. The checked-in synthetic fixture measured no-memory completion `0.0`, previous-summary completion `0.0`, and TermyteDB completion `1.0`; raw history also reached `1.0`. This demonstrates the harness and production path only, not a general agent-quality claim.
+Continuation fixtures run with `python -m termytedb.evaluation <fixture> --continuation`. The checked-in synthetic fixture measured no-memory completion `0.0`, previous-summary completion `0.0`, and TermyteDB completion `1.0`; raw history also reached `1.0`. Fixtures may additionally provide bounded, shell-free `verification_commands`; only Python and pytest entrypoints are allowed, with a 30-second command timeout. This demonstrates the harness and production path only, not a general agent-quality claim.
 
 LongMemEval-shaped fixtures run with `python -m termytedb.evaluation <fixture> --longmemeval`. The adapter emits frozen configuration, prompt hash, raw predictions, abstention, token, latency, and accuracy fields. The checked-in two-item fixture reached accuracy `1.0`; it is synthetic and is not an external LongMemEval-s result.
 
