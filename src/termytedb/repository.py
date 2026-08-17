@@ -68,7 +68,7 @@ class Repository:
         self.embedding = embedding or LocalHashEmbedding()
 
     def ensure_namespace(self, namespace_id: str, org_id: str = "default") -> None:
-        with self.db.connection:
+        with self.db.lock, self.db.connection:
             self.db.execute(
                 "INSERT OR IGNORE INTO namespaces(id, org_id, created_at) VALUES (?, ?, ?)",
                 (namespace_id, org_id, iso()),
@@ -314,7 +314,7 @@ class Repository:
 
     def claim_jobs(self, namespace_id: str, limit: int, lease_seconds: int) -> list[sqlite3.Row]:
         # SQLite computes the lease consistently and avoids client clock formatting issues.
-        with self.db.connection:
+        with self.db.lock, self.db.connection:
             rows = self.db.execute(
                 """SELECT * FROM processing_jobs
                 WHERE namespace_id = ? AND (status IN ('pending', 'failed') OR

@@ -11,7 +11,7 @@
 
 ## Measured local evidence
 
-- 113 automated tests pass with Ruff and mypy.
+- 114 automated tests pass with Ruff and mypy.
 - Retrieval smoke fixture: Recall@5 `1.0`, MRR `1.0`, NDCG@5 `1.0`.
 - Synthetic continuation fixture: no-memory `0.0`, previous-summary `0.0`, raw history `1.0`, TermyteDB `1.0`.
 - Synthetic LongMemEval-shaped fixture: accuracy `1.0` over 2 items.

@@ -77,3 +77,4 @@
 - [x] Local benchmark command using the production performance path
 - [x] Production-path temporal evaluator for stale rejection and historical state
 - [x] Explainable retrieval component signals for confidence, evidence, type, and temporal status
+- [x] Concurrent worker processing regression coverage for leased jobs
