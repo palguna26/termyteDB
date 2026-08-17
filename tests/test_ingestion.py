@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
+
 from .conftest import event
 
 
@@ -38,3 +40,19 @@ def test_event_payload_is_redacted_before_extraction(db):
     result = db.search("n1", "Decision")
     assert result
     assert "SUPERSECRET123456789" not in result[0].statement
+
+
+def test_concurrent_namespaces_keep_event_counts_and_isolation(db):
+    namespaces = [f"parallel-{index}" for index in range(4)]
+
+    def ingest_namespace(namespace_id: str) -> None:
+        for index in range(5):
+            db.ingest(event(namespace_id, str(index), f"Decision: {namespace_id} item {index}."))
+
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        list(executor.map(ingest_namespace, namespaces))
+    for namespace_id in namespaces:
+        assert db.database.execute("SELECT COUNT(*) FROM events WHERE namespace_id=?", (namespace_id,)).fetchone()[0] == 5
+        event_id = db.database.execute("SELECT id FROM events WHERE namespace_id=? LIMIT 1", (namespace_id,)).fetchone()[0]
+        assert db.event(namespace_id, event_id)["namespace_id"] == namespace_id
+        assert db.event("other-namespace", event_id) is None

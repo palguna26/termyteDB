@@ -63,3 +63,4 @@
 - [x] Integrity detection for tampered canonical event payloads
 - [x] Integrity-aware readiness endpoint with unhealthy-store response
 - [x] SQLite online backup with reopen and preservation coverage
+- [x] Concurrent namespace ingestion benchmark and isolation regression coverage

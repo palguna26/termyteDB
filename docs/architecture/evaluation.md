@@ -19,3 +19,5 @@ Continuation fixtures run with `python -m termytedb.evaluation <fixture> --conti
 LongMemEval-shaped fixtures run with `python -m termytedb.evaluation <fixture> --longmemeval`. The adapter emits frozen configuration, prompt hash, raw predictions, abstention, token, latency, and accuracy fields. The checked-in two-item fixture reached accuracy `1.0`; it is synthetic and is not an external LongMemEval-s result.
 
 `run_performance_benchmark(n)` measures local operation latency and restart recovery. A 10-event local run measured batch ingest `12.802 ms` (`781.15 events/s`), processing `43.455 ms`, search `0.768 ms`, context `0.332 ms`, and restart search `0.725 ms` on the developer machine. These are one smoke run, not release capacity targets.
+
+The same benchmark also runs bounded concurrent ingestion across four namespaces and reports `concurrent_namespace_ms` and the recovered job count. This is a local contention smoke measurement, not a capacity or p95 claim.

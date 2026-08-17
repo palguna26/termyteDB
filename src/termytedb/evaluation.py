@@ -5,6 +5,7 @@ import json
 import math
 import tempfile
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -277,6 +278,19 @@ def run_performance_benchmark(event_count: int = 100) -> dict[str, Any]:
         process_ms = elapsed(lambda: engine.process(namespace, limit=event_count + 1))
         search_ms = elapsed(lambda: engine.search(namespace, "SQLite", limit=10))
         context_ms = elapsed(lambda: engine.context(namespace, "SQLite", token_budget=200, limit=10))
+        concurrent_namespaces = [f"concurrent-{index}" for index in range(4)]
+
+        def ingest_namespace(name: str) -> int:
+            for index in range(event_count):
+                engine.ingest(
+                    {"namespace_id": name, "idempotency_key": f"event-{index}", "type": "note", "payload": {"text": f"Decision: {name} item {index}."}}
+                )
+            return len(engine.jobs(name))
+
+        concurrent_started = time.perf_counter()
+        with ThreadPoolExecutor(max_workers=len(concurrent_namespaces)) as executor:
+            concurrent_jobs = list(executor.map(ingest_namespace, concurrent_namespaces))
+        concurrent_ms = (time.perf_counter() - concurrent_started) * 1000
         engine.close()
         restarted = TermyteDB(path)
         recovered_jobs = len(restarted.jobs(namespace))
@@ -290,6 +304,9 @@ def run_performance_benchmark(event_count: int = 100) -> dict[str, Any]:
         "process_ms": round(process_ms, 3),
         "search_ms": round(search_ms, 3),
         "context_ms": round(context_ms, 3),
+        "concurrent_namespace_ms": round(concurrent_ms, 3),
+        "concurrent_namespace_jobs": sum(concurrent_jobs),
+        "concurrent_namespace_count": len(concurrent_namespaces),
         "restart_search_ms": round(restart_search_ms, 3),
         "recovered_jobs": recovered_jobs,
         "storage": "sqlite-wal-fts5-local-hash-v1",
