@@ -1,5 +1,6 @@
 from fastapi.testclient import TestClient
 
+from termytedb import TermyteDB
 from termytedb.service import create_app
 
 
@@ -26,3 +27,13 @@ def test_processing_timeout_leaves_unclaimed_jobs_pending(tmp_path):
     response = client.post("/v1/process", json={"namespace_id": "timeout", "limit": 2, "timeout_seconds": 0.001})
     assert response.status_code == 200
     assert response.json()["processed"] <= 2
+
+
+def test_worker_completion_cannot_overwrite_cancellation(tmp_path):
+    db = TermyteDB(tmp_path / "cancel-race.sqlite")
+    receipt = db.ingest({"namespace_id": "race", "idempotency_key": "one", "type": "note", "payload": {"text": "Decision: use SQLite."}})
+    claimed = db.repository.claim_jobs("race", 1, 30)[0]
+    assert db.repository.cancel_job("race", str(receipt.job_id)) is True
+    db.repository.complete_job("race", str(receipt.job_id))
+    assert db.repository.db.execute("SELECT status FROM processing_jobs WHERE id=?", (str(claimed["id"]),)).fetchone()[0] == "cancelled"
+    db.close()

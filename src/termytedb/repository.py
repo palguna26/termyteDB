@@ -304,18 +304,20 @@ class Repository:
     def complete_job(self, namespace_id: str, job_id: str) -> None:
         with self.db.connection:
             self.db.execute(
-                "UPDATE processing_jobs SET status='completed', lease_until=NULL, updated_at=? WHERE id=? AND namespace_id=?",
+                "UPDATE processing_jobs SET status='completed', lease_until=NULL, updated_at=? WHERE id=? AND namespace_id=? AND status='processing'",
                 (iso(), job_id, namespace_id),
             )
 
     def fail_job(self, namespace_id: str, job_id: str, error: str) -> str:
         with self.db.connection:
             row = self.db.execute(
-                "SELECT attempts, max_attempts FROM processing_jobs WHERE id=? AND namespace_id=?",
+                "SELECT status, attempts, max_attempts FROM processing_jobs WHERE id=? AND namespace_id=?",
                 (job_id, namespace_id),
             ).fetchone()
             if not row:
                 raise KeyError(job_id)
+            if row["status"] == "cancelled":
+                return "cancelled"
             status = "dead" if row["attempts"] >= row["max_attempts"] else "failed"
             self.db.execute(
                 "UPDATE processing_jobs SET status=?, lease_until=NULL, last_error=?, updated_at=? WHERE id=? AND namespace_id=?",
