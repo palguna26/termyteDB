@@ -140,6 +140,14 @@ class FeedbackResponse(BaseModel):
     label: str
 
 
+class EpisodeStatusRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    namespace_id: str = Field(min_length=1)
+    status: Literal["active", "completed", "failed", "abandoned", "interrupted"]
+    summary: str | None = Field(default=None, max_length=2000)
+
+
 class ProcessRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 

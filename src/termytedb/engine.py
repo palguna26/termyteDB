@@ -88,6 +88,9 @@ class TermyteDB:
     def episodes(self, namespace_id: str, limit: int = 100, offset: int = 0) -> list[dict[str, Any]]:
         return self.repository.list_episodes(namespace_id, limit, offset)
 
+    def update_episode(self, namespace_id: str, episode_id: str, status: str, summary: str | None) -> bool:
+        return self.repository.update_episode(namespace_id, episode_id, status, summary)
+
     def feedback(self, namespace_id: str, memory_id: str, label: str, note: str | None) -> str:
         return self.repository.record_feedback(namespace_id, memory_id, label, note)
 

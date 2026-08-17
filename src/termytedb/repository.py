@@ -198,6 +198,14 @@ class Repository:
         ).fetchall()
         return [dict(row) for row in rows]
 
+    def update_episode(self, namespace_id: str, episode_id: str, status: str, summary: str | None) -> bool:
+        with self.db.lock, self.db.connection:
+            cursor = self.db.execute(
+                "UPDATE episodes SET status=?, summary=COALESCE(?, summary), updated_at=? WHERE id=? AND namespace_id=?",
+                (status, redact_text(summary) if summary else None, iso(), episode_id, namespace_id),
+            )
+            return cursor.rowcount == 1
+
     def record_feedback(self, namespace_id: str, memory_id: str, label: str, note: str | None) -> str:
         feedback_id = str(uuid.uuid4())
         with self.db.lock, self.db.connection:

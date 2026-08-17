@@ -21,6 +21,7 @@ from .schemas import (
     BatchEventResponse,
     ContextRequest,
     ContextResponse,
+    EpisodeStatusRequest,
     EventInput,
     EventReceipt,
     FeedbackRequest,
@@ -178,6 +179,13 @@ def create_app(
     def episodes(namespace_id: str = Query(...), limit: int = Query(100, ge=1, le=100), offset: int = Query(0, ge=0)) -> list[dict[str, object]]:
         require_namespace(namespace_id)
         return engine.episodes(namespace_id, limit, offset)
+
+    @app.patch("/v1/episodes/{episode_id}")
+    def update_episode(episode_id: str, request: EpisodeStatusRequest) -> dict[str, bool]:
+        require_namespace(request.namespace_id)
+        if not engine.update_episode(request.namespace_id, episode_id, request.status, request.summary):
+            raise HTTPException(status_code=404, detail="episode not found")
+        return {"updated": True}
 
     @app.get("/v1/feedback")
     def feedback_rows(namespace_id: str = Query(...), limit: int = Query(100, ge=1, le=100), offset: int = Query(0, ge=0)) -> list[dict[str, object]]:

@@ -34,6 +34,7 @@
 - [x] Health and readiness endpoints
 - [x] Repository installs cleanly for pytest via configured source path
 - [x] Persistent deterministic episode construction with late-event handling
+- [x] Namespace-scoped episode lifecycle statuses and summaries
 - [x] Production-path labelled retrieval evaluator with Recall@k, MRR, and NDCG@k
 - [x] Transactional canonical namespace export/import with audit and episode preservation
 - [x] Explainable namespace-scoped hybrid lexical/vector retrieval with rebuildable local embeddings
