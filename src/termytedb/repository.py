@@ -749,7 +749,8 @@ class Repository:
         rows = self.db.execute(
             f"""SELECT m.id, m.kind, v.id AS version_id, v.statement, v.status
             FROM memory_versions v JOIN memories m ON m.id=v.memory_id AND m.namespace_id=?
-            WHERE v.namespace_id=? AND v.id IN ({placeholders}) AND (? OR (v.status='active' AND m.status='active'))""",
+            WHERE v.namespace_id=? AND v.id IN ({placeholders}) AND (? OR (v.status='active' AND m.status='active' AND v.valid_to IS NULL
+              AND (v.valid_until IS NULL OR julianday(v.valid_until) > julianday('now'))))""",
             (namespace_id, namespace_id, *candidate_ids, historical),
         ).fetchall()
         ranked = sorted(

@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from termytedb.evaluation import evaluate_reconciliation_fixture, evaluate_retrieval_fixture, evaluate_rule_fixture
+from termytedb.evaluation import evaluate_reconciliation_fixture, evaluate_retrieval_fixture, evaluate_rule_fixture, evaluate_temporal_fixture
 
 
 def test_rule_evaluation_is_reproducible():
@@ -23,3 +23,11 @@ def test_reconciliation_evaluation_uses_production_path():
     result = evaluate_reconciliation_fixture(fixture)
     assert result["cases"] == 2
     assert result["reconciliation_accuracy"] == 1.0
+
+
+def test_temporal_evaluation_measures_stale_rejection():
+    fixture = Path(__file__).parent / "fixtures" / "temporal_cases.jsonl"
+    result = evaluate_temporal_fixture(fixture)
+    assert result["cases"] == 1
+    assert result["stale_memory_rejection"] == 1.0
+    assert result["temporal_state_accuracy"] == 1.0

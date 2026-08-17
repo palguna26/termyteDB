@@ -8,11 +8,13 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
+from uuid import UUID
 
 from .context import token_count
 from .engine import TermyteDB
 from .extractor import extract
-from .schemas import EventInput
+from .provider import ProviderResult
+from .schemas import EventInput, EvidenceSpan, ExtractionCandidate, ExtractionResponse
 
 
 def evaluate_rule_fixture(path: str | Path) -> dict[str, float | int]:
@@ -110,6 +112,48 @@ def evaluate_reconciliation_fixture(path: str | Path) -> dict[str, float | int]:
         "cases": len(cases),
         "reconciliation_accuracy": round(action_correct / action_total, 4) if action_total else 0.0,
         "action_count": action_total,
+    }
+
+
+def evaluate_temporal_fixture(path: str | Path) -> dict[str, float | int]:
+    """Measure stale rejection and explicit historical retrieval on labelled intervals."""
+    cases = [json.loads(line) for line in Path(path).read_text(encoding="utf-8").splitlines() if line.strip()]
+    stale_correct = 0
+    historical_correct = 0
+    with tempfile.TemporaryDirectory(prefix="termytedb-temporal-") as directory:
+        for case_index, case in enumerate(cases):
+            namespace = f"temporal-{case_index}"
+            event_text = str(case["text"])
+            candidate_holder: list[ExtractionResponse] = []
+
+            class Provider:
+                name = "temporal-fixture"
+                model = "temporal-fixture-v1"
+
+                def extract(self, request: Any, timeout_seconds: float = 30.0, cancellation: Any = None) -> ProviderResult:
+                    del request, timeout_seconds, cancellation
+                    response = candidate_holder.pop(0)
+                    return ProviderResult(response, self.name, self.model, response.prompt_version, "fixture", None, None, 0)
+
+            engine = TermyteDB(Path(directory) / f"{case_index}.sqlite", extraction_provider=Provider())
+            receipt = engine.ingest({"namespace_id": namespace, "idempotency_key": "one", "type": "decision", "payload": {"text": event_text}})
+            event_id = UUID(str(receipt.event_id))
+            candidate = ExtractionCandidate(
+                kind="decision", subject=str(case["subject"]), statement=event_text,
+                evidence=[EvidenceSpan(event_id=event_id, start_offset=0, end_offset=len(event_text), excerpt=event_text)],
+                confidence=1.0, durability="session", valid_from=case.get("valid_from"), valid_until=case.get("valid_until"),
+            )
+            candidate_holder.append(ExtractionResponse(schema_version="extraction-v1", prompt_version="temporal-v1", candidates=[candidate]))
+            engine.process(namespace)
+            query = str(case.get("query", event_text))
+            stale_correct += int(not engine.search(namespace, query))
+            historical_correct += int(bool(engine.search(namespace, query, historical=True)))
+            engine.close()
+    total = len(cases)
+    return {
+        "cases": total,
+        "stale_memory_rejection": round(stale_correct / total, 4) if total else 0.0,
+        "temporal_state_accuracy": round(historical_correct / total, 4) if total else 0.0,
     }
 
 
@@ -322,8 +366,11 @@ def main() -> None:
     parser.add_argument("--continuation", action="store_true", help="run the production continuation fixture")
     parser.add_argument("--longmemeval", action="store_true", help="run the LongMemEval-shaped production adapter")
     parser.add_argument("--reconciliation", action="store_true", help="run the production reconciliation fixture")
+    parser.add_argument("--temporal", action="store_true", help="run the production temporal fixture")
     arguments = parser.parse_args()
-    if arguments.reconciliation:
+    if arguments.temporal:
+        result = evaluate_temporal_fixture(arguments.fixture)
+    elif arguments.reconciliation:
         result = evaluate_reconciliation_fixture(arguments.fixture)
     elif arguments.longmemeval:
         result = evaluate_longmemeval_fixture(arguments.fixture)
