@@ -211,6 +211,13 @@ MIGRATIONS: tuple[str, ...] = (
     );
     CREATE INDEX feedback_namespace_created_idx ON feedback(namespace_id, created_at);
     """,
+    """
+    ALTER TABLE events ADD COLUMN protocol_version TEXT NOT NULL DEFAULT 'event-v1';
+    ALTER TABLE events ADD COLUMN actor_id TEXT;
+    ALTER TABLE events ADD COLUMN agent_id TEXT;
+    ALTER TABLE events ADD COLUMN session_id TEXT;
+    ALTER TABLE events ADD COLUMN source_id TEXT;
+    """,
 )
 
 

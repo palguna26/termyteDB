@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 from pathlib import Path
 from typing import Any
@@ -24,6 +25,7 @@ from .schemas import (
 
 
 class TermyteDB:
+    MAX_EVENT_BYTES = 1_048_576
     def __init__(
         self,
         path: str | Path | None = None,
@@ -45,6 +47,9 @@ class TermyteDB:
     def ingest(self, event: EventInput | dict[str, Any]) -> EventReceipt:
         parsed = event if isinstance(event, EventInput) else EventInput.model_validate(event)
         redacted_payload = redact(parsed.payload)
+        payload_bytes = len(json.dumps(redacted_payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+        if payload_bytes > self.MAX_EVENT_BYTES:
+            raise ValueError(f"event payload exceeds {self.MAX_EVENT_BYTES} bytes")
         event_id, duplicate, content_hash, job_id = self.repository.ingest(parsed.namespace_id, parsed, redacted_payload)
         log(
             self.logger,

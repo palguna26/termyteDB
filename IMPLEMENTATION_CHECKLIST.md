@@ -43,3 +43,4 @@
 - [x] Reproducible coding-continuation fixture runner with explicit baseline metrics
 - [x] LongMemEval-shaped production-path adapter with frozen run metadata and raw predictions
 - [x] Local ingest/process/retrieval/context/restart performance benchmark
+- [x] Versioned canonical event identity with actor/agent/session/source fields and payload boundary

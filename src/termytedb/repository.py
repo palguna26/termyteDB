@@ -31,8 +31,13 @@ def hash_text(value: str) -> str:
 def canonical_event_content(event: EventInput, redacted_payload: dict[str, Any]) -> str:
     return json.dumps(
         {
+            "protocol_version": event.protocol_version,
             "type": event.type,
             "stream_id": event.stream_id,
+            "actor_id": event.actor_id,
+            "agent_id": event.agent_id,
+            "session_id": event.session_id,
+            "source_id": event.source_id,
             "occurred_at": event.occurred_at.isoformat() if event.occurred_at else None,
             "payload": redacted_payload,
         },
@@ -80,13 +85,19 @@ class Repository:
                     return existing["id"], True, existing["content_hash"], existing_job["id"]
                 self.db.execute(
                     """INSERT INTO events
-                    (id, namespace_id, stream_id, idempotency_hash, type, occurred_at, payload_json,
+                    (id, namespace_id, protocol_version, stream_id, actor_id, agent_id, session_id, source_id, idempotency_hash, type, occurred_at,
+                     payload_json,
                      content_hash, redaction_state, created_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'redacted', ?)""",
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'redacted', ?)""",
                     (
                         event_id,
                         namespace_id,
+                        event.protocol_version,
                         event.stream_id,
+                        event.actor_id,
+                        event.agent_id,
+                        event.session_id,
+                        event.source_id,
                         idempotency_hash,
                         event.type,
                         occurred,

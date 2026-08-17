@@ -15,11 +15,16 @@ class EventInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     namespace_id: str = Field(min_length=1)
+    protocol_version: str = Field(default="event-v1", pattern=r"^event-v1$")
     idempotency_key: str = Field(min_length=1)
     type: str = Field(min_length=1, max_length=100)
     payload: dict[str, Any]
     occurred_at: datetime | None = None
     stream_id: str | None = None
+    actor_id: str | None = Field(default=None, max_length=200)
+    agent_id: str | None = Field(default=None, max_length=200)
+    session_id: str | None = Field(default=None, max_length=200)
+    source_id: str | None = Field(default=None, max_length=200)
 
 
 MemoryKind = Literal[
