@@ -103,6 +103,12 @@ class TermyteDB:
     def context_requests(self, namespace_id: str, limit: int = 100, offset: int = 0) -> list[dict[str, Any]]:
         return self.repository.list_context_requests(namespace_id, limit, offset)
 
+    def extraction_runs(self, namespace_id: str, limit: int = 100, offset: int = 0) -> list[dict[str, Any]]:
+        return self.repository.list_extraction_runs(namespace_id, limit, offset)
+
+    def extraction_decisions(self, namespace_id: str, limit: int = 100, offset: int = 0) -> list[dict[str, Any]]:
+        return self.repository.list_extraction_decisions(namespace_id, limit, offset)
+
     def feedback_rows(self, namespace_id: str, limit: int = 100, offset: int = 0) -> list[dict[str, Any]]:
         return self.repository.list_feedback(namespace_id, limit, offset)
 

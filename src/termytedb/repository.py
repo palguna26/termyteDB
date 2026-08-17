@@ -470,6 +470,20 @@ class Repository:
                 (iso(), accepted, rejected, status, error_class, run_id, namespace_id),
             )
 
+    def list_extraction_runs(self, namespace_id: str, limit: int = 100, offset: int = 0) -> list[dict[str, Any]]:
+        rows = self.db.execute(
+            "SELECT * FROM extraction_runs WHERE namespace_id=? ORDER BY started_at DESC, id DESC LIMIT ? OFFSET ?",
+            (namespace_id, limit, offset),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def list_extraction_decisions(self, namespace_id: str, limit: int = 100, offset: int = 0) -> list[dict[str, Any]]:
+        rows = self.db.execute(
+            "SELECT * FROM extraction_decisions WHERE namespace_id=? ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
+            (namespace_id, limit, offset),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
     def record_decision(
         self,
         namespace_id: str,
