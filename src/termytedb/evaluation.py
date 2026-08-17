@@ -11,6 +11,7 @@ from typing import Any
 from .context import token_count
 from .engine import TermyteDB
 from .extractor import extract
+from .schemas import EventInput
 
 
 def evaluate_rule_fixture(path: str | Path) -> dict[str, float | int]:
@@ -188,6 +189,52 @@ def evaluate_longmemeval_fixture(
         "abstention_rate": round(sum(int(item["abstained"]) for item in predictions) / len(predictions), 4) if predictions else 0.0,
         "elapsed_ms": round(elapsed_ms, 3),
         "predictions": predictions,
+    }
+
+
+def run_performance_benchmark(event_count: int = 100) -> dict[str, Any]:
+    """Measure local V1 operations and restart recovery without external services."""
+    if event_count < 1 or event_count > 10_000:
+        raise ValueError("event_count must be between 1 and 10000")
+
+    def elapsed(operation: Any) -> float:
+        started = time.perf_counter()
+        operation()
+        return (time.perf_counter() - started) * 1000
+
+    with tempfile.TemporaryDirectory(prefix="termytedb-performance-") as directory:
+        path = Path(directory) / "benchmark.sqlite"
+        engine = TermyteDB(path)
+        namespace = "benchmark"
+        events = [
+            EventInput(namespace_id=namespace, idempotency_key=f"event-{index}", type="decision", payload={"text": f"Decision: use SQLite for item {index}."})
+            for index in range(event_count)
+        ]
+        single_event_ms = elapsed(
+            lambda: engine.ingest(
+                {"namespace_id": namespace, "idempotency_key": "single", "type": "decision", "payload": {"text": "Decision: single event."}}
+            )
+        )
+        batch_ms = elapsed(lambda: engine.ingest_batch(events))
+        process_ms = elapsed(lambda: engine.process(namespace, limit=event_count + 1))
+        search_ms = elapsed(lambda: engine.search(namespace, "SQLite", limit=10))
+        context_ms = elapsed(lambda: engine.context(namespace, "SQLite", token_budget=200, limit=10))
+        engine.close()
+        restarted = TermyteDB(path)
+        recovered_jobs = len(restarted.jobs(namespace))
+        restart_search_ms = elapsed(lambda: restarted.search(namespace, "SQLite", limit=10))
+        restarted.close()
+    return {
+        "event_count": event_count,
+        "single_event_ingest_ms": round(single_event_ms, 3),
+        "batch_ingest_ms": round(batch_ms, 3),
+        "batch_events_per_second": round(event_count / max(batch_ms / 1000, 0.000001), 2),
+        "process_ms": round(process_ms, 3),
+        "search_ms": round(search_ms, 3),
+        "context_ms": round(context_ms, 3),
+        "restart_search_ms": round(restart_search_ms, 3),
+        "recovered_jobs": recovered_jobs,
+        "storage": "sqlite-wal-fts5-local-hash-v1",
     }
 
 

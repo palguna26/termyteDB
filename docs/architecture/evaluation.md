@@ -15,3 +15,5 @@ The retrieval evaluator accepts JSONL cases containing `query`, `evidence`, and 
 Continuation fixtures run with `python -m termytedb.evaluation <fixture> --continuation`. The checked-in synthetic fixture measured no-memory completion `0.0`, previous-summary completion `0.0`, and TermyteDB completion `1.0`; raw history also reached `1.0`. This demonstrates the harness and production path only, not a general agent-quality claim.
 
 LongMemEval-shaped fixtures run with `python -m termytedb.evaluation <fixture> --longmemeval`. The adapter emits frozen configuration, prompt hash, raw predictions, abstention, token, latency, and accuracy fields. The checked-in two-item fixture reached accuracy `1.0`; it is synthetic and is not an external LongMemEval-s result.
+
+`run_performance_benchmark(n)` measures local operation latency and restart recovery. A 10-event local run measured batch ingest `12.802 ms` (`781.15 events/s`), processing `43.455 ms`, search `0.768 ms`, context `0.332 ms`, and restart search `0.725 ms` on the developer machine. These are one smoke run, not release capacity targets.

@@ -42,3 +42,4 @@
 - [x] Optional generic HTTP extraction provider with strict schema and safe failures
 - [x] Reproducible coding-continuation fixture runner with explicit baseline metrics
 - [x] LongMemEval-shaped production-path adapter with frozen run metadata and raw predictions
+- [x] Local ingest/process/retrieval/context/restart performance benchmark
