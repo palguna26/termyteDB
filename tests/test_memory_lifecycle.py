@@ -57,3 +57,12 @@ def test_new_version_supersedes_old_and_search_excludes_it(db):
     current = db.search("n1", "PostgreSQL")[0]
     assert current.memory_id == old.memory_id
     assert db.database.execute("SELECT COUNT(*) FROM memory_versions WHERE memory_id=?", (str(old.memory_id),)).fetchone()[0] == 2
+
+
+def test_integrity_detects_tampered_event_payload(db):
+    receipt = db.ingest(event("n1", "tamper", "Decision: storage uses SQLite."))
+    with db.database.connection:
+        db.database.execute("UPDATE events SET payload_json=? WHERE id=?", ('{"text":"tampered"}', str(receipt.event_id)))
+    report = check_database(db.database)
+    assert report.event_hash_mismatches == 1
+    assert report.ok is False

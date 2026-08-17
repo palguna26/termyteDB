@@ -6,6 +6,8 @@ from dataclasses import asdict, dataclass
 
 from .db import MIGRATIONS, Database
 from .embedding import embed_text
+from .repository import canonical_event_content, hash_text
+from .schemas import ArtifactInput, EventInput
 
 
 @dataclass(frozen=True)
@@ -19,6 +21,7 @@ class IntegrityReport:
     missing_fts: int
     orphan_embeddings: int
     missing_embeddings: int
+    event_hash_mismatches: int
     schema_compatible: bool
 
     @property
@@ -32,6 +35,7 @@ class IntegrityReport:
             or self.missing_fts
             or self.orphan_embeddings
             or self.missing_embeddings
+            or self.event_hash_mismatches
             or not self.schema_compatible
         )
 
@@ -98,6 +102,34 @@ def check_database(database: Database) -> IntegrityReport:
             WHERE v.status='active' AND m.status='active' AND v.valid_to IS NULL AND e.memory_version_id IS NULL"""
         ).fetchone()[0]
     )
+    event_hash_mismatches = 0
+    for event in connection.execute("SELECT * FROM events").fetchall():
+        artifacts = connection.execute(
+            "SELECT content_hash, media_type, size_bytes, uri, metadata_json FROM artifacts WHERE event_id=? AND namespace_id=? ORDER BY id",
+            (event["id"], event["namespace_id"]),
+        ).fetchall()
+        event_input = EventInput(
+            namespace_id=event["namespace_id"],
+            protocol_version=event["protocol_version"],
+            idempotency_key="integrity-check",
+            type=event["type"],
+            payload=json.loads(event["payload_json"]),
+            # Omitted server ingestion time is intentionally excluded from identity.
+            occurred_at=None,
+            stream_id=event["stream_id"],
+            actor_id=event["actor_id"],
+            agent_id=event["agent_id"],
+            session_id=event["session_id"],
+            source_id=event["source_id"],
+            artifacts=[ArtifactInput.model_validate({
+                    "content_hash": item["content_hash"], "media_type": item["media_type"], "size_bytes": item["size_bytes"],
+                    "uri": item["uri"], "metadata": json.loads(item["metadata_json"]),
+                })
+                for item in artifacts
+            ],
+        )
+        if hash_text(canonical_event_content(event_input, event_input.payload)) != event["content_hash"]:
+            event_hash_mismatches += 1
     return IntegrityReport(
         schema_version,
         foreign_key_errors,
@@ -108,6 +140,7 @@ def check_database(database: Database) -> IntegrityReport:
         missing_fts,
         orphan_embeddings,
         missing_embeddings,
+        event_hash_mismatches,
         compatible,
     )
 

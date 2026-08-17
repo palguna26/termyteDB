@@ -60,3 +60,4 @@
 - [x] Continuation fixtures validate repository snapshots and declarative verification tests
 - [x] Production-path reconciliation evaluator with labelled action fixtures
 - [x] Namespace-scoped durable job cancellation and bounded processing timeout
+- [x] Integrity detection for tampered canonical event payloads
