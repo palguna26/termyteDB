@@ -42,6 +42,16 @@ python -m termytedb --database .\memory.sqlite
 
 The service publishes OpenAPI at `/docs`. Main endpoints are `/v1/events`, `/v1/events:batch`, `/v1/process`, `/v1/search`, `/v1/context`, `/v1/memories/{id}`, `/v1/export`, `/v1/import`, `/v1/feedback`, `/v1/integrity`, `/health`, and `/ready`.
 
+Local database operations:
+
+```powershell
+python -m termytedb.operations init --database .\memory.sqlite
+python -m termytedb.operations export --database .\memory.sqlite --namespace demo --output .\demo.json
+python -m termytedb.operations import --database .\restored.sqlite --namespace demo --input .\demo.json
+python -m termytedb.operations backup --database .\memory.sqlite --output .\memory.backup.sqlite
+python -m termytedb.operations integrity --database .\memory.sqlite
+```
+
 Inspection collections support `limit` (1–100) and `offset` pagination.
 
 ## Evaluation and benchmarks

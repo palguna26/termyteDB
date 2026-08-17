@@ -72,3 +72,4 @@
 - [x] HTTP regression coverage for explicit historical retrieval
 - [x] Paginated namespace-scoped memory collection inspection
 - [x] Namespace-scoped processing and storage metrics endpoint
+- [x] Local operations CLI for initialization, export/import, backup, and integrity
