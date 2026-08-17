@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+from collections import defaultdict, deque
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from pathlib import Path
+from threading import Lock
+from time import monotonic
 from typing import cast
 from uuid import UUID, uuid4
 
@@ -37,6 +40,7 @@ def create_app(
     database: Database | None = None,
     extraction_provider: ExtractionProvider | None = None,
     namespace_authorizer: Callable[[str], bool] | None = None,
+    rate_limit_per_minute: int | None = None,
 ) -> FastAPI:
     if database is None and database_path is None:
         raise ValueError("create_app requires an explicit database path or database instance")
@@ -51,10 +55,26 @@ def create_app(
 
     app = FastAPI(title="TermyteDB", version="0.1.0", lifespan=lifespan)
     app.state.engine = engine
+    request_windows: dict[str, deque[float]] = defaultdict(deque)
+    request_windows_lock = Lock()
 
     def require_namespace(namespace_id: str) -> None:
         if namespace_authorizer is not None and not namespace_authorizer(namespace_id):
             raise HTTPException(status_code=403, detail="namespace access denied")
+
+    def enforce_rate_limit(namespace_id: str) -> None:
+        if rate_limit_per_minute is None:
+            return
+        if rate_limit_per_minute < 1:
+            raise ValueError("rate_limit_per_minute must be positive")
+        now = monotonic()
+        with request_windows_lock:
+            window = request_windows[namespace_id]
+            while window and now - window[0] >= 60:
+                window.popleft()
+            if len(window) >= rate_limit_per_minute:
+                raise HTTPException(status_code=429, detail="namespace rate limit exceeded", headers={"retry-after": "60"})
+            window.append(now)
 
     @app.middleware("http")
     async def request_id_middleware(request: Request, call_next: object) -> Response:
@@ -66,6 +86,7 @@ def create_app(
     @app.post("/v1/events")
     def ingest(event: EventInput) -> EventReceipt:
         require_namespace(event.namespace_id)
+        enforce_rate_limit(event.namespace_id)
         try:
             return engine.ingest(event)
         except IdempotencyConflict as exc:
@@ -75,6 +96,7 @@ def create_app(
     def ingest_batch(request: BatchEventRequest) -> BatchEventResponse:
         for event in request.events:
             require_namespace(event.namespace_id)
+            enforce_rate_limit(event.namespace_id)
         try:
             return engine.ingest_batch(request.events)
         except IdempotencyConflict as exc:
@@ -83,6 +105,7 @@ def create_app(
     @app.post("/v1/process")
     def process(request: ProcessRequest) -> ProcessResponse:
         require_namespace(request.namespace_id)
+        enforce_rate_limit(request.namespace_id)
         return engine.process(request.namespace_id, request.limit, request.lease_seconds)
 
     @app.get("/v1/jobs")
@@ -101,11 +124,13 @@ def create_app(
     @app.post("/v1/search")
     def search(request: SearchRequest) -> list[SearchResult]:
         require_namespace(request.namespace_id)
+        enforce_rate_limit(request.namespace_id)
         return engine.search(request.namespace_id, request.query, request.limit)
 
     @app.post("/v1/context")
     def context(request: ContextRequest) -> ContextResponse:
         require_namespace(request.namespace_id)
+        enforce_rate_limit(request.namespace_id)
         return engine.context(request.namespace_id, request.query, request.token_budget, request.limit)
 
     @app.get("/v1/context/requests")

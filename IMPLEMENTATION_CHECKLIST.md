@@ -50,3 +50,4 @@
 - [x] Context score-floor abstention, deduplication, token diagnostics, and exclusion reasons
 - [x] Persisted namespace-scoped context selection audit with restart and deletion coverage
 - [x] Artifact URI and metadata redaction across persistence, inspection, and export
+- [x] Optional per-namespace HTTP sliding-window rate boundary
