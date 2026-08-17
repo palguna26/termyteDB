@@ -591,8 +591,9 @@ class Repository:
                 return memory_id if memory else None, "IGNORE", None
             if not memory:
                 self.db.execute(
-                    "INSERT INTO memories(id, namespace_id, kind, subject_key, status, confidence, created_at) VALUES (?, ?, ?, ?, 'active', ?, ?)",
-                    (memory_id, namespace_id, item.kind, item.subject, item.confidence, iso()),
+                    "INSERT INTO memories(id, namespace_id, kind, subject_key, status, confidence, importance, created_at) "
+                    "VALUES (?, ?, ?, ?, 'active', ?, ?, ?)",
+                    (memory_id, namespace_id, item.kind, item.subject, item.confidence, item.importance, iso()),
                 )
             current = self.db.execute(
                 "SELECT * FROM memory_versions WHERE memory_id=? AND namespace_id=? ORDER BY version DESC LIMIT 1", (memory_id, namespace_id)
@@ -663,8 +664,8 @@ class Repository:
                 )
             if status == "active":
                 self.db.execute(
-                    "UPDATE memories SET current_version_id=?, status='active', confidence=? WHERE id=? AND namespace_id=?",
-                    (version_id, item.confidence, memory_id, namespace_id),
+                    "UPDATE memories SET current_version_id=?, status='active', confidence=?, importance=? WHERE id=? AND namespace_id=?",
+                    (version_id, item.confidence, item.importance, memory_id, namespace_id),
                 )
                 self.db.execute(
                     "INSERT INTO memory_fts(memory_version_id, namespace_id, statement, evidence_text) VALUES (?, ?, ?, ?)",
@@ -691,6 +692,7 @@ class Repository:
             subject_key=row["subject_key"],
             status=row["version_status"],
             confidence=row["confidence"],
+            importance=row["importance"],
             current_version_id=uuid.UUID(row["version_id"]),
             version=row["version"],
             statement=row["statement"],
@@ -708,7 +710,7 @@ class Repository:
         return [
             MemoryResponse(
                 memory_id=uuid.UUID(row["id"]), namespace_id=namespace_id, kind=row["kind"], subject_key=row["subject_key"],
-                status=row["version_status"], confidence=row["confidence"], current_version_id=uuid.UUID(row["version_id"]),
+                status=row["version_status"], confidence=row["confidence"], importance=row["importance"], current_version_id=uuid.UUID(row["version_id"]),
                 version=row["version"], statement=row["statement"], citations=self._citations(namespace_id, row["version_id"]),
             )
             for row in rows
@@ -747,7 +749,7 @@ class Repository:
             return []
         placeholders = ",".join("?" for _ in candidate_ids)
         rows = self.db.execute(
-            f"""SELECT m.id, m.kind, m.confidence, v.id AS version_id, v.statement, v.status
+            f"""SELECT m.id, m.kind, m.confidence, m.importance, v.id AS version_id, v.statement, v.status
             FROM memory_versions v JOIN memories m ON m.id=v.memory_id AND m.namespace_id=?
             WHERE v.namespace_id=? AND v.id IN ({placeholders}) AND (? OR (v.status='active' AND m.status='active' AND v.valid_to IS NULL
               AND (v.valid_until IS NULL OR julianday(v.valid_until) > julianday('now'))))""",
@@ -774,6 +776,7 @@ class Repository:
                     vector_score=vector_score,
                     component_scores={
                         "confidence": round(float(row["confidence"]), 6),
+                        "importance": round(float(row["importance"]), 6),
                         "evidence_quality": round(min(1.0, len(citations) / 3), 6),
                         "memory_type_signal": float(row["kind"].casefold() in query_terms),
                         "temporal_signal": float(row["status"] == "active"),

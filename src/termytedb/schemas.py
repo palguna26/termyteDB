@@ -71,6 +71,7 @@ class ExtractionCandidate(BaseModel):
     statement: str = Field(min_length=1, max_length=2000)
     evidence: list[EvidenceSpan] = Field(min_length=1, max_length=8)
     confidence: float = Field(ge=0, le=1)
+    importance: float = Field(default=0.5, ge=0, le=1)
     durability: Durability
     valid_from: datetime | None = None
     valid_until: datetime | None = None
@@ -216,6 +217,7 @@ class MemoryResponse(BaseModel):
     subject_key: str
     status: str
     confidence: float
+    importance: float
     current_version_id: UUID
     version: int
     statement: str

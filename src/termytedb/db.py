@@ -246,6 +246,9 @@ MIGRATIONS: tuple[str, ...] = (
     );
     CREATE INDEX context_requests_namespace_created_idx ON context_requests(namespace_id, created_at);
     """,
+    """
+    ALTER TABLE memories ADD COLUMN importance REAL NOT NULL DEFAULT 0.5;
+    """,
 )
 
 
