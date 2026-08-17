@@ -41,3 +41,4 @@
 - [x] Namespace-scoped event/evidence and job inspection plus integrity API
 - [x] Optional generic HTTP extraction provider with strict schema and safe failures
 - [x] Reproducible coding-continuation fixture runner with explicit baseline metrics
+- [x] LongMemEval-shaped production-path adapter with frozen run metadata and raw predictions

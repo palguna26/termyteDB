@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import tempfile
@@ -136,6 +137,60 @@ def evaluate_continuation_fixture(path: str | Path) -> dict[str, Any]:
     }
 
 
+def evaluate_longmemeval_fixture(
+    path: str | Path,
+    *,
+    dataset_revision: str = "local-fixture",
+    extraction_model: str = "rule-v1",
+    embedding_model: str = "local-hash-v1",
+) -> dict[str, Any]:
+    """Run LongMemEval-shaped items through production paths and freeze run metadata."""
+    cases = [json.loads(line) for line in Path(path).read_text(encoding="utf-8").splitlines() if line.strip()]
+    prompt = "longmemeval-s-adapter-v1|evidence-framed|answer-from-context"
+    config: dict[str, Any] = {
+        "dataset_revision": dataset_revision,
+        "extraction_model": extraction_model,
+        "embedding_model": embedding_model,
+        "reranker": "none",
+        "answer_model": "none-local-context-match",
+        "retrieval_weights": {"lexical": 0.6, "vector": 0.4},
+        "top_k": 5,
+        "token_budget": 500,
+        "prompt_hash": hashlib.sha256(prompt.encode()).hexdigest(),
+    }
+    started = time.perf_counter()
+    predictions: list[dict[str, Any]] = []
+    with tempfile.TemporaryDirectory(prefix="termytedb-longmemeval-") as directory:
+        engine = TermyteDB(Path(directory) / "longmemeval.sqlite")
+        for index, case in enumerate(cases):
+            namespace = f"longmemeval-{index}"
+            for event_index, evidence in enumerate(case["evidence"]):
+                engine.ingest({"namespace_id": namespace, "idempotency_key": f"item-{event_index}", "type": "conversation", "payload": {"text": evidence}})
+            engine.process(namespace, limit=max(1, len(case["evidence"])))
+            context = engine.context(namespace, case["question"], config["token_budget"], config["top_k"])
+            expected = str(case["expected"]).casefold()
+            predictions.append(
+                {
+                    "id": case.get("id", str(index)),
+                    "prediction": context.text,
+                    "expected": case["expected"],
+                    "correct": expected in context.text.casefold(),
+                    "abstained": context.abstained,
+                    "token_count": context.token_count,
+                }
+            )
+        engine.close()
+    elapsed_ms = (time.perf_counter() - started) * 1000
+    return {
+        "config": config,
+        "cases": len(predictions),
+        "accuracy": round(sum(int(item["correct"]) for item in predictions) / len(predictions), 4) if predictions else 0.0,
+        "abstention_rate": round(sum(int(item["abstained"]) for item in predictions) / len(predictions), 4) if predictions else 0.0,
+        "elapsed_ms": round(elapsed_ms, 3),
+        "predictions": predictions,
+    }
+
+
 def main() -> None:
     import argparse
 
@@ -143,8 +198,11 @@ def main() -> None:
     parser.add_argument("fixture", type=Path)
     parser.add_argument("--retrieval", action="store_true", help="run the production retrieval fixture instead of extraction")
     parser.add_argument("--continuation", action="store_true", help="run the production continuation fixture")
+    parser.add_argument("--longmemeval", action="store_true", help="run the LongMemEval-shaped production adapter")
     arguments = parser.parse_args()
-    if arguments.continuation:
+    if arguments.longmemeval:
+        result = evaluate_longmemeval_fixture(arguments.fixture)
+    elif arguments.continuation:
         result = evaluate_continuation_fixture(arguments.fixture)
     else:
         result = evaluate_retrieval_fixture(arguments.fixture) if arguments.retrieval else evaluate_rule_fixture(arguments.fixture)

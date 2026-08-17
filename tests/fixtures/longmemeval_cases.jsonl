@@ -1,0 +1,2 @@
+{"id":"lm-001","evidence":["Decision: use SQLite for local persistence."],"question":"What persistence decision was made?","expected":"use SQLite for local persistence"}
+{"id":"lm-002","evidence":["Failure: the migration failed."],"question":"What failure should be remembered?","expected":"the migration failed"}
