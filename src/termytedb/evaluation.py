@@ -87,6 +87,31 @@ def evaluate_retrieval_fixture(path: str | Path) -> dict[str, float | int]:
     }
 
 
+def evaluate_reconciliation_fixture(path: str | Path) -> dict[str, float | int]:
+    """Measure reconciliation actions through the production processing path."""
+    cases = [json.loads(line) for line in Path(path).read_text(encoding="utf-8").splitlines() if line.strip()]
+    action_correct = 0
+    action_total = 0
+    with tempfile.TemporaryDirectory(prefix="termytedb-reconciliation-") as directory:
+        engine = TermyteDB(Path(directory) / "reconciliation.sqlite")
+        for case_index, case in enumerate(cases):
+            namespace = f"reconciliation-{case_index}"
+            for event_index, event in enumerate(case["events"]):
+                text = event["text"] if isinstance(event, dict) else str(event)
+                engine.ingest({"namespace_id": namespace, "idempotency_key": f"event-{event_index}", "type": "decision", "payload": {"text": text}})
+            engine.process(namespace, limit=max(1, len(case["events"])))
+            actual = [row["action"] for row in engine.extraction_decisions(namespace)]
+            expected = list(case["expected_actions"])
+            action_total += len(expected)
+            action_correct += sum(int(left == right) for left, right in zip(reversed(actual), expected))
+        engine.close()
+    return {
+        "cases": len(cases),
+        "reconciliation_accuracy": round(action_correct / action_total, 4) if action_total else 0.0,
+        "action_count": action_total,
+    }
+
+
 def _events(cases: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [{"text": case["evidence"]} for case in cases]
 
@@ -279,8 +304,11 @@ def main() -> None:
     parser.add_argument("--retrieval", action="store_true", help="run the production retrieval fixture instead of extraction")
     parser.add_argument("--continuation", action="store_true", help="run the production continuation fixture")
     parser.add_argument("--longmemeval", action="store_true", help="run the LongMemEval-shaped production adapter")
+    parser.add_argument("--reconciliation", action="store_true", help="run the production reconciliation fixture")
     arguments = parser.parse_args()
-    if arguments.longmemeval:
+    if arguments.reconciliation:
+        result = evaluate_reconciliation_fixture(arguments.fixture)
+    elif arguments.longmemeval:
         result = evaluate_longmemeval_fixture(arguments.fixture)
     elif arguments.continuation:
         result = evaluate_continuation_fixture(arguments.fixture)

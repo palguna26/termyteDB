@@ -1,0 +1,2 @@
+{"id":"insert-reinforce","events":[{"text":"Decision: use SQLite."},{"text":"Decision: use SQLite."}],"expected_actions":["INSERT","REINFORCE"]}
+{"id":"supersede","events":[{"text":"Decision: storage is SQLite."},{"text":"Decision: storage is PostgreSQL."}],"expected_actions":["INSERT","SUPERSEDE"]}
