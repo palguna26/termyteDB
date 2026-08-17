@@ -49,3 +49,4 @@
 - [x] Integrity detection and deterministic repair for both FTS and embedding indexes
 - [x] Context score-floor abstention, deduplication, token diagnostics, and exclusion reasons
 - [x] Persisted namespace-scoped context selection audit with restart and deletion coverage
+- [x] Artifact URI and metadata redaction across persistence, inspection, and export

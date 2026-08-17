@@ -28,7 +28,22 @@ def hash_text(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
+def safe_artifact_uri(uri: str | None, content_hash: str) -> str | None:
+    if not uri:
+        return None
+    expected = f"cas://{content_hash.removeprefix('sha256:')}"
+    return uri if uri == expected else "[REDACTED]"
+
+
 def canonical_event_content(event: EventInput, redacted_payload: dict[str, Any]) -> str:
+    artifacts = [
+        {
+            **item.model_dump(mode="json", exclude={"uri", "metadata"}),
+            "uri": safe_artifact_uri(item.uri, item.content_hash),
+            "metadata": {key: redact_text(value) for key, value in item.metadata.items()},
+        }
+        for item in event.artifacts
+    ]
     return json.dumps(
         {
             "protocol_version": event.protocol_version,
@@ -38,7 +53,7 @@ def canonical_event_content(event: EventInput, redacted_payload: dict[str, Any])
             "agent_id": event.agent_id,
             "session_id": event.session_id,
             "source_id": event.source_id,
-            "artifacts": [item.model_dump(mode="json") for item in event.artifacts],
+            "artifacts": artifacts,
             "occurred_at": event.occurred_at.isoformat() if event.occurred_at else None,
             "payload": redacted_payload,
         },
@@ -108,12 +123,14 @@ class Repository:
                     ),
                 )
                 for artifact in event.artifacts:
+                    safe_uri = safe_artifact_uri(artifact.uri, artifact.content_hash)
+                    safe_metadata = {key: redact_text(value) for key, value in artifact.metadata.items()}
                     self.db.execute(
                         """INSERT INTO artifacts(id, namespace_id, event_id, media_type, size_bytes, uri, content_hash, metadata_json)
                         VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
                         (
                             str(uuid.uuid4()), namespace_id, event_id, artifact.media_type, artifact.size_bytes,
-                            artifact.uri, artifact.content_hash, json.dumps(artifact.metadata, sort_keys=True, separators=(",", ":")),
+                            safe_uri, artifact.content_hash, json.dumps(safe_metadata, sort_keys=True, separators=(",", ":")),
                         ),
                     )
                 self.db.execute(
