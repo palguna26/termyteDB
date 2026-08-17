@@ -33,3 +33,4 @@
 - [x] Namespace export and transactional deletion endpoints
 - [x] Health and readiness endpoints
 - [x] Repository installs cleanly for pytest via configured source path
+- [x] Persistent deterministic episode construction with late-event handling

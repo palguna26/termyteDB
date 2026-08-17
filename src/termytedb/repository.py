@@ -4,7 +4,7 @@ import hashlib
 import json
 import sqlite3
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any, cast
 
 from .db import Database
@@ -100,7 +100,64 @@ class Repository:
                     VALUES (?, ?, ?, ?, 'pending', ?, ?)""",
                     (job_id, namespace_id, event_id, content_hash, iso(), iso()),
                 )
+                self._assign_episode(namespace_id, event_id, event.stream_id, occurred)
             return event_id, False, content_hash, job_id
+
+    def _assign_episode(self, namespace_id: str, event_id: str, stream_id: str | None, occurred: str) -> str:
+        """Assign an event to the nearest deterministic stream episode."""
+        event_time = datetime.fromisoformat(occurred)
+        candidates = self.db.execute(
+            """SELECT ep.id, ep.start_event_id, ep.end_event_id,
+                      start.occurred_at AS start_at, end.occurred_at AS end_at
+               FROM episodes ep
+               JOIN events start ON start.id=ep.start_event_id
+               JOIN events end ON end.id=ep.end_event_id
+               WHERE ep.namespace_id=? AND (ep.stream_id IS ? OR ep.stream_id=?)
+               ORDER BY ep.updated_at DESC""",
+            (namespace_id, stream_id, stream_id),
+        ).fetchall()
+        selected: sqlite3.Row | None = None
+        for row in candidates:
+            start = datetime.fromisoformat(row["start_at"])
+            end = datetime.fromisoformat(row["end_at"])
+            if min(abs(event_time - start), abs(event_time - end)) <= timedelta(minutes=30):
+                selected = row
+                break
+        if selected is None:
+            episode_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"termytedb:episode:{namespace_id}:{event_id}"))
+            self.db.execute(
+                """INSERT INTO episodes(id, namespace_id, stream_id, start_event_id, end_event_id, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (episode_id, namespace_id, stream_id, event_id, event_id, iso(), iso()),
+            )
+            self.db.execute(
+                "INSERT INTO episode_events(episode_id, namespace_id, event_id, ordinal) VALUES (?, ?, ?, 0)",
+                (episode_id, namespace_id, event_id),
+            )
+            return episode_id
+        episode_id = cast(str, selected["id"])
+        count = int(self.db.execute("SELECT COUNT(*) FROM episode_events WHERE episode_id=?", (episode_id,)).fetchone()[0])
+        self.db.execute(
+            "INSERT INTO episode_events(episode_id, namespace_id, event_id, ordinal) VALUES (?, ?, ?, ?)",
+            (episode_id, namespace_id, event_id, count),
+        )
+        start_id = selected["start_event_id"]
+        end_id = selected["end_event_id"]
+        if event_time < datetime.fromisoformat(selected["start_at"]):
+            start_id = event_id
+        if event_time > datetime.fromisoformat(selected["end_at"]):
+            end_id = event_id
+        self.db.execute(
+            "UPDATE episodes SET start_event_id=?, end_event_id=?, updated_at=? WHERE id=? AND namespace_id=?",
+            (start_id, end_id, iso(), episode_id, namespace_id),
+        )
+        return episode_id
+
+    def list_episodes(self, namespace_id: str) -> list[dict[str, Any]]:
+        rows = self.db.execute(
+            "SELECT * FROM episodes WHERE namespace_id=? ORDER BY created_at, id", (namespace_id,)
+        ).fetchall()
+        return [dict(row) for row in rows]
 
     def claim_jobs(self, namespace_id: str, limit: int, lease_seconds: int) -> list[sqlite3.Row]:
         # SQLite computes the lease consistently and avoids client clock formatting issues.
@@ -558,6 +615,8 @@ class Repository:
             self.db.execute("DELETE FROM memory_fts WHERE namespace_id=?", (namespace_id,))
             self.db.execute("DELETE FROM extraction_decisions WHERE namespace_id=?", (namespace_id,))
             self.db.execute("DELETE FROM extraction_runs WHERE namespace_id=?", (namespace_id,))
+            self.db.execute("DELETE FROM episode_events WHERE namespace_id=?", (namespace_id,))
+            self.db.execute("DELETE FROM episodes WHERE namespace_id=?", (namespace_id,))
             for table in ("evidence_refs", "memory_versions", "memories", "processing_jobs", "events"):
                 self.db.execute(f"DELETE FROM {table} WHERE namespace_id=?", (namespace_id,))
             self.db.execute("DELETE FROM namespaces WHERE id=?", (namespace_id,))

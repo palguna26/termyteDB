@@ -167,6 +167,29 @@ MIGRATIONS: tuple[str, ...] = (
     ALTER TABLE memory_versions ADD COLUMN durability TEXT NOT NULL DEFAULT 'session';
     ALTER TABLE memory_versions ADD COLUMN model_run_id TEXT;
     """,
+    """
+    CREATE TABLE episodes (
+      id TEXT PRIMARY KEY,
+      namespace_id TEXT NOT NULL REFERENCES namespaces(id),
+      stream_id TEXT,
+      start_event_id TEXT NOT NULL REFERENCES events(id),
+      end_event_id TEXT NOT NULL REFERENCES events(id),
+      status TEXT NOT NULL DEFAULT 'active',
+      summary TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+    CREATE INDEX episodes_namespace_stream_idx ON episodes(namespace_id, stream_id, updated_at);
+    CREATE TABLE episode_events (
+      episode_id TEXT NOT NULL REFERENCES episodes(id),
+      namespace_id TEXT NOT NULL REFERENCES namespaces(id),
+      event_id TEXT NOT NULL REFERENCES events(id),
+      ordinal INTEGER NOT NULL,
+      PRIMARY KEY (episode_id, event_id),
+      UNIQUE(namespace_id, event_id)
+    );
+    CREATE INDEX episode_events_order_idx ON episode_events(episode_id, ordinal);
+    """,
 )
 
 

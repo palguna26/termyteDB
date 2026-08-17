@@ -97,6 +97,10 @@ def create_app(
     def export(namespace_id: str = Query(...)) -> dict[str, object]:
         return engine.export_namespace(namespace_id)
 
+    @app.get("/v1/episodes")
+    def episodes(namespace_id: str = Query(...)) -> list[dict[str, object]]:
+        return engine.episodes(namespace_id)
+
     @app.delete("/v1/namespaces/{namespace_id}")
     def delete_namespace(namespace_id: str) -> dict[str, bool]:
         if not engine.delete_namespace(namespace_id):

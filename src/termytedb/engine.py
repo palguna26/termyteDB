@@ -77,6 +77,9 @@ class TermyteDB:
     def delete_namespace(self, namespace_id: str) -> bool:
         return self.repository.delete_namespace(namespace_id)
 
+    def episodes(self, namespace_id: str) -> list[dict[str, Any]]:
+        return self.repository.list_episodes(namespace_id)
+
     def process(self, namespace_id: str, limit: int = 100, lease_seconds: int = 30) -> ProcessResponse:
         processed, failed, dead, accepted, rejected = self.processor.process_namespace(namespace_id, limit, lease_seconds)
         return ProcessResponse(processed=processed, failed=failed, dead_lettered=dead, accepted=accepted, rejected=rejected)
