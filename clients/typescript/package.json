@@ -1,0 +1,9 @@
+{
+  "name": "termytedb-client",
+  "version": "0.1.0",
+  "description": "Thin HTTP client for the TermyteDB service",
+  "type": "module",
+  "exports": {
+    ".": "./index.ts"
+  }
+}
