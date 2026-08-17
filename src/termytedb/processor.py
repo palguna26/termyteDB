@@ -46,7 +46,12 @@ class Processor:
                     rule_mode = True
                 else:
                     request = ExtractionRequest(namespace_id=namespace_id, events=[event_id], evidence_text=included)
-                    provider_result = self.provider.extract(request)
+                    remaining = max(0.001, deadline - time.perf_counter())
+                    provider_result = self.provider.extract(
+                        request,
+                        timeout_seconds=remaining,
+                        cancellation=lambda: time.perf_counter() >= deadline,
+                    )
                     response = provider_result.response
                     provider_name, model_name = provider_result.provider_name, provider_result.model_name
                     input_tokens, output_tokens, provider_latency = provider_result.input_tokens, provider_result.output_tokens, provider_result.latency_ms

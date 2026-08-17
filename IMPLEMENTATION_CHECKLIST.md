@@ -67,3 +67,4 @@
 - [x] Injectable embedding provider boundary with persisted index provenance
 - [x] OpenAPI contract regression coverage for versioned public operations
 - [x] CLI configuration boundary for optional HTTP extraction and rate limits
+- [x] Provider timeout and cancellation propagation from processing deadlines
