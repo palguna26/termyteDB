@@ -22,16 +22,27 @@ from .schemas import (
 
 
 class TermyteDB:
-    def __init__(self, path: str | Path = "termytedb.sqlite", logger: logging.Logger | None = None):
-        self.database = Database(path)
+    def __init__(
+        self,
+        path: str | Path | None = None,
+        *,
+        database: Database | None = None,
+        logger: logging.Logger | None = None,
+    ):
+        if database is None and path is None:
+            raise ValueError("an explicit database path or database instance is required")
+        if database is not None and path is not None:
+            raise ValueError("provide a database path or database instance, not both")
+        self.database = database or Database(path)  # type: ignore[arg-type]
         self.repository = Repository(self.database)
         self.logger = logger or get_logger()
         self.processor = Processor(self.repository, self.logger)
+        self._closed = False
 
     def ingest(self, event: EventInput | dict[str, Any]) -> EventReceipt:
         parsed = event if isinstance(event, EventInput) else EventInput.model_validate(event)
         redacted_payload = redact(parsed.payload)
-        event_id, duplicate, content_hash, job_id = self.repository.ingest(parsed, redacted_payload)
+        event_id, duplicate, content_hash, job_id = self.repository.ingest(parsed.namespace_id, parsed, redacted_payload)
         log(
             self.logger,
             logging.INFO,
@@ -79,4 +90,9 @@ class TermyteDB:
         return self.repository.get_memory(namespace_id, memory_id)
 
     def close(self) -> None:
-        self.database.close()
+        if not self._closed:
+            self.database.close()
+            self._closed = True
+
+    def checkpoint(self) -> None:
+        self.database.checkpoint()

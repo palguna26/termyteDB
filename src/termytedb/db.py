@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -87,13 +88,32 @@ MIGRATIONS: tuple[str, ...] = (
       evidence_text
     );
     """,
+    """
+    ALTER TABLE memory_versions ADD COLUMN source_event_id TEXT REFERENCES events(id);
+    UPDATE memory_versions
+    SET source_event_id = (
+      SELECT event_id FROM evidence_refs
+      WHERE evidence_refs.memory_version_id = memory_versions.id
+      ORDER BY evidence_refs.id LIMIT 1
+    )
+    WHERE source_event_id IS NULL;
+    CREATE TRIGGER evidence_refs_namespace_guard
+    BEFORE INSERT ON evidence_refs
+    BEGIN
+      SELECT CASE WHEN
+        (SELECT namespace_id FROM memory_versions WHERE id=NEW.memory_version_id) != NEW.namespace_id
+        OR (SELECT namespace_id FROM events WHERE id=NEW.event_id) != NEW.namespace_id
+        THEN RAISE(ABORT, 'evidence namespace or source mismatch') END;
+    END;
+    """,
 )
 
 
 class Database:
     def __init__(self, path: str | Path):
         self.path = str(path)
-        self.connection = sqlite3.connect(self.path, check_same_thread=False)
+        self.lock = threading.RLock()
+        self.connection = sqlite3.connect(self.path, check_same_thread=False, timeout=30)
         self.connection.row_factory = sqlite3.Row
         self.connection.execute("PRAGMA foreign_keys = ON")
         self.connection.execute("PRAGMA journal_mode = WAL")
@@ -117,4 +137,10 @@ class Database:
         return self.connection.execute(sql, parameters)
 
     def close(self) -> None:
-        self.connection.close()
+        with self.lock:
+            self.checkpoint()
+            self.connection.close()
+
+    def checkpoint(self) -> None:
+        with self.lock:
+            self.connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")

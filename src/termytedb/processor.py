@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import json
 import logging
+from typing import Any
 
-from .extractor import extract
+from .extractor import extract, payload_text
 from .logging import log
+from .redaction import redact_text
 from .repository import Repository
 
 
@@ -22,7 +24,7 @@ class Processor:
                 payload = json.loads(event["payload_json"])
                 candidates = extract(payload)
                 for candidate in candidates:
-                    self._validate_evidence(namespace_id, event, candidate)
+                    self._validate_evidence(namespace_id, event, candidate, payload)
                     self.repository.save_candidate(namespace_id, event, candidate)
                 self.repository.complete_job(namespace_id, job["id"])
                 processed += 1
@@ -35,7 +37,8 @@ class Processor:
                     candidates=len(candidates),
                 )
             except Exception as exc:  # the job record is the failure boundary
-                status = self.repository.fail_job(namespace_id, job["id"], str(exc))
+                safe_error = redact_text(str(exc))
+                status = self.repository.fail_job(namespace_id, job["id"], safe_error)
                 failed += 1
                 dead += status == "dead"
                 log(
@@ -45,14 +48,17 @@ class Processor:
                     namespace_id=namespace_id,
                     job_id=job["id"],
                     status=status,
-                    error=str(exc),
+                    error=safe_error,
                 )
         return processed, failed, dead
 
     @staticmethod
-    def _validate_evidence(namespace_id: str, event: object, candidate: object) -> None:
+    def _validate_evidence(namespace_id: str, event: object, candidate: object, payload: dict[str, Any]) -> None:
         event_namespace = event["namespace_id"]  # type: ignore[index]
         if event_namespace != namespace_id:
             raise ValueError("evidence namespace mismatch")
-        if candidate.start_offset < 0 or candidate.end_offset <= candidate.start_offset:  # type: ignore[attr-defined]
+        text = payload_text(payload)
+        if candidate.start_offset < 0 or candidate.end_offset > len(text):  # type: ignore[attr-defined]
             raise ValueError("invalid evidence span")
+        if text[candidate.start_offset : candidate.end_offset] != candidate.statement:  # type: ignore[attr-defined]
+            raise ValueError("evidence does not match source text")

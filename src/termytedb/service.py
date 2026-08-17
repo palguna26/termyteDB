@@ -1,8 +1,14 @@
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+from pathlib import Path
+
 from fastapi import FastAPI, HTTPException
 
+from .db import Database
 from .engine import TermyteDB
+from .errors import IdempotencyConflict
 from .schemas import (
     ContextRequest,
     ContextResponse,
@@ -16,14 +22,27 @@ from .schemas import (
 )
 
 
-def create_app(database_path: str = "termytedb.sqlite") -> FastAPI:
-    app = FastAPI(title="TermyteDB", version="0.1.0")
-    engine = TermyteDB(database_path)
+def create_app(database_path: str | Path | None = None, *, database: Database | None = None) -> FastAPI:
+    if database is None and database_path is None:
+        raise ValueError("create_app requires an explicit database path or database instance")
+    engine = TermyteDB(database_path, database=database)
+
+    @asynccontextmanager
+    async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+        try:
+            yield
+        finally:
+            engine.close()
+
+    app = FastAPI(title="TermyteDB", version="0.1.0", lifespan=lifespan)
     app.state.engine = engine
 
     @app.post("/v1/events")
     def ingest(event: EventInput) -> EventReceipt:
-        return engine.ingest(event)
+        try:
+            return engine.ingest(event)
+        except IdempotencyConflict as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     @app.post("/v1/process")
     def process(request: ProcessRequest) -> ProcessResponse:
@@ -45,6 +64,3 @@ def create_app(database_path: str = "termytedb.sqlite") -> FastAPI:
         return memory
 
     return app
-
-
-app = create_app()

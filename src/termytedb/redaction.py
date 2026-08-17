@@ -10,6 +10,8 @@ PATTERNS = (
     (re.compile(r"\b[\w.+-]+@[\w-]+\.[\w.-]+\b"), "[REDACTED_EMAIL]"),
 )
 
+SENSITIVE_KEYS = {"api_key", "apikey", "secret", "password", "token", "access_token", "private_key"}
+
 
 def redact_text(value: str) -> str:
     for pattern, replacement in PATTERNS:
@@ -21,7 +23,11 @@ def redact(value: Any) -> Any:
     if isinstance(value, str):
         return redact_text(value)
     if isinstance(value, dict):
-        return {str(key): redact(item) for key, item in value.items()}
+        result: dict[str, Any] = {}
+        for key, item in value.items():
+            normalized_key = str(key).casefold().replace("-", "_")
+            result[str(key)] = "[REDACTED]" if normalized_key in SENSITIVE_KEYS else redact(item)
+        return result
     if isinstance(value, list):
         return [redact(item) for item in value]
     if isinstance(value, tuple):

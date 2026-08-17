@@ -15,5 +15,10 @@
 - [x] Leased jobs, retries, and dead-letter state
 - [x] Structured JSON logging
 - [x] Unit, security, restart, and end-to-end tests
+- [x] Explicit application factory and clean lifespan shutdown
+- [x] Namespace-scoped idempotency conflict handling
+- [x] Concurrent duplicate ingestion protection
+- [x] At-least-once processing guarantee documented
+- [x] SQLite integrity checks, schema compatibility checks, and deterministic FTS repair
+- [x] WAL checkpoint and direct persistence inspection
 - [ ] Milestone 2 features: embeddings, graph, SDKs, hosted storage, richer extraction
-

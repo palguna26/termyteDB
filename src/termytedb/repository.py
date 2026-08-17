@@ -8,6 +8,7 @@ from datetime import UTC, datetime
 from typing import Any, cast
 
 from .db import Database
+from .errors import IdempotencyConflict
 from .extractor import Candidate
 from .schemas import EventInput, EvidenceCitation, MemoryResponse, SearchResult
 
@@ -24,6 +25,19 @@ def hash_text(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
+def canonical_event_content(event: EventInput, redacted_payload: dict[str, Any]) -> str:
+    return json.dumps(
+        {
+            "type": event.type,
+            "stream_id": event.stream_id,
+            "occurred_at": event.occurred_at.isoformat() if event.occurred_at else None,
+            "payload": redacted_payload,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
 class Repository:
     def __init__(self, database: Database):
         self.db = database
@@ -35,54 +49,56 @@ class Repository:
                 (namespace_id, org_id, iso()),
             )
 
-    def ingest(self, event: EventInput, redacted_payload: dict[str, Any]) -> tuple[str, bool, str, str]:
-        self.ensure_namespace(event.namespace_id)
-        event_id = stable_uuid(event.namespace_id, event.idempotency_key)
-        idempotency_hash = hash_text(event.idempotency_key)
-        payload_json = json.dumps(redacted_payload, sort_keys=True, separators=(",", ":"))
-        content_hash = hash_text(payload_json)
-        occurred = iso(event.occurred_at)
-        job_id = str(uuid.uuid4())
-        with self.db.connection:
-            existing = self.db.execute(
-                "SELECT id, content_hash FROM events WHERE namespace_id = ? AND idempotency_hash = ?",
-                (event.namespace_id, idempotency_hash),
-            ).fetchone()
-            if existing:
-                existing_job = self.db.execute(
-                    "SELECT id FROM processing_jobs WHERE namespace_id = ? AND event_id = ? ORDER BY created_at LIMIT 1",
-                    (event.namespace_id, existing["id"]),
+    def ingest(self, namespace_id: str, event: EventInput, redacted_payload: dict[str, Any]) -> tuple[str, bool, str, str]:
+        if event.namespace_id != namespace_id:
+            raise ValueError("event namespace does not match repository namespace")
+        with self.db.lock:
+            self.ensure_namespace(namespace_id)
+            event_id = stable_uuid(namespace_id, event.idempotency_key)
+            idempotency_hash = hash_text(event.idempotency_key)
+            payload_json = json.dumps(redacted_payload, sort_keys=True, separators=(",", ":"))
+            content_hash = hash_text(canonical_event_content(event, redacted_payload))
+            occurred = iso(event.occurred_at)
+            job_id = str(uuid.uuid4())
+            with self.db.connection:
+                existing = self.db.execute(
+                    "SELECT id, content_hash FROM events WHERE namespace_id = ? AND idempotency_hash = ?",
+                    (namespace_id, idempotency_hash),
                 ).fetchone()
-                return (
-                    existing["id"],
-                    True,
-                    existing["content_hash"],
-                    existing_job["id"] if existing_job else job_id,
+                if existing:
+                    if existing["content_hash"] != content_hash:
+                        raise IdempotencyConflict("idempotency key is already used for different content")
+                    existing_job = self.db.execute(
+                        "SELECT id FROM processing_jobs WHERE namespace_id = ? AND event_id = ? ORDER BY created_at LIMIT 1",
+                        (namespace_id, existing["id"]),
+                    ).fetchone()
+                    if not existing_job:
+                        raise RuntimeError("event is missing its processing job")
+                    return existing["id"], True, existing["content_hash"], existing_job["id"]
+                self.db.execute(
+                    """INSERT INTO events
+                    (id, namespace_id, stream_id, idempotency_hash, type, occurred_at, payload_json,
+                     content_hash, redaction_state, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'redacted', ?)""",
+                    (
+                        event_id,
+                        namespace_id,
+                        event.stream_id,
+                        idempotency_hash,
+                        event.type,
+                        occurred,
+                        payload_json,
+                        content_hash,
+                        iso(),
+                    ),
                 )
-            self.db.execute(
-                """INSERT INTO events
-                (id, namespace_id, stream_id, idempotency_hash, type, occurred_at, payload_json,
-                 content_hash, redaction_state, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'redacted', ?)""",
-                (
-                    event_id,
-                    event.namespace_id,
-                    event.stream_id,
-                    idempotency_hash,
-                    event.type,
-                    occurred,
-                    payload_json,
-                    content_hash,
-                    iso(),
-                ),
-            )
-            self.db.execute(
-                """INSERT INTO processing_jobs
-                (id, namespace_id, event_id, input_hash, status, created_at, updated_at)
-                VALUES (?, ?, ?, ?, 'pending', ?, ?)""",
-                (job_id, event.namespace_id, event_id, content_hash, iso(), iso()),
-            )
-        return event_id, False, content_hash, job_id
+                self.db.execute(
+                    """INSERT INTO processing_jobs
+                    (id, namespace_id, event_id, input_hash, status, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, 'pending', ?, ?)""",
+                    (job_id, namespace_id, event_id, content_hash, iso(), iso()),
+                )
+            return event_id, False, content_hash, job_id
 
     def claim_jobs(self, namespace_id: str, limit: int, lease_seconds: int) -> list[sqlite3.Row]:
         # SQLite computes the lease consistently and avoids client clock formatting issues.
@@ -144,7 +160,15 @@ class Repository:
 
     def save_candidate(self, namespace_id: str, event: sqlite3.Row, candidate: Candidate) -> str:
         now = iso()
-        with self.db.connection:
+        with self.db.lock, self.db.connection:
+            stored_event = self.db.execute(
+                "SELECT id, namespace_id, created_at FROM events WHERE id=? AND namespace_id=?",
+                (event["id"], namespace_id),
+            ).fetchone()
+            if not stored_event:
+                raise ValueError("evidence event is not in the requested namespace")
+            if stored_event["created_at"] > now:
+                raise ValueError("evidence postdates derived version")
             memory = self.db.execute(
                 "SELECT * FROM memories WHERE namespace_id=? AND kind=? AND subject_key=?",
                 (namespace_id, candidate.kind, candidate.subject_key),
@@ -194,12 +218,16 @@ class Repository:
                     "UPDATE memory_versions SET status='superseded', valid_to=? WHERE id=? AND namespace_id=?",
                     (now, current["id"], namespace_id),
                 )
+                self.db.execute(
+                    "DELETE FROM memory_fts WHERE memory_version_id=? AND namespace_id=?",
+                    (current["id"], namespace_id),
+                )
             version_id = str(uuid.uuid4())
             self.db.execute(
                 """INSERT INTO memory_versions
-                (id, memory_id, namespace_id, version, statement, valid_from, recorded_at, status, reason)
-                VALUES (?, ?, ?, ?, ?, ?, ?, 'active', 'deterministic_rule')""",
-                (version_id, memory_id, namespace_id, version, candidate.statement, now, now),
+                (id, memory_id, namespace_id, source_event_id, version, statement, valid_from, recorded_at, status, reason)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active', 'deterministic_rule')""",
+                (version_id, memory_id, namespace_id, event["id"], version, candidate.statement, now, now),
             )
             self.db.execute(
                 """INSERT INTO evidence_refs
@@ -299,3 +327,10 @@ class Repository:
 
     def memory_count(self, namespace_id: str) -> int:
         return int(self.db.execute("SELECT COUNT(*) FROM memories WHERE namespace_id=?", (namespace_id,)).fetchone()[0])
+
+    def list_versions(self, namespace_id: str, memory_id: str) -> list[sqlite3.Row]:
+        return self.db.execute(
+            """SELECT * FROM memory_versions
+            WHERE memory_id=? AND namespace_id=? ORDER BY version""",
+            (memory_id, namespace_id),
+        ).fetchall()
