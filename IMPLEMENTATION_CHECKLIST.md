@@ -62,3 +62,4 @@
 - [x] Namespace-scoped durable job cancellation and bounded processing timeout
 - [x] Integrity detection for tampered canonical event payloads
 - [x] Integrity-aware readiness endpoint with unhealthy-store response
+- [x] SQLite online backup with reopen and preservation coverage

@@ -284,3 +284,11 @@ class Database:
     def checkpoint(self) -> None:
         with self.lock:
             self.connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+
+    def backup(self, destination: str | Path) -> None:
+        target = Path(destination)
+        if target.resolve() == Path(self.path).resolve():
+            raise ValueError("backup destination must differ from the live database")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with self.lock, sqlite3.connect(str(target)) as backup_connection:
+            self.connection.backup(backup_connection)

@@ -157,3 +157,6 @@ class TermyteDB:
 
     def checkpoint(self) -> None:
         self.database.checkpoint()
+
+    def backup(self, destination: str | Path) -> None:
+        self.database.backup(destination)
