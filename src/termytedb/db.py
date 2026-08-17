@@ -190,6 +190,16 @@ MIGRATIONS: tuple[str, ...] = (
     );
     CREATE INDEX episode_events_order_idx ON episode_events(episode_id, ordinal);
     """,
+    """
+    CREATE TABLE memory_embeddings (
+      memory_version_id TEXT PRIMARY KEY REFERENCES memory_versions(id),
+      namespace_id TEXT NOT NULL REFERENCES namespaces(id),
+      provider TEXT NOT NULL,
+      dimensions INTEGER NOT NULL,
+      vector_json TEXT NOT NULL
+    );
+    CREATE INDEX memory_embeddings_namespace_idx ON memory_embeddings(namespace_id);
+    """,
 )
 
 

@@ -8,6 +8,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any, cast
 
 from .db import Database
+from .embedding import cosine, embed_text
 from .errors import IdempotencyConflict
 from .extraction import ValidatedCandidate
 from .extractor import Candidate
@@ -281,6 +282,7 @@ class Repository:
                     "DELETE FROM memory_fts WHERE memory_version_id=? AND namespace_id=?",
                     (current["id"], namespace_id),
                 )
+                self.db.execute("DELETE FROM memory_embeddings WHERE memory_version_id=? AND namespace_id=?", (current["id"], namespace_id))
             version_id = str(uuid.uuid4())
             self.db.execute(
                 """INSERT INTO memory_versions
@@ -327,6 +329,10 @@ class Repository:
             self.db.execute(
                 "INSERT INTO memory_fts(memory_version_id, namespace_id, statement, evidence_text) VALUES (?, ?, ?, ?)",
                 (version_id, namespace_id, candidate.statement, candidate.statement),
+            )
+            self.db.execute(
+                "INSERT INTO memory_embeddings(memory_version_id, namespace_id, provider, dimensions, vector_json) VALUES (?, ?, 'local-hash-v1', 32, ?)",
+                (version_id, namespace_id, json.dumps(embed_text(candidate.statement), separators=(",", ":"))),
             )
             return memory_id
 
@@ -513,30 +519,53 @@ class Repository:
 
     def search(self, namespace_id: str, query: str, limit: int) -> list[SearchResult]:
         terms = [part for part in query.split() if part.isalnum()]
-        if not terms:
-            return []
-        match = " OR ".join(f'"{term.replace(chr(34), "")}"' for term in terms)
-        rows = self.db.execute(
-            """SELECT m.id, m.kind, v.id AS version_id, v.statement, v.status, bm25(memory_fts) AS score
-            FROM memory_fts JOIN memory_versions v ON v.id=memory_fts.memory_version_id
-            JOIN memories m ON m.id=v.memory_id AND m.namespace_id=?
-            WHERE memory_fts.namespace_id=? AND memory_fts MATCH ?
-              AND v.namespace_id=? AND v.status='active' AND m.status='active' AND v.valid_to IS NULL
-              AND (v.valid_until IS NULL OR julianday(v.valid_until) > julianday('now'))
-            ORDER BY score, v.id LIMIT ?""",
-            (namespace_id, namespace_id, match, namespace_id, limit),
+        lexical: dict[str, float] = {}
+        if terms:
+            match = " OR ".join(f'"{term.replace(chr(34), "")}"' for term in terms)
+            lexical_rows = self.db.execute(
+                "SELECT memory_version_id, bm25(memory_fts) AS score FROM memory_fts WHERE namespace_id=? AND memory_fts MATCH ? ORDER BY score LIMIT ?",
+                (namespace_id, match, max(limit * 5, 20)),
+            ).fetchall()
+            maximum = max((abs(float(row["score"])) for row in lexical_rows), default=1.0)
+            lexical = {row["memory_version_id"]: min(1.0, abs(float(row["score"])) / maximum) for row in lexical_rows}
+        query_vector = embed_text(query)
+        vector_rows = self.db.execute(
+            """SELECT e.memory_version_id, e.vector_json
+            FROM memory_embeddings e JOIN memory_versions v ON v.id=e.memory_version_id AND v.namespace_id=e.namespace_id
+            JOIN memories m ON m.id=v.memory_id AND m.namespace_id=v.namespace_id
+            WHERE e.namespace_id=? AND v.status='active' AND m.status='active' AND v.valid_to IS NULL
+              AND (v.valid_until IS NULL OR julianday(v.valid_until) > julianday('now'))""",
+            (namespace_id,),
         ).fetchall()
+        vector = {row["memory_version_id"]: cosine(query_vector, json.loads(row["vector_json"])) for row in vector_rows}
+        vector_candidates = {memory_id for memory_id, score in vector.items() if score >= 0.75}
+        candidate_ids = set(lexical) | vector_candidates
+        if not candidate_ids:
+            return []
+        placeholders = ",".join("?" for _ in candidate_ids)
+        rows = self.db.execute(
+            f"""SELECT m.id, m.kind, v.id AS version_id, v.statement, v.status
+            FROM memory_versions v JOIN memories m ON m.id=v.memory_id AND m.namespace_id=?
+            WHERE v.namespace_id=? AND v.id IN ({placeholders}) AND v.status='active' AND m.status='active'""",
+            (namespace_id, namespace_id, *candidate_ids),
+        ).fetchall()
+        ranked = sorted(
+            rows,
+            key=lambda row: (-(0.6 * lexical.get(row["version_id"], 0.0) + 0.4 * vector.get(row["version_id"], 0.0)), row["version_id"]),
+        )[:limit]
         return [
             SearchResult(
                 memory_id=uuid.UUID(row["id"]),
                 memory_version_id=uuid.UUID(row["version_id"]),
                 statement=row["statement"],
                 kind=row["kind"],
-                score=float(-row["score"]),
+                score=round(0.6 * lexical.get(row["version_id"], 0.0) + 0.4 * vector.get(row["version_id"], 0.0), 6),
+                lexical_score=round(lexical.get(row["version_id"], 0.0), 6),
+                vector_score=round(vector.get(row["version_id"], 0.0), 6),
                 status=row["status"],
                 citations=self._citations(namespace_id, row["version_id"]),
             )
-            for row in rows
+            for row in ranked
         ]
 
     def _citations(self, namespace_id: str, version_id: str) -> list[EvidenceCitation]:
@@ -601,7 +630,7 @@ class Repository:
     def export_namespace(self, namespace_id: str) -> dict[str, Any]:
         tables = (
             "namespaces", "events", "memories", "memory_versions", "evidence_refs", "processing_jobs",
-            "extraction_runs", "extraction_decisions", "episodes", "episode_events",
+            "extraction_runs", "extraction_decisions", "episodes", "episode_events", "memory_embeddings",
         )
         result: dict[str, Any] = {
             "namespaces": [dict(row) for row in self.db.execute("SELECT * FROM namespaces WHERE id=?", (namespace_id,))],
@@ -620,7 +649,7 @@ class Repository:
             raise ValueError("export namespace does not match requested namespace")
         ordered = (
             "namespaces", "events", "memories", "extraction_runs", "memory_versions", "processing_jobs",
-            "evidence_refs", "extraction_decisions", "episodes", "episode_events",
+            "evidence_refs", "extraction_decisions", "episodes", "episode_events", "memory_embeddings",
         )
         counts: dict[str, int] = {}
         with self.db.lock, self.db.connection:
@@ -649,6 +678,7 @@ class Repository:
 
     def _rebuild_fts(self, namespace_id: str) -> None:
         self.db.execute("DELETE FROM memory_fts WHERE namespace_id=?", (namespace_id,))
+        self.db.execute("DELETE FROM memory_embeddings WHERE namespace_id=?", (namespace_id,))
         rows = self.db.execute(
             """SELECT v.id, v.statement, COALESCE(v.evidence_excerpt, '') AS evidence_excerpt
                FROM memory_versions v JOIN memories m ON m.id=v.memory_id AND m.namespace_id=v.namespace_id
@@ -659,6 +689,10 @@ class Repository:
             self.db.execute(
                 "INSERT INTO memory_fts(memory_version_id, namespace_id, statement, evidence_text) VALUES (?, ?, ?, ?)",
                 (row["id"], namespace_id, row["statement"], row["evidence_excerpt"]),
+            )
+            self.db.execute(
+                "INSERT INTO memory_embeddings(memory_version_id, namespace_id, provider, dimensions, vector_json) VALUES (?, ?, 'local-hash-v1', 32, ?)",
+                (row["id"], namespace_id, json.dumps(embed_text(row["statement"]), separators=(",", ":"))),
             )
 
     def delete_namespace(self, namespace_id: str) -> bool:
@@ -671,6 +705,7 @@ class Repository:
             self.db.execute("DELETE FROM extraction_runs WHERE namespace_id=?", (namespace_id,))
             self.db.execute("DELETE FROM episode_events WHERE namespace_id=?", (namespace_id,))
             self.db.execute("DELETE FROM episodes WHERE namespace_id=?", (namespace_id,))
+            self.db.execute("DELETE FROM memory_embeddings WHERE namespace_id=?", (namespace_id,))
             for table in ("evidence_refs", "memory_versions", "memories", "processing_jobs", "events"):
                 self.db.execute(f"DELETE FROM {table} WHERE namespace_id=?", (namespace_id,))
             self.db.execute("DELETE FROM namespaces WHERE id=?", (namespace_id,))

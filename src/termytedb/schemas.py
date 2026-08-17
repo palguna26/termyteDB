@@ -145,6 +145,8 @@ class SearchResult(BaseModel):
     statement: str
     kind: str
     score: float
+    lexical_score: float = 0.0
+    vector_score: float = 0.0
     status: str
     citations: list[EvidenceCitation]
 

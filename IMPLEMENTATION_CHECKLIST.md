@@ -36,3 +36,4 @@
 - [x] Persistent deterministic episode construction with late-event handling
 - [x] Production-path labelled retrieval evaluator with Recall@k, MRR, and NDCG@k
 - [x] Transactional canonical namespace export/import with audit and episode preservation
+- [x] Explainable namespace-scoped hybrid lexical/vector retrieval with rebuildable local embeddings
