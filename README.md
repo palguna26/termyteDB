@@ -37,6 +37,7 @@ db.close()
 
 ```powershell
 python -m termytedb --database .\memory.sqlite
+# Optional: --rate-limit-per-minute 120 --extraction-url https://provider.example/extract
 ```
 
 The service publishes OpenAPI at `/docs`. Main endpoints are `/v1/events`, `/v1/events:batch`, `/v1/process`, `/v1/search`, `/v1/context`, `/v1/memories/{id}`, `/v1/export`, `/v1/import`, `/v1/feedback`, `/v1/integrity`, `/health`, and `/ready`.
