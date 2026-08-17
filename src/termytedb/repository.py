@@ -323,6 +323,15 @@ class Repository:
             )
             return status
 
+    def cancel_job(self, namespace_id: str, job_id: str) -> bool:
+        with self.db.connection:
+            cursor = self.db.execute(
+                "UPDATE processing_jobs SET status='cancelled', lease_until=NULL, updated_at=? "
+                "WHERE id=? AND namespace_id=? AND status IN ('pending', 'failed', 'processing')",
+                (iso(), job_id, namespace_id),
+            )
+            return cursor.rowcount == 1
+
     def event_for_job(self, namespace_id: str, job_id: str) -> sqlite3.Row:
         row = self.db.execute(
             """SELECT e.* FROM events e JOIN processing_jobs j ON j.event_id=e.id

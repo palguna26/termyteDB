@@ -107,7 +107,14 @@ def create_app(
     def process(request: ProcessRequest) -> ProcessResponse:
         require_namespace(request.namespace_id)
         enforce_rate_limit(request.namespace_id)
-        return engine.process(request.namespace_id, request.limit, request.lease_seconds)
+        return engine.process_with_timeout(request.namespace_id, request.limit, request.lease_seconds, request.timeout_seconds)
+
+    @app.post("/v1/jobs/{job_id}/cancel")
+    def cancel_job(job_id: str, namespace_id: str = Query(...)) -> dict[str, bool]:
+        require_namespace(namespace_id)
+        if not engine.cancel_job(namespace_id, job_id):
+            raise HTTPException(status_code=404, detail="job not found")
+        return {"cancelled": True}
 
     @app.get("/v1/jobs")
     def jobs(namespace_id: str = Query(...), limit: int = Query(100, ge=1, le=100), offset: int = Query(0, ge=0)) -> list[dict[str, object]]:

@@ -59,3 +59,4 @@
 - [x] Paginated extraction-run and extraction-decision provenance inspection
 - [x] Continuation fixtures validate repository snapshots and declarative verification tests
 - [x] Production-path reconciliation evaluator with labelled action fixtures
+- [x] Namespace-scoped durable job cancellation and bounded processing timeout

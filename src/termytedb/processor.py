@@ -23,10 +23,13 @@ class Processor:
         self.logger = logger
         self.provider = provider
 
-    def process_namespace(self, namespace_id: str, limit: int = 100, lease_seconds: int = 30) -> tuple[int, int, int, int, int]:
+    def process_namespace(self, namespace_id: str, limit: int = 100, lease_seconds: int = 30, timeout_seconds: float = 30.0) -> tuple[int, int, int, int, int]:
+        deadline = time.perf_counter() + timeout_seconds
         jobs = self.repository.claim_jobs(namespace_id, limit, lease_seconds)
         processed = failed = dead = accepted = rejected = 0
         for job in jobs:
+            if time.perf_counter() >= deadline:
+                break
             run_id = str(uuid.uuid4())
             started = time.perf_counter()
             try:

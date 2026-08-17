@@ -116,6 +116,13 @@ class TermyteDB:
         processed, failed, dead, accepted, rejected = self.processor.process_namespace(namespace_id, limit, lease_seconds)
         return ProcessResponse(processed=processed, failed=failed, dead_lettered=dead, accepted=accepted, rejected=rejected)
 
+    def process_with_timeout(self, namespace_id: str, limit: int = 100, lease_seconds: int = 30, timeout_seconds: float = 30.0) -> ProcessResponse:
+        processed, failed, dead, accepted, rejected = self.processor.process_namespace(namespace_id, limit, lease_seconds, timeout_seconds)
+        return ProcessResponse(processed=processed, failed=failed, dead_lettered=dead, accepted=accepted, rejected=rejected)
+
+    def cancel_job(self, namespace_id: str, job_id: str) -> bool:
+        return self.repository.cancel_job(namespace_id, job_id)
+
     def search(self, namespace_id: str, query: str, limit: int = 10) -> list[SearchResult]:
         results = self.repository.search(namespace_id, query, limit)
         log(
