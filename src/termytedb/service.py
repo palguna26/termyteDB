@@ -121,6 +121,11 @@ def create_app(
         require_namespace(namespace_id)
         return engine.jobs(namespace_id, limit, offset)
 
+    @app.get("/v1/events", response_model=list[dict[str, object]])
+    def events(namespace_id: str = Query(...), limit: int = Query(100, ge=1, le=100), offset: int = Query(0, ge=0)) -> list[dict[str, object]]:
+        require_namespace(namespace_id)
+        return engine.events(namespace_id, limit, offset)
+
     @app.get("/v1/events/{event_id}")
     def get_event(event_id: str, namespace_id: str = Query(...)) -> dict[str, object]:
         require_namespace(namespace_id)

@@ -99,6 +99,9 @@ class TermyteDB:
     def event(self, namespace_id: str, event_id: str) -> dict[str, Any] | None:
         return self.repository.get_event(namespace_id, event_id)
 
+    def events(self, namespace_id: str, limit: int = 100, offset: int = 0) -> list[dict[str, Any]]:
+        return self.repository.list_events(namespace_id, limit, offset)
+
     def jobs(self, namespace_id: str, limit: int = 100, offset: int = 0) -> list[dict[str, Any]]:
         return self.repository.list_jobs(namespace_id, limit, offset)
 

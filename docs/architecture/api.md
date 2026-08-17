@@ -5,6 +5,7 @@ The stable interface is framework-neutral and uses namespace-scoped IDs.
 ```http
 POST /v1/events
 POST /v1/events:batch
+GET  /v1/events?namespace_id=...
 POST /v1/process
 POST /v1/jobs/{job_id}/cancel
 GET  /v1/jobs

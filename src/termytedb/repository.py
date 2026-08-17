@@ -272,6 +272,13 @@ class Repository:
         ]
         return result
 
+    def list_events(self, namespace_id: str, limit: int = 100, offset: int = 0) -> list[dict[str, Any]]:
+        rows = self.db.execute(
+            "SELECT id FROM events WHERE namespace_id=? ORDER BY occurred_at, id LIMIT ? OFFSET ?",
+            (namespace_id, limit, offset),
+        ).fetchall()
+        return [event for row in rows if (event := self.get_event(namespace_id, row["id"])) is not None]
+
     def list_jobs(self, namespace_id: str, limit: int = 100, offset: int = 0) -> list[dict[str, Any]]:
         rows = self.db.execute(
             "SELECT * FROM processing_jobs WHERE namespace_id=? ORDER BY created_at, id LIMIT ? OFFSET ?", (namespace_id, limit, offset)
