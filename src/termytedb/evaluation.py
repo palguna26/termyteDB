@@ -305,6 +305,10 @@ def run_performance_benchmark(event_count: int = 100) -> dict[str, Any]:
         operation()
         return (time.perf_counter() - started) * 1000
 
+    def percentile(values: list[float], fraction: float) -> float:
+        ordered = sorted(values)
+        return ordered[min(len(ordered) - 1, max(0, math.ceil(fraction * len(ordered)) - 1))]
+
     with tempfile.TemporaryDirectory(prefix="termytedb-performance-") as directory:
         path = Path(directory) / "benchmark.sqlite"
         engine = TermyteDB(path)
@@ -322,6 +326,8 @@ def run_performance_benchmark(event_count: int = 100) -> dict[str, Any]:
         process_ms = elapsed(lambda: engine.process(namespace, limit=event_count + 1))
         search_ms = elapsed(lambda: engine.search(namespace, "SQLite", limit=10))
         context_ms = elapsed(lambda: engine.context(namespace, "SQLite", token_budget=200, limit=10))
+        search_samples = [elapsed(lambda: engine.search(namespace, "SQLite", limit=10)) for _ in range(5)]
+        context_samples = [elapsed(lambda: engine.context(namespace, "SQLite", token_budget=200, limit=10)) for _ in range(5)]
         concurrent_namespaces = [f"concurrent-{index}" for index in range(4)]
 
         def ingest_namespace(name: str) -> int:
@@ -336,6 +342,7 @@ def run_performance_benchmark(event_count: int = 100) -> dict[str, Any]:
             concurrent_jobs = list(executor.map(ingest_namespace, concurrent_namespaces))
         concurrent_ms = (time.perf_counter() - concurrent_started) * 1000
         engine.close()
+        storage_bytes = sum(path.stat().st_size for path in Path(directory).glob("benchmark.sqlite*"))
         restarted = TermyteDB(path)
         recovered_jobs = len(restarted.jobs(namespace))
         restart_search_ms = elapsed(lambda: restarted.search(namespace, "SQLite", limit=10))
@@ -346,13 +353,17 @@ def run_performance_benchmark(event_count: int = 100) -> dict[str, Any]:
         "batch_ingest_ms": round(batch_ms, 3),
         "batch_events_per_second": round(event_count / max(batch_ms / 1000, 0.000001), 2),
         "process_ms": round(process_ms, 3),
+        "job_throughput_per_second": round((event_count + 1) / max(process_ms / 1000, 0.000001), 2),
         "search_ms": round(search_ms, 3),
+        "search_p95_ms": round(percentile(search_samples, 0.95), 3),
         "context_ms": round(context_ms, 3),
+        "context_p95_ms": round(percentile(context_samples, 0.95), 3),
         "concurrent_namespace_ms": round(concurrent_ms, 3),
         "concurrent_namespace_jobs": sum(concurrent_jobs),
         "concurrent_namespace_count": len(concurrent_namespaces),
         "restart_search_ms": round(restart_search_ms, 3),
         "recovered_jobs": recovered_jobs,
+        "storage_bytes": storage_bytes,
         "storage": "sqlite-wal-fts5-local-hash-v1",
     }
 
