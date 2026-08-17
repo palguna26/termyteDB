@@ -8,7 +8,7 @@
 - Deterministic episodes, evidence-span validation, rule extraction, fake provider, generic HTTP provider boundary, append-only versions, corrections, disputes, invalidation, and audit decisions.
 - Namespace-filtered FTS5 plus injectable embeddings (deterministic local default), explainable hybrid scores, context token budgets, abstention, selection diagnostics, feedback, export/import, deletion, backup, and integrity repair.
 - Versioned HTTP service with request IDs, optional namespace authorization, health/readiness, paginated event/memory/evidence/job inspection, namespace metrics, and OpenAPI generation with a contract test.
-- Thin Python and TypeScript clients with bounded transient retries, request IDs, timeouts, and structured errors; Python behavior is contract-tested.
+- Thin Python and TypeScript clients with bounded transient retries, request IDs, timeouts, and structured errors; Python behavior is contract-tested and the TypeScript source compiles with TypeScript 7.0.2.
 - Deterministic extraction, retrieval, temporal, continuation, LongMemEval-shaped, reconciliation, and local performance harnesses, including concurrent namespace smoke coverage.
 
 ## Measured local evidence
@@ -29,9 +29,8 @@ These are regression and smoke measurements, not broad product-quality, capacity
 - Real LongMemEval-s dataset execution and real coding-agent trajectories with executed verification commands.
 - Real agent completion, tests-passed, tool-call, token, cost, and repeated-mistake measurements.
 - Large-scale concurrent load, disk-failure simulation, and representative storage-growth targets.
-- TypeScript/Python network SDK packages, pagination for any future collection endpoints beyond the current bounded inspection paths, and hosted authentication integration beyond the callback boundary.
+- Pagination for any future collection endpoints beyond the current bounded inspection paths, and hosted authentication integration beyond the callback boundary.
 - Artifact byte storage; only content-addressed descriptors are persisted.
-- TypeScript client compilation is not locally verified because `tsc` is not installed in this environment.
 
 ## Release position
 
