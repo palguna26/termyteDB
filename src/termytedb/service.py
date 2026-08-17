@@ -246,4 +246,9 @@ def create_app(
         report = check_database(engine.database)
         return {"ok": report.ok, **report.__dict__}
 
+    @app.get("/v1/metrics")
+    def metrics(namespace_id: str = Query(...)) -> dict[str, float | int]:
+        require_namespace(namespace_id)
+        return engine.metrics(namespace_id)
+
     return app

@@ -225,6 +225,35 @@ class Repository:
         ).fetchall()
         return [dict(row) for row in rows]
 
+    def metrics(self, namespace_id: str) -> dict[str, float | int]:
+        def count(table: str) -> int:
+            return int(self.db.execute(f"SELECT COUNT(*) FROM {table} WHERE namespace_id=?", (namespace_id,)).fetchone()[0])
+
+        job_counts = {
+            str(row["status"]): int(row["count"])
+            for row in self.db.execute("SELECT status, COUNT(*) AS count FROM processing_jobs WHERE namespace_id=? GROUP BY status", (namespace_id,))
+        }
+        latency = self.db.execute(
+            "SELECT AVG(latency_ms) AS average, MAX(latency_ms) AS maximum FROM extraction_runs WHERE namespace_id=? AND latency_ms IS NOT NULL",
+            (namespace_id,),
+        ).fetchone()
+        return {
+            "events": count("events"),
+            "memories": count("memories"),
+            "memory_versions": count("memory_versions"),
+            "jobs": count("processing_jobs"),
+            "extraction_runs": count("extraction_runs"),
+            "extraction_decisions": count("extraction_decisions"),
+            "jobs_pending": job_counts.get("pending", 0),
+            "jobs_processing": job_counts.get("processing", 0),
+            "jobs_completed": job_counts.get("completed", 0),
+            "jobs_failed": job_counts.get("failed", 0),
+            "jobs_dead": job_counts.get("dead", 0),
+            "jobs_cancelled": job_counts.get("cancelled", 0),
+            "average_extraction_latency_ms": round(float(latency["average"] or 0), 3),
+            "maximum_extraction_latency_ms": int(latency["maximum"] or 0),
+        }
+
     def get_event(self, namespace_id: str, event_id: str) -> dict[str, Any] | None:
         row = self.db.execute("SELECT * FROM events WHERE id=? AND namespace_id=?", (event_id, namespace_id)).fetchone()
         if not row:

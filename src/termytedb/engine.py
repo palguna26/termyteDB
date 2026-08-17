@@ -114,6 +114,9 @@ class TermyteDB:
     def feedback_rows(self, namespace_id: str, limit: int = 100, offset: int = 0) -> list[dict[str, Any]]:
         return self.repository.list_feedback(namespace_id, limit, offset)
 
+    def metrics(self, namespace_id: str) -> dict[str, float | int]:
+        return self.repository.metrics(namespace_id)
+
     def process(self, namespace_id: str, limit: int = 100, lease_seconds: int = 30) -> ProcessResponse:
         processed, failed, dead, accepted, rejected = self.processor.process_namespace(namespace_id, limit, lease_seconds)
         return ProcessResponse(processed=processed, failed=failed, dead_lettered=dead, accepted=accepted, rejected=rejected)
