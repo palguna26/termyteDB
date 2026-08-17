@@ -218,6 +218,20 @@ MIGRATIONS: tuple[str, ...] = (
     ALTER TABLE events ADD COLUMN session_id TEXT;
     ALTER TABLE events ADD COLUMN source_id TEXT;
     """,
+    """
+    CREATE TABLE artifacts (
+      id TEXT PRIMARY KEY,
+      namespace_id TEXT NOT NULL REFERENCES namespaces(id),
+      event_id TEXT NOT NULL REFERENCES events(id),
+      media_type TEXT NOT NULL,
+      size_bytes INTEGER NOT NULL,
+      uri TEXT,
+      content_hash TEXT NOT NULL,
+      metadata_json TEXT NOT NULL,
+      UNIQUE(namespace_id, event_id, content_hash)
+    );
+    CREATE INDEX artifacts_namespace_event_idx ON artifacts(namespace_id, event_id);
+    """,
 )
 
 

@@ -44,3 +44,4 @@
 - [x] LongMemEval-shaped production-path adapter with frozen run metadata and raw predictions
 - [x] Local ingest/process/retrieval/context/restart performance benchmark
 - [x] Versioned canonical event identity with actor/agent/session/source fields and payload boundary
+- [x] Bounded content-addressed artifact descriptors with export/import and deletion coverage

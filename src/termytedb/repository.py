@@ -38,6 +38,7 @@ def canonical_event_content(event: EventInput, redacted_payload: dict[str, Any])
             "agent_id": event.agent_id,
             "session_id": event.session_id,
             "source_id": event.source_id,
+            "artifacts": [item.model_dump(mode="json") for item in event.artifacts],
             "occurred_at": event.occurred_at.isoformat() if event.occurred_at else None,
             "payload": redacted_payload,
         },
@@ -106,6 +107,15 @@ class Repository:
                         iso(),
                     ),
                 )
+                for artifact in event.artifacts:
+                    self.db.execute(
+                        """INSERT INTO artifacts(id, namespace_id, event_id, media_type, size_bytes, uri, content_hash, metadata_json)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                        (
+                            str(uuid.uuid4()), namespace_id, event_id, artifact.media_type, artifact.size_bytes,
+                            artifact.uri, artifact.content_hash, json.dumps(artifact.metadata, sort_keys=True, separators=(",", ":")),
+                        ),
+                    )
                 self.db.execute(
                     """INSERT INTO processing_jobs
                     (id, namespace_id, event_id, input_hash, status, created_at, updated_at)
@@ -192,6 +202,10 @@ class Repository:
             return None
         result = dict(row)
         result["payload_json"] = json.loads(result["payload_json"])
+        result["artifacts"] = [
+            {**dict(item), "metadata_json": json.loads(item["metadata_json"])}
+            for item in self.db.execute("SELECT * FROM artifacts WHERE event_id=? AND namespace_id=? ORDER BY id", (event_id, namespace_id)).fetchall()
+        ]
         result["evidence_refs"] = [
             dict(item)
             for item in self.db.execute(
@@ -672,7 +686,7 @@ class Repository:
 
     def export_namespace(self, namespace_id: str) -> dict[str, Any]:
         tables = (
-            "namespaces", "events", "memories", "memory_versions", "evidence_refs", "processing_jobs",
+            "namespaces", "events", "artifacts", "memories", "memory_versions", "evidence_refs", "processing_jobs",
             "extraction_runs", "extraction_decisions", "episodes", "episode_events", "memory_embeddings", "feedback",
         )
         result: dict[str, Any] = {
@@ -691,7 +705,7 @@ class Repository:
         if not isinstance(namespace_rows, list) or not any(row.get("id") == namespace_id for row in namespace_rows):
             raise ValueError("export namespace does not match requested namespace")
         ordered = (
-            "namespaces", "events", "memories", "extraction_runs", "memory_versions", "processing_jobs",
+            "namespaces", "events", "artifacts", "memories", "extraction_runs", "memory_versions", "processing_jobs",
             "evidence_refs", "extraction_decisions", "episodes", "episode_events", "memory_embeddings", "feedback",
         )
         counts: dict[str, int] = {}
@@ -750,6 +764,7 @@ class Repository:
             self.db.execute("DELETE FROM episodes WHERE namespace_id=?", (namespace_id,))
             self.db.execute("DELETE FROM memory_embeddings WHERE namespace_id=?", (namespace_id,))
             self.db.execute("DELETE FROM feedback WHERE namespace_id=?", (namespace_id,))
+            self.db.execute("DELETE FROM artifacts WHERE namespace_id=?", (namespace_id,))
             for table in ("evidence_refs", "memory_versions", "memories", "processing_jobs", "events"):
                 self.db.execute(f"DELETE FROM {table} WHERE namespace_id=?", (namespace_id,))
             self.db.execute("DELETE FROM namespaces WHERE id=?", (namespace_id,))

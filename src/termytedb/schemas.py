@@ -25,6 +25,17 @@ class EventInput(BaseModel):
     agent_id: str | None = Field(default=None, max_length=200)
     session_id: str | None = Field(default=None, max_length=200)
     source_id: str | None = Field(default=None, max_length=200)
+    artifacts: list[ArtifactInput] = Field(default_factory=list, max_length=20)
+
+
+class ArtifactInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    content_hash: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+    media_type: str = Field(min_length=1, max_length=200)
+    size_bytes: int = Field(ge=0, le=100_000_000)
+    uri: str | None = Field(default=None, max_length=2000)
+    metadata: dict[str, str] = Field(default_factory=dict, max_length=20)
 
 
 MemoryKind = Literal[

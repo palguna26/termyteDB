@@ -48,7 +48,7 @@ class TermyteDB:
         parsed = event if isinstance(event, EventInput) else EventInput.model_validate(event)
         redacted_payload = redact(parsed.payload)
         payload_bytes = len(json.dumps(redacted_payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
-        if payload_bytes > self.MAX_EVENT_BYTES:
+        if payload_bytes > self.MAX_EVENT_BYTES or sum(item.size_bytes for item in parsed.artifacts) > 100_000_000:
             raise ValueError(f"event payload exceeds {self.MAX_EVENT_BYTES} bytes")
         event_id, duplicate, content_hash, job_id = self.repository.ingest(parsed.namespace_id, parsed, redacted_payload)
         log(
