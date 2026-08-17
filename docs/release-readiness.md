@@ -19,6 +19,7 @@
 - Synthetic LongMemEval-shaped fixture: accuracy `1.0` over 2 items.
 - Ten-event local smoke run: batch ingest `781.15 events/s`, processing `43.455 ms`, search `0.768 ms`, context `0.332 ms`, restart search `0.725 ms`.
 - Wheel build succeeds with `python -m build --wheel --no-isolation`; generated build artifacts are not committed.
+- Isolated wheel install smoke passed: installed `TermyteDB` completed ingest, processing, and cited context retrieval with an explicit SQLite path.
 - Local operations CLI covers init, export/import, backup, integrity, and benchmark workflows.
 
 These are regression and smoke measurements, not broad product-quality, capacity, or external benchmark claims.
