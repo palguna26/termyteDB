@@ -39,3 +39,4 @@
 - [x] Explainable namespace-scoped hybrid lexical/vector retrieval with rebuildable local embeddings
 - [x] Namespace-scoped redacted feedback endpoint and request ID correlation
 - [x] Namespace-scoped event/evidence and job inspection plus integrity API
+- [x] Optional generic HTTP extraction provider with strict schema and safe failures

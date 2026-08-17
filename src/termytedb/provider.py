@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Protocol
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 
 from .schemas import ExtractionRequest, ExtractionResponse
 
@@ -78,6 +81,61 @@ class FakeExtractionProvider:
             prompt_version=self.response.prompt_version,
             raw_response_hash=hashlib.sha256(raw.encode()).hexdigest(),
             input_tokens=len(json.dumps(request.model_dump(mode="json"), sort_keys=True).split()),
+            output_tokens=len(raw.split()),
+            latency_ms=int((time.perf_counter() - started) * 1000),
+        )
+
+
+class HttpExtractionProvider:
+    """Generic HTTP JSON provider; it has no vendor-specific request or response logic."""
+
+    name = "http"
+
+    def __init__(self, endpoint: str | None = None, model: str | None = None, api_key: str | None = None):
+        self.endpoint = endpoint or os.environ.get("TERMYTEDB_EXTRACTION_URL", "")
+        self.model = model or os.environ.get("TERMYTEDB_EXTRACTION_MODEL", "configured")
+        self.api_key = api_key or os.environ.get("TERMYTEDB_EXTRACTION_API_KEY")
+        if not self.endpoint:
+            raise ValueError("an extraction endpoint is required")
+
+    def extract(
+        self,
+        request: ExtractionRequest,
+        timeout_seconds: float = 30.0,
+        cancellation: Callable[[], bool] | None = None,
+    ) -> ProviderResult:
+        if cancellation and cancellation():
+            raise ProviderError("extraction cancelled", retryable=True, error_class="cancelled")
+        prompt = build_extraction_prompt(request)
+        body = json.dumps({"model": self.model, "prompt": prompt, "schema": "extraction-v1"}).encode("utf-8")
+        headers = {"content-type": "application/json"}
+        if self.api_key:
+            headers["authorization"] = f"Bearer {self.api_key}"
+        started = time.perf_counter()
+        try:
+            with urlopen(Request(self.endpoint, data=body, headers=headers, method="POST"), timeout=timeout_seconds) as response:
+                raw_bytes = response.read()
+        except HTTPError as exc:
+            raise ProviderError(f"provider returned HTTP {exc.code}", retryable=exc.code >= 500, error_class="http_error") from exc
+        except (TimeoutError, URLError) as exc:
+            raise ProviderError("provider request failed", retryable=True, error_class="transport_error") from exc
+        if cancellation and cancellation():
+            raise ProviderError("extraction cancelled", retryable=True, error_class="cancelled")
+        raw = raw_bytes.decode("utf-8", errors="replace")
+        try:
+            payload = json.loads(raw)
+            if isinstance(payload, dict) and isinstance(payload.get("output"), str):
+                payload = json.loads(payload["output"])
+            parsed = ExtractionResponse.model_validate(payload)
+        except (UnicodeError, json.JSONDecodeError, TypeError, ValueError) as exc:
+            raise ProviderError("provider returned invalid extraction-v1 JSON", retryable=False, error_class="invalid_output") from exc
+        return ProviderResult(
+            response=parsed,
+            provider_name=self.name,
+            model_name=self.model,
+            prompt_version=parsed.prompt_version,
+            raw_response_hash=hashlib.sha256(raw_bytes).hexdigest(),
+            input_tokens=len(prompt.split()),
             output_tokens=len(raw.split()),
             latency_ms=int((time.perf_counter() - started) * 1000),
         )
