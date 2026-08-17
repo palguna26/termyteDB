@@ -70,3 +70,4 @@
 - [x] Provider timeout and cancellation propagation from processing deadlines
 - [x] Explicit historical search and context retrieval flag
 - [x] HTTP regression coverage for explicit historical retrieval
+- [x] Paginated namespace-scoped memory collection inspection

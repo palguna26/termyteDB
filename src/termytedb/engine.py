@@ -152,6 +152,9 @@ class TermyteDB:
     def get_memory(self, namespace_id: str, memory_id: str) -> MemoryResponse | None:
         return self.repository.get_memory(namespace_id, memory_id)
 
+    def memories(self, namespace_id: str, limit: int = 100, offset: int = 0) -> list[MemoryResponse]:
+        return self.repository.list_memories(namespace_id, limit, offset)
+
     def close(self) -> None:
         if not self._closed:
             self.database.close()

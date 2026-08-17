@@ -156,6 +156,11 @@ def create_app(
         require_namespace(namespace_id)
         return engine.extraction_decisions(namespace_id, limit, offset)
 
+    @app.get("/v1/memories", response_model=list[MemoryResponse])
+    def memories(namespace_id: str = Query(...), limit: int = Query(100, ge=1, le=100), offset: int = Query(0, ge=0)) -> list[MemoryResponse]:
+        require_namespace(namespace_id)
+        return engine.memories(namespace_id, limit, offset)
+
     @app.get("/v1/memories/{memory_id}")
     def get_memory(memory_id: str, namespace_id: str) -> MemoryResponse:
         require_namespace(namespace_id)

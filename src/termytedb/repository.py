@@ -661,6 +661,23 @@ class Repository:
             citations=citations,
         )
 
+    def list_memories(self, namespace_id: str, limit: int = 100, offset: int = 0) -> list[MemoryResponse]:
+        rows = self.db.execute(
+            """SELECT m.*, v.id AS version_id, v.version, v.statement, v.status AS version_status
+            FROM memories m JOIN memory_versions v ON v.id=m.current_version_id
+            WHERE m.namespace_id=? AND v.namespace_id=?
+            ORDER BY m.created_at, m.id LIMIT ? OFFSET ?""",
+            (namespace_id, namespace_id, limit, offset),
+        ).fetchall()
+        return [
+            MemoryResponse(
+                memory_id=uuid.UUID(row["id"]), namespace_id=namespace_id, kind=row["kind"], subject_key=row["subject_key"],
+                status=row["version_status"], confidence=row["confidence"], current_version_id=uuid.UUID(row["version_id"]),
+                version=row["version"], statement=row["statement"], citations=self._citations(namespace_id, row["version_id"]),
+            )
+            for row in rows
+        ]
+
     def search(self, namespace_id: str, query: str, limit: int, historical: bool = False) -> list[SearchResult]:
         terms = [part for part in query.split() if part.isalnum()]
         lexical: dict[str, float] = {}
