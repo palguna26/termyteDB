@@ -28,3 +28,8 @@
 - [x] Rule-only operation remains the default disabled-model path
 - [x] Labelled 50-case extraction fixture and model-path adversarial tests
 - [x] Omitted server ingestion time is excluded from event identity
+- [x] Batch ingestion reuses namespace-scoped idempotency
+- [x] Memory history and explicit invalidation endpoints
+- [x] Namespace export and transactional deletion endpoints
+- [x] Health and readiness endpoints
+- [x] Repository installs cleanly for pytest via configured source path

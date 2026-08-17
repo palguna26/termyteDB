@@ -19,3 +19,21 @@ def test_http_vertical_slice(tmp_path):
     assert response.status_code == 200
     assert response.json()["abstained"] is False
     assert str(receipt["event_id"]) in response.json()["text"]
+
+
+def test_http_batch_history_invalidation_export_and_delete(tmp_path):
+    client = TestClient(create_app(str(tmp_path / "lifecycle.sqlite")))
+    batch = client.post("/v1/events:batch", json={"events": [
+        {"namespace_id": "lifecycle", "idempotency_key": "one", "type": "decision", "payload": {"text": "Decision: use SQLite."}},
+        {"namespace_id": "lifecycle", "idempotency_key": "two", "type": "failure", "payload": {"text": "Failure: old cache broke."}},
+    ]})
+    assert batch.status_code == 200
+    assert len(batch.json()["receipts"]) == 2
+    assert client.post("/v1/process", json={"namespace_id": "lifecycle"}).json()["accepted"] == 2
+    result = client.post("/v1/search", json={"namespace_id": "lifecycle", "query": "SQLite"}).json()[0]
+    memory_id = result["memory_id"]
+    assert client.get(f"/v1/memories/{memory_id}/history", params={"namespace_id": "lifecycle"}).status_code == 200
+    assert client.post(f"/v1/memories/{memory_id}/invalidate", params={"namespace_id": "lifecycle", "reason": "test"}).json() == {"invalidated": True}
+    assert client.get("/v1/export", params={"namespace_id": "lifecycle"}).json()["events"]
+    assert client.delete("/v1/namespaces/lifecycle").json() == {"deleted": True}
+    assert client.get(f"/v1/memories/{memory_id}", params={"namespace_id": "lifecycle"}).status_code == 404

@@ -13,6 +13,7 @@ from .provider import ExtractionProvider
 from .redaction import redact
 from .repository import Repository
 from .schemas import (
+    BatchEventResponse,
     ContextResponse,
     EventInput,
     EventReceipt,
@@ -60,6 +61,21 @@ class TermyteDB:
             duplicate=duplicate,
             job_id=UUID(job_id),
         )
+
+    def ingest_batch(self, events: list[EventInput]) -> BatchEventResponse:
+        return BatchEventResponse(receipts=[self.ingest(event) for event in events])
+
+    def history(self, namespace_id: str, memory_id: str) -> list[dict[str, Any]] | None:
+        return self.repository.history(namespace_id, memory_id)
+
+    def invalidate(self, namespace_id: str, memory_id: str, reason: str) -> bool:
+        return self.repository.invalidate_memory(namespace_id, memory_id, reason)
+
+    def export_namespace(self, namespace_id: str) -> dict[str, Any]:
+        return self.repository.export_namespace(namespace_id)
+
+    def delete_namespace(self, namespace_id: str) -> bool:
+        return self.repository.delete_namespace(namespace_id)
 
     def process(self, namespace_id: str, limit: int = 100, lease_seconds: int = 30) -> ProcessResponse:
         processed, failed, dead, accepted, rejected = self.processor.process_namespace(namespace_id, limit, lease_seconds)

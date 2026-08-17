@@ -3,18 +3,22 @@ from __future__ import annotations
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
+from uuid import UUID
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 
 from .db import Database
 from .engine import TermyteDB
 from .errors import IdempotencyConflict
 from .provider import ExtractionProvider
 from .schemas import (
+    BatchEventRequest,
+    BatchEventResponse,
     ContextRequest,
     ContextResponse,
     EventInput,
     EventReceipt,
+    MemoryHistoryResponse,
     MemoryResponse,
     ProcessRequest,
     ProcessResponse,
@@ -50,6 +54,13 @@ def create_app(
         except IdempotencyConflict as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
 
+    @app.post("/v1/events:batch", response_model=BatchEventResponse)
+    def ingest_batch(request: BatchEventRequest) -> BatchEventResponse:
+        try:
+            return engine.ingest_batch(request.events)
+        except IdempotencyConflict as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
     @app.post("/v1/process")
     def process(request: ProcessRequest) -> ProcessResponse:
         return engine.process(request.namespace_id, request.limit, request.lease_seconds)
@@ -68,5 +79,36 @@ def create_app(
         if memory is None:
             raise HTTPException(status_code=404, detail="memory not found")
         return memory
+
+    @app.get("/v1/memories/{memory_id}/history", response_model=MemoryHistoryResponse)
+    def history(memory_id: str, namespace_id: str = Query(...)) -> MemoryHistoryResponse:
+        versions = engine.history(namespace_id, memory_id)
+        if versions is None:
+            raise HTTPException(status_code=404, detail="memory not found")
+        return MemoryHistoryResponse(memory_id=UUID(memory_id), versions=versions)
+
+    @app.post("/v1/memories/{memory_id}/invalidate")
+    def invalidate(memory_id: str, namespace_id: str, reason: str = Query(..., min_length=1)) -> dict[str, bool]:
+        if not engine.invalidate(namespace_id, memory_id, reason):
+            raise HTTPException(status_code=404, detail="memory not found")
+        return {"invalidated": True}
+
+    @app.get("/v1/export")
+    def export(namespace_id: str = Query(...)) -> dict[str, object]:
+        return engine.export_namespace(namespace_id)
+
+    @app.delete("/v1/namespaces/{namespace_id}")
+    def delete_namespace(namespace_id: str) -> dict[str, bool]:
+        if not engine.delete_namespace(namespace_id):
+            raise HTTPException(status_code=404, detail="namespace not found")
+        return {"deleted": True}
+
+    @app.get("/health")
+    def health() -> dict[str, str]:
+        return {"status": "ok"}
+
+    @app.get("/ready")
+    def ready() -> dict[str, str]:
+        return {"status": "ready"}
 
     return app

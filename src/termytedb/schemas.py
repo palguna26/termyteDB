@@ -93,6 +93,21 @@ class EventReceipt(BaseModel):
     job_id: UUID
 
 
+class BatchEventRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    events: list[EventInput] = Field(min_length=1, max_length=1000)
+
+
+class BatchEventResponse(BaseModel):
+    receipts: list[EventReceipt]
+
+
+class MemoryHistoryResponse(BaseModel):
+    memory_id: UUID
+    versions: list[dict[str, Any]]
+
+
 class ProcessRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 

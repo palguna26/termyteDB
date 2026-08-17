@@ -509,3 +509,56 @@ class Repository:
             WHERE memory_id=? AND namespace_id=? ORDER BY version""",
             (memory_id, namespace_id),
         ).fetchall()
+
+    def invalidate_memory(self, namespace_id: str, memory_id: str, reason: str) -> bool:
+        with self.db.lock, self.db.connection:
+            row = self.db.execute(
+                "SELECT current_version_id FROM memories WHERE id=? AND namespace_id=?",
+                (memory_id, namespace_id),
+            ).fetchone()
+            if not row:
+                return False
+            self.db.execute(
+                "UPDATE memories SET status='invalidated' WHERE id=? AND namespace_id=?",
+                (memory_id, namespace_id),
+            )
+            self.db.execute(
+                "UPDATE memory_versions SET status='invalidated', reason=? WHERE memory_id=? AND namespace_id=?",
+                (reason, memory_id, namespace_id),
+            )
+            self.db.execute(
+                "DELETE FROM memory_fts WHERE namespace_id=? AND memory_version_id=?",
+                (namespace_id, row["current_version_id"]),
+            )
+            return True
+
+    def history(self, namespace_id: str, memory_id: str) -> list[dict[str, Any]] | None:
+        memory = self.db.execute(
+            "SELECT id FROM memories WHERE id=? AND namespace_id=?", (memory_id, namespace_id)
+        ).fetchone()
+        if not memory:
+            return None
+        rows = self.list_versions(namespace_id, memory_id)
+        return [dict(row) for row in rows]
+
+    def export_namespace(self, namespace_id: str) -> dict[str, Any]:
+        tables = ("namespaces", "events", "memories", "memory_versions", "evidence_refs", "processing_jobs")
+        result: dict[str, Any] = {
+            "namespaces": [dict(row) for row in self.db.execute("SELECT * FROM namespaces WHERE id=?", (namespace_id,))],
+        }
+        for table in tables[1:]:
+            result[table] = [dict(row) for row in self.db.execute(f"SELECT * FROM {table} WHERE namespace_id=?", (namespace_id,))]
+        return result
+
+    def delete_namespace(self, namespace_id: str) -> bool:
+        with self.db.lock, self.db.connection:
+            exists = self.db.execute("SELECT 1 FROM namespaces WHERE id=?", (namespace_id,)).fetchone()
+            if not exists:
+                return False
+            self.db.execute("DELETE FROM memory_fts WHERE namespace_id=?", (namespace_id,))
+            self.db.execute("DELETE FROM extraction_decisions WHERE namespace_id=?", (namespace_id,))
+            self.db.execute("DELETE FROM extraction_runs WHERE namespace_id=?", (namespace_id,))
+            for table in ("evidence_refs", "memory_versions", "memories", "processing_jobs", "events"):
+                self.db.execute(f"DELETE FROM {table} WHERE namespace_id=?", (namespace_id,))
+            self.db.execute("DELETE FROM namespaces WHERE id=?", (namespace_id,))
+            return True
