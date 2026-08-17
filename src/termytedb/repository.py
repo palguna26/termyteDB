@@ -319,7 +319,7 @@ class Repository:
                 """SELECT * FROM processing_jobs
                 WHERE namespace_id = ? AND (status IN ('pending', 'failed') OR
                     (status = 'processing' AND lease_until < datetime('now')))
-                ORDER BY created_at, id LIMIT ?""",
+                ORDER BY created_at, rowid LIMIT ?""",
                 (namespace_id, limit),
             ).fetchall()
             claimed: list[sqlite3.Row] = []
