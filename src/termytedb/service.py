@@ -109,9 +109,9 @@ def create_app(
         return engine.process(request.namespace_id, request.limit, request.lease_seconds)
 
     @app.get("/v1/jobs")
-    def jobs(namespace_id: str = Query(...)) -> list[dict[str, object]]:
+    def jobs(namespace_id: str = Query(...), limit: int = Query(100, ge=1, le=100), offset: int = Query(0, ge=0)) -> list[dict[str, object]]:
         require_namespace(namespace_id)
-        return engine.jobs(namespace_id)
+        return engine.jobs(namespace_id, limit, offset)
 
     @app.get("/v1/events/{event_id}")
     def get_event(event_id: str, namespace_id: str = Query(...)) -> dict[str, object]:
@@ -134,9 +134,9 @@ def create_app(
         return engine.context(request.namespace_id, request.query, request.token_budget, request.limit)
 
     @app.get("/v1/context/requests")
-    def context_requests(namespace_id: str = Query(...)) -> list[dict[str, object]]:
+    def context_requests(namespace_id: str = Query(...), limit: int = Query(100, ge=1, le=100), offset: int = Query(0, ge=0)) -> list[dict[str, object]]:
         require_namespace(namespace_id)
-        return engine.context_requests(namespace_id)
+        return engine.context_requests(namespace_id, limit, offset)
 
     @app.get("/v1/memories/{memory_id}")
     def get_memory(memory_id: str, namespace_id: str) -> MemoryResponse:
@@ -175,9 +175,14 @@ def create_app(
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     @app.get("/v1/episodes")
-    def episodes(namespace_id: str = Query(...)) -> list[dict[str, object]]:
+    def episodes(namespace_id: str = Query(...), limit: int = Query(100, ge=1, le=100), offset: int = Query(0, ge=0)) -> list[dict[str, object]]:
         require_namespace(namespace_id)
-        return engine.episodes(namespace_id)
+        return engine.episodes(namespace_id, limit, offset)
+
+    @app.get("/v1/feedback")
+    def feedback_rows(namespace_id: str = Query(...), limit: int = Query(100, ge=1, le=100), offset: int = Query(0, ge=0)) -> list[dict[str, object]]:
+        require_namespace(namespace_id)
+        return engine.feedback_rows(namespace_id, limit, offset)
 
     @app.post("/v1/feedback", response_model=FeedbackResponse)
     def feedback(request: FeedbackRequest) -> FeedbackResponse:

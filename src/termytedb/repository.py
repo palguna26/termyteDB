@@ -192,9 +192,9 @@ class Repository:
         )
         return episode_id
 
-    def list_episodes(self, namespace_id: str) -> list[dict[str, Any]]:
+    def list_episodes(self, namespace_id: str, limit: int = 100, offset: int = 0) -> list[dict[str, Any]]:
         rows = self.db.execute(
-            "SELECT * FROM episodes WHERE namespace_id=? ORDER BY created_at, id", (namespace_id,)
+            "SELECT * FROM episodes WHERE namespace_id=? ORDER BY created_at, id LIMIT ? OFFSET ?", (namespace_id, limit, offset)
         ).fetchall()
         return [dict(row) for row in rows]
 
@@ -210,8 +210,11 @@ class Repository:
             )
         return feedback_id
 
-    def list_feedback(self, namespace_id: str) -> list[dict[str, Any]]:
-        return [dict(row) for row in self.db.execute("SELECT * FROM feedback WHERE namespace_id=? ORDER BY created_at, id", (namespace_id,)).fetchall()]
+    def list_feedback(self, namespace_id: str, limit: int = 100, offset: int = 0) -> list[dict[str, Any]]:
+        rows = self.db.execute(
+            "SELECT * FROM feedback WHERE namespace_id=? ORDER BY created_at, id LIMIT ? OFFSET ?", (namespace_id, limit, offset)
+        ).fetchall()
+        return [dict(row) for row in rows]
 
     def get_event(self, namespace_id: str, event_id: str) -> dict[str, Any] | None:
         row = self.db.execute("SELECT * FROM events WHERE id=? AND namespace_id=?", (event_id, namespace_id)).fetchone()
@@ -231,8 +234,11 @@ class Repository:
         ]
         return result
 
-    def list_jobs(self, namespace_id: str) -> list[dict[str, Any]]:
-        return [dict(row) for row in self.db.execute("SELECT * FROM processing_jobs WHERE namespace_id=? ORDER BY created_at, id", (namespace_id,)).fetchall()]
+    def list_jobs(self, namespace_id: str, limit: int = 100, offset: int = 0) -> list[dict[str, Any]]:
+        rows = self.db.execute(
+            "SELECT * FROM processing_jobs WHERE namespace_id=? ORDER BY created_at, id LIMIT ? OFFSET ?", (namespace_id, limit, offset)
+        ).fetchall()
+        return [dict(row) for row in rows]
 
     def record_context_request(self, namespace_id: str, query: str, token_budget: int, response: Any) -> str:
         request_id = str(uuid.uuid4())
@@ -249,8 +255,10 @@ class Repository:
             )
         return request_id
 
-    def list_context_requests(self, namespace_id: str) -> list[dict[str, Any]]:
-        rows = self.db.execute("SELECT * FROM context_requests WHERE namespace_id=? ORDER BY created_at, id", (namespace_id,)).fetchall()
+    def list_context_requests(self, namespace_id: str, limit: int = 100, offset: int = 0) -> list[dict[str, Any]]:
+        rows = self.db.execute(
+            "SELECT * FROM context_requests WHERE namespace_id=? ORDER BY created_at, id LIMIT ? OFFSET ?", (namespace_id, limit, offset)
+        ).fetchall()
         result = []
         for row in rows:
             item = dict(row)

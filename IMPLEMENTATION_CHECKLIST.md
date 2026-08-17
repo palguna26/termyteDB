@@ -51,3 +51,4 @@
 - [x] Persisted namespace-scoped context selection audit with restart and deletion coverage
 - [x] Artifact URI and metadata redaction across persistence, inspection, and export
 - [x] Optional per-namespace HTTP sliding-window rate boundary
+- [x] Bounded limit/offset pagination for inspection collections

@@ -85,8 +85,8 @@ class TermyteDB:
     def delete_namespace(self, namespace_id: str) -> bool:
         return self.repository.delete_namespace(namespace_id)
 
-    def episodes(self, namespace_id: str) -> list[dict[str, Any]]:
-        return self.repository.list_episodes(namespace_id)
+    def episodes(self, namespace_id: str, limit: int = 100, offset: int = 0) -> list[dict[str, Any]]:
+        return self.repository.list_episodes(namespace_id, limit, offset)
 
     def feedback(self, namespace_id: str, memory_id: str, label: str, note: str | None) -> str:
         return self.repository.record_feedback(namespace_id, memory_id, label, note)
@@ -94,11 +94,14 @@ class TermyteDB:
     def event(self, namespace_id: str, event_id: str) -> dict[str, Any] | None:
         return self.repository.get_event(namespace_id, event_id)
 
-    def jobs(self, namespace_id: str) -> list[dict[str, Any]]:
-        return self.repository.list_jobs(namespace_id)
+    def jobs(self, namespace_id: str, limit: int = 100, offset: int = 0) -> list[dict[str, Any]]:
+        return self.repository.list_jobs(namespace_id, limit, offset)
 
-    def context_requests(self, namespace_id: str) -> list[dict[str, Any]]:
-        return self.repository.list_context_requests(namespace_id)
+    def context_requests(self, namespace_id: str, limit: int = 100, offset: int = 0) -> list[dict[str, Any]]:
+        return self.repository.list_context_requests(namespace_id, limit, offset)
+
+    def feedback_rows(self, namespace_id: str, limit: int = 100, offset: int = 0) -> list[dict[str, Any]]:
+        return self.repository.list_feedback(namespace_id, limit, offset)
 
     def process(self, namespace_id: str, limit: int = 100, lease_seconds: int = 30) -> ProcessResponse:
         processed, failed, dead, accepted, rejected = self.processor.process_namespace(namespace_id, limit, lease_seconds)
