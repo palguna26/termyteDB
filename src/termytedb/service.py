@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import cast
@@ -36,6 +36,7 @@ def create_app(
     *,
     database: Database | None = None,
     extraction_provider: ExtractionProvider | None = None,
+    namespace_authorizer: Callable[[str], bool] | None = None,
 ) -> FastAPI:
     if database is None and database_path is None:
         raise ValueError("create_app requires an explicit database path or database instance")
@@ -51,6 +52,10 @@ def create_app(
     app = FastAPI(title="TermyteDB", version="0.1.0", lifespan=lifespan)
     app.state.engine = engine
 
+    def require_namespace(namespace_id: str) -> None:
+        if namespace_authorizer is not None and not namespace_authorizer(namespace_id):
+            raise HTTPException(status_code=403, detail="namespace access denied")
+
     @app.middleware("http")
     async def request_id_middleware(request: Request, call_next: object) -> Response:
         request_id = request.headers.get("x-request-id") or str(uuid4())
@@ -60,6 +65,7 @@ def create_app(
 
     @app.post("/v1/events")
     def ingest(event: EventInput) -> EventReceipt:
+        require_namespace(event.namespace_id)
         try:
             return engine.ingest(event)
         except IdempotencyConflict as exc:
@@ -67,6 +73,8 @@ def create_app(
 
     @app.post("/v1/events:batch", response_model=BatchEventResponse)
     def ingest_batch(request: BatchEventRequest) -> BatchEventResponse:
+        for event in request.events:
+            require_namespace(event.namespace_id)
         try:
             return engine.ingest_batch(request.events)
         except IdempotencyConflict as exc:
@@ -74,14 +82,17 @@ def create_app(
 
     @app.post("/v1/process")
     def process(request: ProcessRequest) -> ProcessResponse:
+        require_namespace(request.namespace_id)
         return engine.process(request.namespace_id, request.limit, request.lease_seconds)
 
     @app.get("/v1/jobs")
     def jobs(namespace_id: str = Query(...)) -> list[dict[str, object]]:
+        require_namespace(namespace_id)
         return engine.jobs(namespace_id)
 
     @app.get("/v1/events/{event_id}")
     def get_event(event_id: str, namespace_id: str = Query(...)) -> dict[str, object]:
+        require_namespace(namespace_id)
         event = engine.event(namespace_id, event_id)
         if event is None:
             raise HTTPException(status_code=404, detail="event not found")
@@ -89,14 +100,17 @@ def create_app(
 
     @app.post("/v1/search")
     def search(request: SearchRequest) -> list[SearchResult]:
+        require_namespace(request.namespace_id)
         return engine.search(request.namespace_id, request.query, request.limit)
 
     @app.post("/v1/context")
     def context(request: ContextRequest) -> ContextResponse:
+        require_namespace(request.namespace_id)
         return engine.context(request.namespace_id, request.query, request.token_budget, request.limit)
 
     @app.get("/v1/memories/{memory_id}")
     def get_memory(memory_id: str, namespace_id: str) -> MemoryResponse:
+        require_namespace(namespace_id)
         memory = engine.get_memory(namespace_id, memory_id)
         if memory is None:
             raise HTTPException(status_code=404, detail="memory not found")
@@ -104,6 +118,7 @@ def create_app(
 
     @app.get("/v1/memories/{memory_id}/history", response_model=MemoryHistoryResponse)
     def history(memory_id: str, namespace_id: str = Query(...)) -> MemoryHistoryResponse:
+        require_namespace(namespace_id)
         versions = engine.history(namespace_id, memory_id)
         if versions is None:
             raise HTTPException(status_code=404, detail="memory not found")
@@ -111,16 +126,19 @@ def create_app(
 
     @app.post("/v1/memories/{memory_id}/invalidate")
     def invalidate(memory_id: str, namespace_id: str, reason: str = Query(..., min_length=1)) -> dict[str, bool]:
+        require_namespace(namespace_id)
         if not engine.invalidate(namespace_id, memory_id, reason):
             raise HTTPException(status_code=404, detail="memory not found")
         return {"invalidated": True}
 
     @app.get("/v1/export")
     def export(namespace_id: str = Query(...)) -> dict[str, object]:
+        require_namespace(namespace_id)
         return engine.export_namespace(namespace_id)
 
     @app.post("/v1/import")
     def import_namespace(document: dict[str, object], namespace_id: str = Query(...)) -> dict[str, int]:
+        require_namespace(namespace_id)
         try:
             return engine.import_namespace(document, namespace_id)
         except ValueError as exc:
@@ -128,10 +146,12 @@ def create_app(
 
     @app.get("/v1/episodes")
     def episodes(namespace_id: str = Query(...)) -> list[dict[str, object]]:
+        require_namespace(namespace_id)
         return engine.episodes(namespace_id)
 
     @app.post("/v1/feedback", response_model=FeedbackResponse)
     def feedback(request: FeedbackRequest) -> FeedbackResponse:
+        require_namespace(request.namespace_id)
         try:
             feedback_id = engine.feedback(request.namespace_id, str(request.memory_id), request.label, request.note)
         except KeyError as exc:
@@ -140,6 +160,7 @@ def create_app(
 
     @app.delete("/v1/namespaces/{namespace_id}")
     def delete_namespace(namespace_id: str) -> dict[str, bool]:
+        require_namespace(namespace_id)
         if not engine.delete_namespace(namespace_id):
             raise HTTPException(status_code=404, detail="namespace not found")
         return {"deleted": True}
