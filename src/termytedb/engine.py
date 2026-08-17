@@ -9,6 +9,7 @@ from .context import build_context
 from .db import Database
 from .logging import get_logger, log
 from .processor import Processor
+from .provider import ExtractionProvider
 from .redaction import redact
 from .repository import Repository
 from .schemas import (
@@ -28,6 +29,7 @@ class TermyteDB:
         *,
         database: Database | None = None,
         logger: logging.Logger | None = None,
+        extraction_provider: ExtractionProvider | None = None,
     ):
         if database is None and path is None:
             raise ValueError("an explicit database path or database instance is required")
@@ -36,7 +38,7 @@ class TermyteDB:
         self.database = database or Database(path)  # type: ignore[arg-type]
         self.repository = Repository(self.database)
         self.logger = logger or get_logger()
-        self.processor = Processor(self.repository, self.logger)
+        self.processor = Processor(self.repository, self.logger, extraction_provider)
         self._closed = False
 
     def ingest(self, event: EventInput | dict[str, Any]) -> EventReceipt:
@@ -60,8 +62,8 @@ class TermyteDB:
         )
 
     def process(self, namespace_id: str, limit: int = 100, lease_seconds: int = 30) -> ProcessResponse:
-        processed, failed, dead = self.processor.process_namespace(namespace_id, limit, lease_seconds)
-        return ProcessResponse(processed=processed, failed=failed, dead_lettered=dead)
+        processed, failed, dead, accepted, rejected = self.processor.process_namespace(namespace_id, limit, lease_seconds)
+        return ProcessResponse(processed=processed, failed=failed, dead_lettered=dead, accepted=accepted, rejected=rejected)
 
     def search(self, namespace_id: str, query: str, limit: int = 10) -> list[SearchResult]:
         results = self.repository.search(namespace_id, query, limit)

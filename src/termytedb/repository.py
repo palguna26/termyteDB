@@ -9,8 +9,10 @@ from typing import Any, cast
 
 from .db import Database
 from .errors import IdempotencyConflict
+from .extraction import ValidatedCandidate
 from .extractor import Candidate
-from .schemas import EventInput, EvidenceCitation, MemoryResponse, SearchResult
+from .redaction import redact_text
+from .schemas import EventInput, EvidenceCitation, ExtractionCandidate, MemoryResponse, SearchResult
 
 
 def iso(value: datetime | None = None) -> str:
@@ -271,6 +273,164 @@ class Repository:
             )
             return memory_id
 
+    def record_run(self, namespace_id: str, run: dict[str, Any]) -> None:
+        with self.db.connection:
+            self.db.execute(
+                """INSERT INTO extraction_runs
+                (id, namespace_id, input_hash, provider_name, model_name, prompt_version, schema_version,
+                 started_at, completed_at, input_events_json, input_characters, input_tokens, output_tokens,
+                 latency_ms, accepted_count, rejected_count, status, error_class)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                tuple(run.values()),
+            )
+
+    def finish_run(self, namespace_id: str, run_id: str, accepted: int, rejected: int, status: str, error_class: str | None = None) -> None:
+        with self.db.connection:
+            self.db.execute(
+                """UPDATE extraction_runs SET completed_at=?, accepted_count=?, rejected_count=?, status=?, error_class=?
+                WHERE id=? AND namespace_id=?""",
+                (iso(), accepted, rejected, status, error_class, run_id, namespace_id),
+            )
+
+    def record_decision(
+        self,
+        namespace_id: str,
+        run_id: str,
+        candidate: ExtractionCandidate,
+        fingerprint: str,
+        validation_status: str,
+        reason: str | None,
+        action: str,
+        memory_id: str | None = None,
+        version_id: str | None = None,
+    ) -> None:
+        with self.db.connection:
+            self.db.execute(
+                """INSERT OR IGNORE INTO extraction_decisions
+                (id, run_id, namespace_id, candidate_fingerprint, kind, subject, statement,
+                 validation_status, rejection_reason, action, memory_id, memory_version_id, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    str(uuid.uuid4()),
+                    run_id,
+                    namespace_id,
+                    fingerprint,
+                    candidate.kind,
+                    redact_text(candidate.subject),
+                    redact_text(candidate.statement),
+                    validation_status,
+                    redact_text(reason) if reason else None,
+                    action,
+                    memory_id,
+                    version_id,
+                    iso(),
+                ),
+            )
+
+    def reconcile_candidate(self, namespace_id: str, event: sqlite3.Row, candidate: ValidatedCandidate, run_id: str) -> tuple[str | None, str, str | None]:
+        """Atomically apply one validated proposal. Returns memory id, action, version id."""
+        item = candidate.candidate
+        with self.db.lock, self.db.connection:
+            source = self.db.execute(
+                "SELECT namespace_id, created_at, occurred_at, payload_json FROM events WHERE id=? AND namespace_id=?",
+                (str(item.evidence[0].event_id), namespace_id),
+            ).fetchone()
+            if not source:
+                raise ValueError("evidence event is not in the requested namespace")
+            if source["created_at"] > iso():
+                raise ValueError("evidence postdates derived version")
+            memory = self.db.execute(
+                "SELECT * FROM memories WHERE namespace_id=? AND kind=? AND subject_key=?",
+                (namespace_id, item.kind, item.subject),
+            ).fetchone()
+            memory_id = memory["id"] if memory else str(uuid.uuid4())
+            if item.intent == "ignore":
+                return memory_id if memory else None, "IGNORE", None
+            if not memory:
+                self.db.execute(
+                    "INSERT INTO memories(id, namespace_id, kind, subject_key, status, confidence, created_at) VALUES (?, ?, ?, ?, 'active', ?, ?)",
+                    (memory_id, namespace_id, item.kind, item.subject, item.confidence, iso()),
+                )
+            current = self.db.execute(
+                "SELECT * FROM memory_versions WHERE memory_id=? AND namespace_id=? ORDER BY version DESC LIMIT 1", (memory_id, namespace_id)
+            ).fetchone()
+            if current and current["statement"] == item.statement and current["status"] == "active":
+                for span in item.evidence:
+                    self.db.execute(
+                        """INSERT OR IGNORE INTO evidence_refs
+                        (id, memory_version_id, namespace_id, event_id, start_offset, end_offset, excerpt)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                        (str(uuid.uuid4()), current["id"], namespace_id, str(span.event_id), span.start_offset, span.end_offset, span.excerpt),
+                    )
+                return memory_id, "REINFORCE", current["id"]
+            if item.intent == "dispute":
+                action = "DISPUTE"
+                status = "contradicted"
+            elif current and item.intent in {"update", "supersede"}:
+                explicit = any(
+                    word in item.statement.casefold() or word in span.excerpt.casefold()
+                    for span in item.evidence
+                    for word in ("correction", "corrected", "replace", "supersede", "instead")
+                )
+                action = "UPDATE" if item.intent == "update" else "SUPERSEDE"
+                if not explicit:
+                    action, status = "DISPUTE", "contradicted"
+                else:
+                    status = "active"
+            elif current:
+                action, status = "DISPUTE", "contradicted"
+            else:
+                action, status = "INSERT", "active"
+            version = current["version"] + 1 if current else 1
+            if current and status == "active":
+                self.db.execute(
+                    "UPDATE memory_versions SET status='superseded', valid_to=? WHERE id=? AND namespace_id=?", (iso(), current["id"], namespace_id)
+                )
+                self.db.execute("DELETE FROM memory_fts WHERE memory_version_id=? AND namespace_id=?", (current["id"], namespace_id))
+            span = item.evidence[0]
+            version_id = str(uuid.uuid4())
+            self.db.execute(
+                """INSERT INTO memory_versions
+                (id, memory_id, namespace_id, source_event_id, evidence_start_offset, evidence_end_offset, evidence_excerpt,
+                 version, statement, valid_from, valid_until, recorded_at, status, reason, durability, model_run_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    version_id,
+                    memory_id,
+                    namespace_id,
+                    str(span.event_id),
+                    span.start_offset,
+                    span.end_offset,
+                    span.excerpt,
+                    version,
+                    item.statement,
+                    item.valid_from.astimezone(UTC).isoformat() if item.valid_from else source["occurred_at"],
+                    item.valid_until.astimezone(UTC).isoformat() if item.valid_until else None,
+                    iso(),
+                    status,
+                    action,
+                    item.durability,
+                    run_id,
+                ),
+            )
+            for ref in item.evidence:
+                self.db.execute(
+                    "INSERT INTO evidence_refs(id, memory_version_id, namespace_id, event_id, start_offset, end_offset, excerpt) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (str(uuid.uuid4()), version_id, namespace_id, str(ref.event_id), ref.start_offset, ref.end_offset, ref.excerpt),
+                )
+            if status == "active":
+                self.db.execute(
+                    "UPDATE memories SET current_version_id=?, status='active', confidence=? WHERE id=? AND namespace_id=?",
+                    (version_id, item.confidence, memory_id, namespace_id),
+                )
+                self.db.execute(
+                    "INSERT INTO memory_fts(memory_version_id, namespace_id, statement, evidence_text) VALUES (?, ?, ?, ?)",
+                    (version_id, namespace_id, item.statement, span.excerpt),
+                )
+            elif status == "contradicted":
+                self.db.execute("UPDATE memories SET status='disputed' WHERE id=? AND namespace_id=?", (memory_id, namespace_id))
+            return memory_id, action, version_id
+
     def get_memory(self, namespace_id: str, memory_id: str) -> MemoryResponse | None:
         row = self.db.execute(
             """SELECT m.*, v.id AS version_id, v.version, v.statement, v.status AS version_status
@@ -305,6 +465,7 @@ class Repository:
             JOIN memories m ON m.id=v.memory_id AND m.namespace_id=?
             WHERE memory_fts.namespace_id=? AND memory_fts MATCH ?
               AND v.namespace_id=? AND v.status='active' AND m.status='active' AND v.valid_to IS NULL
+              AND (v.valid_until IS NULL OR julianday(v.valid_until) > julianday('now'))
             ORDER BY score, v.id LIMIT ?""",
             (namespace_id, namespace_id, match, namespace_id, limit),
         ).fetchall()

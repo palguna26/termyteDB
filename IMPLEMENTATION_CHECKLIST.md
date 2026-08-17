@@ -22,3 +22,9 @@
 - [x] SQLite integrity checks, schema compatibility checks, and deterministic FTS repair
 - [x] WAL checkpoint and direct persistence inspection
 - [ ] Milestone 2 features: embeddings, graph, SDKs, hosted storage, richer extraction
+- [x] Strict extraction-v1 model proposal contract and offline fake provider
+- [x] Exact evidence-span, namespace, redaction, and conservative support validation
+- [x] Auditable extraction runs and reconciliation decisions
+- [x] Rule-only operation remains the default disabled-model path
+- [x] Labelled 50-case extraction fixture and model-path adversarial tests
+- [x] Omitted server ingestion time is excluded from event identity

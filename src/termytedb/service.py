@@ -9,6 +9,7 @@ from fastapi import FastAPI, HTTPException
 from .db import Database
 from .engine import TermyteDB
 from .errors import IdempotencyConflict
+from .provider import ExtractionProvider
 from .schemas import (
     ContextRequest,
     ContextResponse,
@@ -22,10 +23,15 @@ from .schemas import (
 )
 
 
-def create_app(database_path: str | Path | None = None, *, database: Database | None = None) -> FastAPI:
+def create_app(
+    database_path: str | Path | None = None,
+    *,
+    database: Database | None = None,
+    extraction_provider: ExtractionProvider | None = None,
+) -> FastAPI:
     if database is None and database_path is None:
         raise ValueError("create_app requires an explicit database path or database instance")
-    engine = TermyteDB(database_path, database=database)
+    engine = TermyteDB(database_path, database=database, extraction_provider=extraction_provider)
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:

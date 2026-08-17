@@ -22,6 +22,69 @@ class EventInput(BaseModel):
     stream_id: str | None = None
 
 
+MemoryKind = Literal[
+    "fact",
+    "decision",
+    "attempt",
+    "failure",
+    "outcome",
+    "constraint",
+    "procedure",
+    "task_state",
+    "correction",
+    "question",
+]
+ReconciliationIntent = Literal["insert", "reinforce", "update", "supersede", "dispute", "ignore"]
+Durability = Literal["permanent", "session", "task"]
+
+
+class EvidenceSpan(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    event_id: UUID
+    start_offset: int = Field(ge=0)
+    end_offset: int = Field(gt=0)
+    excerpt: str = Field(min_length=1, max_length=2000)
+
+
+class ExtractionCandidate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    kind: MemoryKind
+    subject: str = Field(min_length=1, max_length=200)
+    statement: str = Field(min_length=1, max_length=2000)
+    evidence: list[EvidenceSpan] = Field(min_length=1, max_length=8)
+    confidence: float = Field(ge=0, le=1)
+    durability: Durability
+    valid_from: datetime | None = None
+    valid_until: datetime | None = None
+    intent: ReconciliationIntent = "insert"
+    existing_memory_id: UUID | None = None
+
+
+class ExtractionResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    schema_version: str = Field(pattern=r"^extraction-v1$")
+    prompt_version: str = Field(min_length=1, max_length=100)
+    candidates: list[ExtractionCandidate] = Field(max_length=50)
+
+
+class ExtractionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    namespace_id: str = Field(min_length=1)
+    events: list[UUID] = Field(min_length=1, max_length=20)
+    evidence_text: dict[UUID, str]
+
+
+class ExtractionResult(BaseModel):
+    run_id: UUID
+    accepted: int
+    rejected: int
+    actions: dict[str, int]
+
+
 class EventReceipt(BaseModel):
     event_id: UUID
     namespace_id: str
@@ -42,6 +105,8 @@ class ProcessResponse(BaseModel):
     processed: int
     failed: int
     dead_lettered: int
+    accepted: int = 0
+    rejected: int = 0
 
 
 class SearchRequest(BaseModel):

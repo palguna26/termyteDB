@@ -124,6 +124,49 @@ MIGRATIONS: tuple[str, ...] = (
         THEN RAISE(ABORT, 'memory version requires same-namespace evidence') END;
     END;
     """,
+    """
+    CREATE TABLE extraction_runs (
+      id TEXT PRIMARY KEY,
+      namespace_id TEXT NOT NULL REFERENCES namespaces(id),
+      input_hash TEXT NOT NULL,
+      provider_name TEXT NOT NULL,
+      model_name TEXT NOT NULL,
+      prompt_version TEXT NOT NULL,
+      schema_version TEXT NOT NULL,
+      started_at TEXT NOT NULL,
+      completed_at TEXT,
+      input_events_json TEXT NOT NULL,
+      input_characters INTEGER NOT NULL,
+      input_tokens INTEGER,
+      output_tokens INTEGER,
+      latency_ms INTEGER,
+      accepted_count INTEGER NOT NULL DEFAULT 0,
+      rejected_count INTEGER NOT NULL DEFAULT 0,
+      status TEXT NOT NULL,
+      error_class TEXT
+    );
+    CREATE INDEX extraction_runs_namespace_idx ON extraction_runs(namespace_id, started_at);
+    CREATE TABLE extraction_decisions (
+      id TEXT PRIMARY KEY,
+      run_id TEXT NOT NULL REFERENCES extraction_runs(id),
+      namespace_id TEXT NOT NULL REFERENCES namespaces(id),
+      candidate_fingerprint TEXT NOT NULL,
+      kind TEXT NOT NULL,
+      subject TEXT NOT NULL,
+      statement TEXT NOT NULL,
+      validation_status TEXT NOT NULL,
+      rejection_reason TEXT,
+      action TEXT NOT NULL,
+      memory_id TEXT,
+      memory_version_id TEXT,
+      created_at TEXT NOT NULL,
+      UNIQUE(run_id, candidate_fingerprint)
+    );
+    CREATE INDEX extraction_decisions_namespace_idx ON extraction_decisions(namespace_id, created_at);
+    ALTER TABLE memory_versions ADD COLUMN valid_until TEXT;
+    ALTER TABLE memory_versions ADD COLUMN durability TEXT NOT NULL DEFAULT 'session';
+    ALTER TABLE memory_versions ADD COLUMN model_run_id TEXT;
+    """,
 )
 
 

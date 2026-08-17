@@ -8,3 +8,4 @@ The continuation benchmark packages a repository snapshot, Agent A task/trajecto
 
 LongMemEval-s gets an adapter that transforms each item into the same event/evidence pipeline, pins model/embedding versions, records seeds/configuration, and emits raw predictions plus metrics. No benchmark-specific shortcut may bypass production processing.
 
+Milestone 2 adds `tests/fixtures/extraction_cases.jsonl` with 50 labelled cases and `python -m termytedb.evaluation <fixture>`. The command reports a deterministic rule-only baseline. Reconciliation and temporal scores remain zero until labelled state transitions are run through the model-provider harness.
