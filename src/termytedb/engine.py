@@ -86,6 +86,12 @@ class TermyteDB:
     def feedback(self, namespace_id: str, memory_id: str, label: str, note: str | None) -> str:
         return self.repository.record_feedback(namespace_id, memory_id, label, note)
 
+    def event(self, namespace_id: str, event_id: str) -> dict[str, Any] | None:
+        return self.repository.get_event(namespace_id, event_id)
+
+    def jobs(self, namespace_id: str) -> list[dict[str, Any]]:
+        return self.repository.list_jobs(namespace_id)
+
     def process(self, namespace_id: str, limit: int = 100, lease_seconds: int = 30) -> ProcessResponse:
         processed, failed, dead, accepted, rejected = self.processor.process_namespace(namespace_id, limit, lease_seconds)
         return ProcessResponse(processed=processed, failed=failed, dead_lettered=dead, accepted=accepted, rejected=rejected)

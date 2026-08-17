@@ -11,6 +11,7 @@ from fastapi import FastAPI, HTTPException, Query, Request, Response
 from .db import Database
 from .engine import TermyteDB
 from .errors import IdempotencyConflict
+from .integrity import check_database
 from .provider import ExtractionProvider
 from .schemas import (
     BatchEventRequest,
@@ -74,6 +75,17 @@ def create_app(
     @app.post("/v1/process")
     def process(request: ProcessRequest) -> ProcessResponse:
         return engine.process(request.namespace_id, request.limit, request.lease_seconds)
+
+    @app.get("/v1/jobs")
+    def jobs(namespace_id: str = Query(...)) -> list[dict[str, object]]:
+        return engine.jobs(namespace_id)
+
+    @app.get("/v1/events/{event_id}")
+    def get_event(event_id: str, namespace_id: str = Query(...)) -> dict[str, object]:
+        event = engine.event(namespace_id, event_id)
+        if event is None:
+            raise HTTPException(status_code=404, detail="event not found")
+        return event
 
     @app.post("/v1/search")
     def search(request: SearchRequest) -> list[SearchResult]:
@@ -139,5 +151,10 @@ def create_app(
     @app.get("/ready")
     def ready() -> dict[str, str]:
         return {"status": "ready"}
+
+    @app.get("/v1/integrity")
+    def integrity() -> dict[str, object]:
+        report = check_database(engine.database)
+        return {"ok": report.ok, **report.__dict__}
 
     return app

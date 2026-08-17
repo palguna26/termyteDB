@@ -38,3 +38,4 @@
 - [x] Transactional canonical namespace export/import with audit and episode preservation
 - [x] Explainable namespace-scoped hybrid lexical/vector retrieval with rebuildable local embeddings
 - [x] Namespace-scoped redacted feedback endpoint and request ID correlation
+- [x] Namespace-scoped event/evidence and job inspection plus integrity API

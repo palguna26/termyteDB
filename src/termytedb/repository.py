@@ -175,6 +175,23 @@ class Repository:
     def list_feedback(self, namespace_id: str) -> list[dict[str, Any]]:
         return [dict(row) for row in self.db.execute("SELECT * FROM feedback WHERE namespace_id=? ORDER BY created_at, id", (namespace_id,)).fetchall()]
 
+    def get_event(self, namespace_id: str, event_id: str) -> dict[str, Any] | None:
+        row = self.db.execute("SELECT * FROM events WHERE id=? AND namespace_id=?", (event_id, namespace_id)).fetchone()
+        if not row:
+            return None
+        result = dict(row)
+        result["payload_json"] = json.loads(result["payload_json"])
+        result["evidence_refs"] = [
+            dict(item)
+            for item in self.db.execute(
+                "SELECT * FROM evidence_refs WHERE event_id=? AND namespace_id=? ORDER BY id", (event_id, namespace_id)
+            ).fetchall()
+        ]
+        return result
+
+    def list_jobs(self, namespace_id: str) -> list[dict[str, Any]]:
+        return [dict(row) for row in self.db.execute("SELECT * FROM processing_jobs WHERE namespace_id=? ORDER BY created_at, id", (namespace_id,)).fetchall()]
+
     def claim_jobs(self, namespace_id: str, limit: int, lease_seconds: int) -> list[sqlite3.Row]:
         # SQLite computes the lease consistently and avoids client clock formatting issues.
         with self.db.connection:
