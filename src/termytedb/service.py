@@ -97,6 +97,13 @@ def create_app(
     def export(namespace_id: str = Query(...)) -> dict[str, object]:
         return engine.export_namespace(namespace_id)
 
+    @app.post("/v1/import")
+    def import_namespace(document: dict[str, object], namespace_id: str = Query(...)) -> dict[str, int]:
+        try:
+            return engine.import_namespace(document, namespace_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
     @app.get("/v1/episodes")
     def episodes(namespace_id: str = Query(...)) -> list[dict[str, object]]:
         return engine.episodes(namespace_id)

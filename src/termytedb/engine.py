@@ -74,6 +74,9 @@ class TermyteDB:
     def export_namespace(self, namespace_id: str) -> dict[str, Any]:
         return self.repository.export_namespace(namespace_id)
 
+    def import_namespace(self, document: dict[str, Any], namespace_id: str) -> dict[str, int]:
+        return self.repository.import_namespace(document, namespace_id)
+
     def delete_namespace(self, namespace_id: str) -> bool:
         return self.repository.delete_namespace(namespace_id)
 

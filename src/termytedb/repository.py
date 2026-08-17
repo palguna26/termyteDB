@@ -599,13 +599,67 @@ class Repository:
         return [dict(row) for row in rows]
 
     def export_namespace(self, namespace_id: str) -> dict[str, Any]:
-        tables = ("namespaces", "events", "memories", "memory_versions", "evidence_refs", "processing_jobs")
+        tables = (
+            "namespaces", "events", "memories", "memory_versions", "evidence_refs", "processing_jobs",
+            "extraction_runs", "extraction_decisions", "episodes", "episode_events",
+        )
         result: dict[str, Any] = {
             "namespaces": [dict(row) for row in self.db.execute("SELECT * FROM namespaces WHERE id=?", (namespace_id,))],
         }
         for table in tables[1:]:
             result[table] = [dict(row) for row in self.db.execute(f"SELECT * FROM {table} WHERE namespace_id=?", (namespace_id,))]
         return result
+
+    def import_namespace(self, document: dict[str, Any], namespace_id: str) -> dict[str, int]:
+        """Replay a namespace export without changing IDs or creating cross-scope rows."""
+        expected = {"namespaces", "events", "memories", "memory_versions", "evidence_refs", "processing_jobs"}
+        if not expected.issubset(document):
+            raise ValueError("export is missing required tables")
+        namespace_rows = document["namespaces"]
+        if not isinstance(namespace_rows, list) or not any(row.get("id") == namespace_id for row in namespace_rows):
+            raise ValueError("export namespace does not match requested namespace")
+        ordered = (
+            "namespaces", "events", "memories", "extraction_runs", "memory_versions", "processing_jobs",
+            "evidence_refs", "extraction_decisions", "episodes", "episode_events",
+        )
+        counts: dict[str, int] = {}
+        with self.db.lock, self.db.connection:
+            for table in ordered:
+                rows = document.get(table, [])
+                if not isinstance(rows, list):
+                    raise ValueError(f"export table {table} must be a list")
+                inserted = 0
+                for row in rows:
+                    if not isinstance(row, dict):
+                        raise ValueError(f"export table {table} contains a non-object row")
+                    if table != "namespaces" and row.get("namespace_id") != namespace_id:
+                        raise ValueError(f"export row in {table} has the wrong namespace")
+                    columns = list(row)
+                    if not columns:
+                        continue
+                    placeholders = ",".join("?" for _ in columns)
+                    cursor = self.db.execute(
+                        f"INSERT OR IGNORE INTO {table} ({','.join(columns)}) VALUES ({placeholders})",
+                        tuple(row[column] for column in columns),
+                    )
+                    inserted += cursor.rowcount
+                counts[table] = inserted
+            self._rebuild_fts(namespace_id)
+        return counts
+
+    def _rebuild_fts(self, namespace_id: str) -> None:
+        self.db.execute("DELETE FROM memory_fts WHERE namespace_id=?", (namespace_id,))
+        rows = self.db.execute(
+            """SELECT v.id, v.statement, COALESCE(v.evidence_excerpt, '') AS evidence_excerpt
+               FROM memory_versions v JOIN memories m ON m.id=v.memory_id AND m.namespace_id=v.namespace_id
+               WHERE v.namespace_id=? AND v.status='active' AND m.status='active' AND v.valid_to IS NULL""",
+            (namespace_id,),
+        ).fetchall()
+        for row in rows:
+            self.db.execute(
+                "INSERT INTO memory_fts(memory_version_id, namespace_id, statement, evidence_text) VALUES (?, ?, ?, ?)",
+                (row["id"], namespace_id, row["statement"], row["evidence_excerpt"]),
+            )
 
     def delete_namespace(self, namespace_id: str) -> bool:
         with self.db.lock, self.db.connection:
