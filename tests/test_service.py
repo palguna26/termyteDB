@@ -49,3 +49,14 @@ def test_http_batch_history_invalidation_export_and_delete(tmp_path):
     assert client.get("/v1/export", params={"namespace_id": "lifecycle"}).json()["events"]
     assert client.delete("/v1/namespaces/lifecycle").json() == {"deleted": True}
     assert client.get(f"/v1/memories/{memory_id}", params={"namespace_id": "lifecycle"}).status_code == 404
+
+
+def test_http_historical_search_is_explicit(tmp_path):
+    client = TestClient(create_app(str(tmp_path / "historical.sqlite")))
+    for key, text in (("one", "Decision: storage uses SQLite."), ("two", "Decision: storage uses PostgreSQL.")):
+        client.post("/v1/events", json={"namespace_id": "history", "idempotency_key": key, "type": "decision", "payload": {"text": text}})
+    client.post("/v1/process", json={"namespace_id": "history"})
+    assert client.post("/v1/search", json={"namespace_id": "history", "query": "SQLite"}).json() == []
+    response = client.post("/v1/search", json={"namespace_id": "history", "query": "SQLite", "historical": True})
+    assert response.status_code == 200
+    assert response.json()[0]["status"] == "superseded"

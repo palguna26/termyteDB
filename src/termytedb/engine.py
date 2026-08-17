@@ -125,8 +125,8 @@ class TermyteDB:
     def cancel_job(self, namespace_id: str, job_id: str) -> bool:
         return self.repository.cancel_job(namespace_id, job_id)
 
-    def search(self, namespace_id: str, query: str, limit: int = 10) -> list[SearchResult]:
-        results = self.repository.search(namespace_id, query, limit)
+    def search(self, namespace_id: str, query: str, limit: int = 10, historical: bool = False) -> list[SearchResult]:
+        results = self.repository.search(namespace_id, query, limit, historical)
         log(
             self.logger,
             logging.INFO,
@@ -136,8 +136,8 @@ class TermyteDB:
         )
         return results
 
-    def context(self, namespace_id: str, query: str, token_budget: int = 500, limit: int = 10) -> ContextResponse:
-        result = build_context(self.repository, namespace_id, query, limit, token_budget)
+    def context(self, namespace_id: str, query: str, token_budget: int = 500, limit: int = 10, historical: bool = False) -> ContextResponse:
+        result = build_context(self.repository, namespace_id, query, limit, token_budget, historical)
         result.request_id = UUID(self.repository.record_context_request(namespace_id, query, token_budget, result))
         log(
             self.logger,

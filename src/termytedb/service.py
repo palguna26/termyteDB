@@ -133,13 +133,13 @@ def create_app(
     def search(request: SearchRequest) -> list[SearchResult]:
         require_namespace(request.namespace_id)
         enforce_rate_limit(request.namespace_id)
-        return engine.search(request.namespace_id, request.query, request.limit)
+        return engine.search(request.namespace_id, request.query, request.limit, request.historical)
 
     @app.post("/v1/context")
     def context(request: ContextRequest) -> ContextResponse:
         require_namespace(request.namespace_id)
         enforce_rate_limit(request.namespace_id)
-        return engine.context(request.namespace_id, request.query, request.token_budget, request.limit)
+        return engine.context(request.namespace_id, request.query, request.token_budget, request.limit, request.historical)
 
     @app.get("/v1/context/requests")
     def context_requests(namespace_id: str = Query(...), limit: int = Query(100, ge=1, le=100), offset: int = Query(0, ge=0)) -> list[dict[str, object]]:

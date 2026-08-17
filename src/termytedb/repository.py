@@ -661,25 +661,31 @@ class Repository:
             citations=citations,
         )
 
-    def search(self, namespace_id: str, query: str, limit: int) -> list[SearchResult]:
+    def search(self, namespace_id: str, query: str, limit: int, historical: bool = False) -> list[SearchResult]:
         terms = [part for part in query.split() if part.isalnum()]
         lexical: dict[str, float] = {}
         if terms:
             match = " OR ".join(f'"{term.replace(chr(34), "")}"' for term in terms)
-            lexical_rows = self.db.execute(
-                "SELECT memory_version_id, bm25(memory_fts) AS score FROM memory_fts WHERE namespace_id=? AND memory_fts MATCH ? ORDER BY score LIMIT ?",
-                (namespace_id, match, max(limit * 5, 20)),
-            ).fetchall()
-            maximum = max((abs(float(row["score"])) for row in lexical_rows), default=1.0)
+            if historical:
+                lexical_rows = self.db.execute(
+                    "SELECT id AS memory_version_id, 0.0 AS score FROM memory_versions WHERE namespace_id=? AND statement LIKE ? LIMIT ?",
+                    (namespace_id, f"%{query}%", max(limit * 5, 20)),
+                ).fetchall()
+            else:
+                lexical_rows = self.db.execute(
+                    "SELECT memory_version_id, bm25(memory_fts) AS score FROM memory_fts WHERE namespace_id=? AND memory_fts MATCH ? ORDER BY score LIMIT ?",
+                    (namespace_id, match, max(limit * 5, 20)),
+                ).fetchall()
+            maximum = max((abs(float(row["score"])) for row in lexical_rows), default=0.0) or 1.0
             lexical = {row["memory_version_id"]: min(1.0, abs(float(row["score"])) / maximum) for row in lexical_rows}
         query_vector = self.embedding.embed(query)
         vector_rows = self.db.execute(
             """SELECT e.memory_version_id, e.vector_json
             FROM memory_embeddings e JOIN memory_versions v ON v.id=e.memory_version_id AND v.namespace_id=e.namespace_id
             JOIN memories m ON m.id=v.memory_id AND m.namespace_id=v.namespace_id
-            WHERE e.namespace_id=? AND v.status='active' AND m.status='active' AND v.valid_to IS NULL
-              AND (v.valid_until IS NULL OR julianday(v.valid_until) > julianday('now'))""",
-            (namespace_id,),
+            WHERE e.namespace_id=? AND (? OR (v.status='active' AND m.status='active' AND v.valid_to IS NULL
+              AND (v.valid_until IS NULL OR julianday(v.valid_until) > julianday('now'))))""",
+            (namespace_id, historical),
         ).fetchall()
         vector = {row["memory_version_id"]: cosine(query_vector, json.loads(row["vector_json"])) for row in vector_rows}
         vector_candidates = {memory_id for memory_id, score in vector.items() if score >= 0.75}
@@ -690,8 +696,8 @@ class Repository:
         rows = self.db.execute(
             f"""SELECT m.id, m.kind, v.id AS version_id, v.statement, v.status
             FROM memory_versions v JOIN memories m ON m.id=v.memory_id AND m.namespace_id=?
-            WHERE v.namespace_id=? AND v.id IN ({placeholders}) AND v.status='active' AND m.status='active'""",
-            (namespace_id, namespace_id, *candidate_ids),
+            WHERE v.namespace_id=? AND v.id IN ({placeholders}) AND (? OR (v.status='active' AND m.status='active'))""",
+            (namespace_id, namespace_id, *candidate_ids, historical),
         ).fetchall()
         ranked = sorted(
             rows,

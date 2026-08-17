@@ -171,6 +171,7 @@ class SearchRequest(BaseModel):
     namespace_id: str = Field(min_length=1)
     query: str = Field(min_length=1)
     limit: int = Field(default=10, ge=1, le=100)
+    historical: bool = False
 
 
 class EvidenceCitation(BaseModel):

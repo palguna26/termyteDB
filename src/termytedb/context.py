@@ -8,8 +8,8 @@ def token_count(text: str) -> int:
     return len(text.split())
 
 
-def build_context(repository: Repository, namespace_id: str, query: str, limit: int, token_budget: int) -> ContextResponse:
-    candidates = repository.search(namespace_id, query, limit)
+def build_context(repository: Repository, namespace_id: str, query: str, limit: int, token_budget: int, historical: bool = False) -> ContextResponse:
+    candidates = repository.search(namespace_id, query, limit, historical)
     results = [result for result in candidates if result.score >= 0.05]
     selected: list[SearchResult] = []
     chunks: list[str] = []
@@ -45,5 +45,6 @@ def build_context(repository: Repository, namespace_id: str, query: str, limit: 
             "selected_count": len(selected),
             "excluded": excluded[:100],
             "token_budget": token_budget,
+            "historical": historical,
         },
     )

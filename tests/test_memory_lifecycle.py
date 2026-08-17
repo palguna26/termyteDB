@@ -59,6 +59,17 @@ def test_new_version_supersedes_old_and_search_excludes_it(db):
     assert db.database.execute("SELECT COUNT(*) FROM memory_versions WHERE memory_id=?", (str(old.memory_id),)).fetchone()[0] == 2
 
 
+def test_historical_search_can_request_superseded_truth(db):
+    db.ingest(event("n1", "one", "Decision: storage uses SQLite."))
+    db.process("n1")
+    db.ingest(event("n1", "two", "Decision: storage uses PostgreSQL."))
+    db.process("n1")
+    assert db.search("n1", "SQLite") == []
+    historical = db.repository.search("n1", "SQLite", 10, historical=True)
+    assert historical
+    assert historical[0].status == "superseded"
+
+
 def test_integrity_detects_tampered_event_payload(db):
     receipt = db.ingest(event("n1", "tamper", "Decision: storage uses SQLite."))
     with db.database.connection:
