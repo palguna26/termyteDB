@@ -33,7 +33,7 @@ def test_python_client_sends_request_id_and_retries(monkeypatch):
             raise HTTPError(request.full_url, 503, "busy", headers, io.BytesIO(b'{"detail":"busy"}'))
         return Response({"status": "ok"})
 
-    monkeypatch.setattr("clients.python.termytedb_client.urlopen", open_request)
+    monkeypatch.setattr("termytedb.client.urlopen", open_request)
     assert TermyteDBClient("http://localhost", retries=1).health() == {"status": "ok"}
     assert len(calls) == 2
     assert calls[0][0].get_header("X-request-id")
@@ -46,7 +46,7 @@ def test_python_client_exposes_structured_errors(monkeypatch):
         headers["x-request-id"] = "request-1"
         raise HTTPError(request.full_url, 422, "bad", headers, io.BytesIO(b'{"detail":"invalid"}'))
 
-    monkeypatch.setattr("clients.python.termytedb_client.urlopen", open_request)
+    monkeypatch.setattr("termytedb.client.urlopen", open_request)
     with pytest.raises(TermyteDBError) as error:
         TermyteDBClient("http://localhost", retries=0).health()
     assert error.value.status == 422
