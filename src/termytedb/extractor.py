@@ -38,6 +38,12 @@ RULES = (
     ),
     ("decision", re.compile(r"(?i)\bwe decided to\s+(.+?)(?:[.!?]|$)")),
     ("failure", re.compile(r"(?i)\b(?:failure|failed|error)\s*[:\-]\s*(.+?)(?:[.!?]|$)")),
+    ("outcome", re.compile(r"(?i)\boutcome\s*[:\-]\s*(.+?)(?:[.!?]|$)")),
+    ("constraint", re.compile(r"(?i)\bconstraint\s*[:\-]\s*(.+?)(?:[.!?]|$)")),
+    ("procedure", re.compile(r"(?i)\bprocedure\s*[:\-]\s*(.+?)(?:[.!?]|$)")),
+    ("attempt", re.compile(r"(?i)\battempt\s*[:\-]\s*(.+?)(?:[.!?]|$)")),
+    ("task_state", re.compile(r"(?i)\btask\s*[:\-]\s*(.+?)(?:[.!?]|$)")),
+    ("question", re.compile(r"(?i)\bquestion\s*[:\-]\s*(.+?)(?:[.!?]|$)")),
     ("correction", re.compile(r"(?i)\b(?:correction|corrected)\s*[:\-]\s*(.+?)(?:[.!?]|$)")),
 )
 

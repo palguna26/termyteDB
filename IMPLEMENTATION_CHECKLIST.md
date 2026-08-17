@@ -52,3 +52,4 @@
 - [x] Artifact URI and metadata redaction across persistence, inspection, and export
 - [x] Optional per-namespace HTTP sliding-window rate boundary
 - [x] Bounded limit/offset pagination for inspection collections
+- [x] Rule-only extraction for declared outcome/constraint/procedure/attempt/task/question kinds

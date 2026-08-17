@@ -80,7 +80,8 @@ def semantic_support(statement: str, excerpt: str) -> bool:
 
 def rule_candidate_to_contract(candidate: RuleCandidate, event_id: UUID, source: str) -> ExtractionCandidate:
     excerpt = source[candidate.start_offset : candidate.end_offset]
-    kind = candidate.kind if candidate.kind in {"decision", "failure", "correction"} else "fact"
+    supported_kinds = {"decision", "failure", "outcome", "constraint", "procedure", "attempt", "task_state", "question", "correction"}
+    kind = candidate.kind if candidate.kind in supported_kinds else "fact"
     return ExtractionCandidate(
         kind=cast(MemoryKind, kind),
         subject=candidate.subject_key,
