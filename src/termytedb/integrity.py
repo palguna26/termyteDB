@@ -38,7 +38,12 @@ def check_database(database: Database) -> IntegrityReport:
     schema_version = max(versions, default=0)
     compatible = versions == list(range(1, len(MIGRATIONS) + 1)) and schema_version == len(MIGRATIONS)
     columns = {row[1] for row in connection.execute("PRAGMA table_info(memory_versions)")}
-    compatible = compatible and "source_event_id" in columns
+    compatible = compatible and {
+        "source_event_id",
+        "evidence_start_offset",
+        "evidence_end_offset",
+        "evidence_excerpt",
+    }.issubset(columns)
     foreign_key_errors = [str(tuple(row)) for row in connection.execute("PRAGMA foreign_key_check")]
     sqlite_errors = [str(row[0]) for row in connection.execute("PRAGMA integrity_check") if row[0] != "ok"]
     orphan_evidence = int(
@@ -60,7 +65,9 @@ def check_database(database: Database) -> IntegrityReport:
         connection.execute(
             """SELECT COUNT(*) FROM memory_versions v
             LEFT JOIN evidence_refs r ON r.memory_version_id=v.id AND r.namespace_id=v.namespace_id
-            WHERE r.id IS NULL"""
+            WHERE r.id IS NULL OR v.source_event_id IS NULL
+               OR v.evidence_start_offset IS NULL OR v.evidence_end_offset IS NULL
+               OR v.evidence_excerpt IS NULL"""
         ).fetchone()[0]
     )
     missing_fts = int(

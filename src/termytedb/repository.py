@@ -225,9 +225,23 @@ class Repository:
             version_id = str(uuid.uuid4())
             self.db.execute(
                 """INSERT INTO memory_versions
-                (id, memory_id, namespace_id, source_event_id, version, statement, valid_from, recorded_at, status, reason)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active', 'deterministic_rule')""",
-                (version_id, memory_id, namespace_id, event["id"], version, candidate.statement, now, now),
+                (id, memory_id, namespace_id, source_event_id, evidence_start_offset,
+                 evidence_end_offset, evidence_excerpt, version, statement, valid_from,
+                 recorded_at, status, reason)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', 'deterministic_rule')""",
+                (
+                    version_id,
+                    memory_id,
+                    namespace_id,
+                    event["id"],
+                    candidate.start_offset,
+                    candidate.end_offset,
+                    candidate.statement,
+                    version,
+                    candidate.statement,
+                    now,
+                    now,
+                ),
             )
             self.db.execute(
                 """INSERT INTO evidence_refs

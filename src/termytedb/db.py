@@ -105,6 +105,24 @@ MIGRATIONS: tuple[str, ...] = (
         OR (SELECT namespace_id FROM events WHERE id=NEW.event_id) != NEW.namespace_id
         THEN RAISE(ABORT, 'evidence namespace or source mismatch') END;
     END;
+    ALTER TABLE memory_versions ADD COLUMN evidence_start_offset INTEGER;
+    ALTER TABLE memory_versions ADD COLUMN evidence_end_offset INTEGER;
+    ALTER TABLE memory_versions ADD COLUMN evidence_excerpt TEXT;
+    UPDATE memory_versions
+    SET evidence_start_offset = (SELECT start_offset FROM evidence_refs WHERE memory_version_id=memory_versions.id ORDER BY id LIMIT 1),
+        evidence_end_offset = (SELECT end_offset FROM evidence_refs WHERE memory_version_id=memory_versions.id ORDER BY id LIMIT 1),
+        evidence_excerpt = (SELECT excerpt FROM evidence_refs WHERE memory_version_id=memory_versions.id ORDER BY id LIMIT 1)
+    WHERE evidence_start_offset IS NULL;
+    CREATE TRIGGER memory_versions_evidence_guard
+    BEFORE INSERT ON memory_versions
+    BEGIN
+      SELECT CASE WHEN
+        NEW.source_event_id IS NULL OR NEW.evidence_start_offset IS NULL OR
+        NEW.evidence_end_offset IS NULL OR NEW.evidence_excerpt IS NULL OR
+        NEW.evidence_end_offset <= NEW.evidence_start_offset OR
+        (SELECT namespace_id FROM events WHERE id=NEW.source_event_id) != NEW.namespace_id
+        THEN RAISE(ABORT, 'memory version requires same-namespace evidence') END;
+    END;
     """,
 )
 
