@@ -1,0 +1,57 @@
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass
+from typing import Any
+
+
+@dataclass(frozen=True)
+class Candidate:
+    kind: str
+    subject_key: str
+    statement: str
+    start_offset: int
+    end_offset: int
+
+
+def payload_text(payload: dict[str, Any]) -> str:
+    parts: list[str] = []
+
+    def visit(value: Any) -> None:
+        if isinstance(value, str):
+            parts.append(value)
+        elif isinstance(value, dict):
+            for item in value.values():
+                visit(item)
+        elif isinstance(value, list):
+            for item in value:
+                visit(item)
+
+    visit(payload)
+    return "\n".join(parts)
+
+
+RULES = (
+    (
+        "decision",
+        re.compile(r"(?i)\b(?:decision|decided|choose|chosen)\s*[:\-]\s*(.+?)(?:[.!?]|$)"),
+    ),
+    ("decision", re.compile(r"(?i)\bwe decided to\s+(.+?)(?:[.!?]|$)")),
+    ("failure", re.compile(r"(?i)\b(?:failure|failed|error)\s*[:\-]\s*(.+?)(?:[.!?]|$)")),
+    ("correction", re.compile(r"(?i)\b(?:correction|corrected)\s*[:\-]\s*(.+?)(?:[.!?]|$)")),
+)
+
+
+def extract(payload: dict[str, Any]) -> list[Candidate]:
+    text = payload_text(payload)
+    candidates: list[Candidate] = []
+    for kind, pattern in RULES:
+        for match in pattern.finditer(text):
+            statement = match.group(0).strip()
+            body = match.group(1).strip()
+            if not body:
+                continue
+            subject_words = body.casefold().split()[:2]
+            subject_key = f"{kind}:{' '.join(subject_words)}"
+            candidates.append(Candidate(kind, subject_key, statement, match.start(), match.end()))
+    return sorted(candidates, key=lambda item: (item.start_offset, item.kind, item.statement))
