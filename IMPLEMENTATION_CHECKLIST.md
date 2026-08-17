@@ -57,3 +57,4 @@
 - [x] Conservative sentence-start declarative fact extraction with speculation rejection
 - [x] Rule-mode reconciliation audit correctly records INSERT versus REINFORCE
 - [x] Paginated extraction-run and extraction-decision provenance inspection
+- [x] Continuation fixtures validate repository snapshots and declarative verification tests

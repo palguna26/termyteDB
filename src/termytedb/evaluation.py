@@ -92,18 +92,29 @@ def _events(cases: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def evaluate_continuation_fixture(path: str | Path) -> dict[str, Any]:
-    """Run continuation cases through production memory and explicit simple baselines."""
+    """Run continuation cases through production memory and explicit baselines.
+
+    Cases may include a synthetic repository snapshot, resulting state, and
+    declarative verification checks. These are validated locally without
+    executing arbitrary fixture-provided commands.
+    """
     cases = [json.loads(line) for line in Path(path).read_text(encoding="utf-8").splitlines() if line.strip()]
     started = time.perf_counter()
     baseline_hits = {"no_memory": 0, "raw_history": 0, "previous_summary": 0, "termytedb": 0}
     token_totals = {name: 0 for name in baseline_hits}
+    required = {
+        "snapshot_id", "initial_task", "continuation_task", "verification", "events", "expected",
+        "repository_snapshot", "resulting_repository", "verification_tests",
+    }
+    verification_passes = 0
+    for case in cases:
+        missing = required - set(case)
+        if missing:
+            raise ValueError(f"continuation case is missing: {sorted(missing)}")
+        verification_passes += int(_verify_repository_fixture(case))
     with tempfile.TemporaryDirectory(prefix="termytedb-continuation-") as directory:
         engine = TermyteDB(Path(directory) / "continuation.sqlite")
         for case_index, case in enumerate(cases):
-            required = {"snapshot_id", "initial_task", "continuation_task", "verification", "events", "expected"}
-            missing = required - set(case)
-            if missing:
-                raise ValueError(f"continuation case is missing: {sorted(missing)}")
             namespace = f"continuation-{case_index}"
             evidence = [str(item) for item in case["events"]]
             for event_index, text in enumerate(evidence):
@@ -134,8 +145,30 @@ def evaluate_continuation_fixture(path: str | Path) -> dict[str, Any]:
             name: {"completion_rate": round(hits / total, 4) if total else 0.0, "tokens": token_totals[name]}
             for name, hits in baseline_hits.items()
         },
+        "repository_fixture_verification_rate": round(verification_passes / total, 4) if total else 0.0,
         "termytedb_improvement_over_previous_summary": round((baseline_hits["termytedb"] - baseline_hits["previous_summary"]) / total, 4) if total else 0.0,
     }
+
+
+def _verify_repository_fixture(case: dict[str, Any]) -> bool:
+    """Verify declarative snapshot/result/test data without running shell commands."""
+    snapshot = case["repository_snapshot"]
+    result = case["resulting_repository"]
+    tests = case["verification_tests"]
+    if not isinstance(snapshot, dict) or not isinstance(result, dict) or not isinstance(tests, list) or not tests:
+        raise ValueError("repository_snapshot and resulting_repository must be objects and verification_tests must be non-empty")
+    for collection in (snapshot, result):
+        for relative_path, content in collection.items():
+            if not isinstance(relative_path, str) or not relative_path or relative_path.startswith(("/", "\\")) or ".." in Path(relative_path).parts:
+                raise ValueError("repository fixture paths must be relative and contained")
+            if not isinstance(content, str):
+                raise ValueError("repository fixture file contents must be strings")
+    for test in tests:
+        if not isinstance(test, dict) or not isinstance(test.get("path"), str) or not isinstance(test.get("contains"), str):
+            raise ValueError("verification_tests require path and contains strings")
+        if test["path"] not in result or test["contains"] not in result[test["path"]]:
+            return False
+    return True
 
 
 def evaluate_longmemeval_fixture(

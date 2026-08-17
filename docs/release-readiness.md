@@ -11,7 +11,7 @@
 
 ## Measured local evidence
 
-- 70 automated tests pass with Ruff and mypy.
+- 82 automated tests pass with Ruff and mypy.
 - Retrieval smoke fixture: Recall@5 `1.0`, MRR `1.0`, NDCG@5 `1.0`.
 - Synthetic continuation fixture: no-memory `0.0`, previous-summary `0.0`, raw history `1.0`, TermyteDB `1.0`.
 - Synthetic LongMemEval-shaped fixture: accuracy `1.0` over 2 items.
@@ -22,7 +22,7 @@ These are regression and smoke measurements, not broad product-quality, capacity
 ## Not verified or not implemented
 
 - PostgreSQL/pgvector storage behavior and hosted transactional migrations.
-- Real LongMemEval-s dataset execution and real coding-agent repository trajectories.
+- Real LongMemEval-s dataset execution and real coding-agent trajectories with executed verification commands.
 - Real agent completion, tests-passed, tool-call, token, cost, and repeated-mistake measurements.
 - Large-scale concurrent load, disk-failure simulation, and representative storage-growth targets.
 - TypeScript/Python network SDK packages, pagination across every collection endpoint, and hosted authentication integration beyond the callback boundary.
