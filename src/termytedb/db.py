@@ -200,6 +200,17 @@ MIGRATIONS: tuple[str, ...] = (
     );
     CREATE INDEX memory_embeddings_namespace_idx ON memory_embeddings(namespace_id);
     """,
+    """
+    CREATE TABLE feedback (
+      id TEXT PRIMARY KEY,
+      namespace_id TEXT NOT NULL REFERENCES namespaces(id),
+      memory_id TEXT NOT NULL REFERENCES memories(id),
+      label TEXT NOT NULL CHECK(label IN ('useful', 'not_useful', 'wrong', 'stale')),
+      note TEXT,
+      created_at TEXT NOT NULL
+    );
+    CREATE INDEX feedback_namespace_created_idx ON feedback(namespace_id, created_at);
+    """,
 )
 
 

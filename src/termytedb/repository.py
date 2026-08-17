@@ -160,6 +160,21 @@ class Repository:
         ).fetchall()
         return [dict(row) for row in rows]
 
+    def record_feedback(self, namespace_id: str, memory_id: str, label: str, note: str | None) -> str:
+        feedback_id = str(uuid.uuid4())
+        with self.db.lock, self.db.connection:
+            exists = self.db.execute("SELECT 1 FROM memories WHERE id=? AND namespace_id=?", (memory_id, namespace_id)).fetchone()
+            if not exists:
+                raise KeyError(memory_id)
+            self.db.execute(
+                "INSERT INTO feedback(id, namespace_id, memory_id, label, note, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                (feedback_id, namespace_id, memory_id, label, redact_text(note) if note else None, iso()),
+            )
+        return feedback_id
+
+    def list_feedback(self, namespace_id: str) -> list[dict[str, Any]]:
+        return [dict(row) for row in self.db.execute("SELECT * FROM feedback WHERE namespace_id=? ORDER BY created_at, id", (namespace_id,)).fetchall()]
+
     def claim_jobs(self, namespace_id: str, limit: int, lease_seconds: int) -> list[sqlite3.Row]:
         # SQLite computes the lease consistently and avoids client clock formatting issues.
         with self.db.connection:
@@ -630,7 +645,7 @@ class Repository:
     def export_namespace(self, namespace_id: str) -> dict[str, Any]:
         tables = (
             "namespaces", "events", "memories", "memory_versions", "evidence_refs", "processing_jobs",
-            "extraction_runs", "extraction_decisions", "episodes", "episode_events", "memory_embeddings",
+            "extraction_runs", "extraction_decisions", "episodes", "episode_events", "memory_embeddings", "feedback",
         )
         result: dict[str, Any] = {
             "namespaces": [dict(row) for row in self.db.execute("SELECT * FROM namespaces WHERE id=?", (namespace_id,))],
@@ -649,7 +664,7 @@ class Repository:
             raise ValueError("export namespace does not match requested namespace")
         ordered = (
             "namespaces", "events", "memories", "extraction_runs", "memory_versions", "processing_jobs",
-            "evidence_refs", "extraction_decisions", "episodes", "episode_events", "memory_embeddings",
+            "evidence_refs", "extraction_decisions", "episodes", "episode_events", "memory_embeddings", "feedback",
         )
         counts: dict[str, int] = {}
         with self.db.lock, self.db.connection:
@@ -706,6 +721,7 @@ class Repository:
             self.db.execute("DELETE FROM episode_events WHERE namespace_id=?", (namespace_id,))
             self.db.execute("DELETE FROM episodes WHERE namespace_id=?", (namespace_id,))
             self.db.execute("DELETE FROM memory_embeddings WHERE namespace_id=?", (namespace_id,))
+            self.db.execute("DELETE FROM feedback WHERE namespace_id=?", (namespace_id,))
             for table in ("evidence_refs", "memory_versions", "memories", "processing_jobs", "events"):
                 self.db.execute(f"DELETE FROM {table} WHERE namespace_id=?", (namespace_id,))
             self.db.execute("DELETE FROM namespaces WHERE id=?", (namespace_id,))

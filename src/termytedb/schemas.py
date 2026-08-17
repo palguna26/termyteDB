@@ -108,6 +108,22 @@ class MemoryHistoryResponse(BaseModel):
     versions: list[dict[str, Any]]
 
 
+class FeedbackRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    namespace_id: str = Field(min_length=1)
+    memory_id: UUID
+    label: Literal["useful", "not_useful", "wrong", "stale"]
+    note: str | None = Field(default=None, max_length=1000)
+
+
+class FeedbackResponse(BaseModel):
+    id: UUID
+    namespace_id: str
+    memory_id: UUID
+    label: str
+
+
 class ProcessRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 

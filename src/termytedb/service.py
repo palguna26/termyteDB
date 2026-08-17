@@ -3,9 +3,10 @@ from __future__ import annotations
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
-from uuid import UUID
+from typing import cast
+from uuid import UUID, uuid4
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request, Response
 
 from .db import Database
 from .engine import TermyteDB
@@ -18,6 +19,8 @@ from .schemas import (
     ContextResponse,
     EventInput,
     EventReceipt,
+    FeedbackRequest,
+    FeedbackResponse,
     MemoryHistoryResponse,
     MemoryResponse,
     ProcessRequest,
@@ -46,6 +49,13 @@ def create_app(
 
     app = FastAPI(title="TermyteDB", version="0.1.0", lifespan=lifespan)
     app.state.engine = engine
+
+    @app.middleware("http")
+    async def request_id_middleware(request: Request, call_next: object) -> Response:
+        request_id = request.headers.get("x-request-id") or str(uuid4())
+        response = cast(Response, await call_next(request))  # type: ignore[operator]
+        response.headers["x-request-id"] = request_id
+        return response
 
     @app.post("/v1/events")
     def ingest(event: EventInput) -> EventReceipt:
@@ -107,6 +117,14 @@ def create_app(
     @app.get("/v1/episodes")
     def episodes(namespace_id: str = Query(...)) -> list[dict[str, object]]:
         return engine.episodes(namespace_id)
+
+    @app.post("/v1/feedback", response_model=FeedbackResponse)
+    def feedback(request: FeedbackRequest) -> FeedbackResponse:
+        try:
+            feedback_id = engine.feedback(request.namespace_id, str(request.memory_id), request.label, request.note)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="memory not found") from exc
+        return FeedbackResponse(id=UUID(feedback_id), namespace_id=request.namespace_id, memory_id=request.memory_id, label=request.label)
 
     @app.delete("/v1/namespaces/{namespace_id}")
     def delete_namespace(namespace_id: str) -> dict[str, bool]:
