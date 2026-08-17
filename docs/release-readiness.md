@@ -7,7 +7,7 @@
 - Adversarial storage scan confirms a redacted secret is absent from the SQLite database and any WAL/journal files created during ingestion and processing.
 - Deterministic episodes, evidence-span validation, rule extraction, fake provider, generic HTTP provider boundary, append-only versions, corrections, disputes, invalidation, and audit decisions.
 - Namespace-filtered FTS5 plus injectable embeddings (deterministic local default), explainable hybrid scores, context token budgets, abstention, selection diagnostics, feedback, export/import, deletion, backup, and integrity repair.
-- Versioned HTTP service with request IDs, optional namespace authorization, health/readiness, paginated event/memory/evidence/job inspection, namespace metrics, and OpenAPI generation with a contract test.
+- Versioned HTTP service with request IDs, optional namespace authorization, health/readiness, paginated event and dedicated evidence/memory/job inspection, namespace metrics, and OpenAPI generation with a contract test.
 - Thin Python and TypeScript clients with bounded transient retries, request IDs, timeouts, and structured errors; Python behavior is contract-tested and the TypeScript source compiles with TypeScript 7.0.2.
 - Deterministic extraction, retrieval, temporal, continuation, LongMemEval-shaped, reconciliation, and local performance harnesses, including concurrent namespace smoke coverage.
 
