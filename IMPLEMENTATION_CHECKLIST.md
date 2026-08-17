@@ -64,3 +64,4 @@
 - [x] Integrity-aware readiness endpoint with unhealthy-store response
 - [x] SQLite online backup with reopen and preservation coverage
 - [x] Concurrent namespace ingestion benchmark and isolation regression coverage
+- [x] Injectable embedding provider boundary with persisted index provenance

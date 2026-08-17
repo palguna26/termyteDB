@@ -3,8 +3,24 @@ from __future__ import annotations
 import hashlib
 import math
 import re
+from typing import Protocol
 
 DIMENSIONS = 32
+
+
+class EmbeddingProvider(Protocol):
+    name: str
+    dimensions: int
+
+    def embed(self, value: str) -> list[float]: ...
+
+
+class LocalHashEmbedding:
+    name = "local-hash-v1"
+    dimensions = DIMENSIONS
+
+    def embed(self, value: str) -> list[float]:
+        return embed_text(value)
 
 
 def embed_text(value: str) -> list[float]:

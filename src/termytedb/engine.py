@@ -8,6 +8,7 @@ from uuid import UUID
 
 from .context import build_context
 from .db import Database
+from .embedding import EmbeddingProvider
 from .logging import get_logger, log
 from .processor import Processor
 from .provider import ExtractionProvider
@@ -33,13 +34,14 @@ class TermyteDB:
         database: Database | None = None,
         logger: logging.Logger | None = None,
         extraction_provider: ExtractionProvider | None = None,
+        embedding_provider: EmbeddingProvider | None = None,
     ):
         if database is None and path is None:
             raise ValueError("an explicit database path or database instance is required")
         if database is not None and path is not None:
             raise ValueError("provide a database path or database instance, not both")
         self.database = database or Database(path)  # type: ignore[arg-type]
-        self.repository = Repository(self.database)
+        self.repository = Repository(self.database, embedding_provider)
         self.logger = logger or get_logger()
         self.processor = Processor(self.repository, self.logger, extraction_provider)
         self._closed = False

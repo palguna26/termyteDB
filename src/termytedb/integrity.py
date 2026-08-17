@@ -5,7 +5,7 @@ import json
 from dataclasses import asdict, dataclass
 
 from .db import MIGRATIONS, Database
-from .embedding import embed_text
+from .embedding import LocalHashEmbedding
 from .repository import canonical_event_content, hash_text
 from .schemas import ArtifactInput, EventInput
 
@@ -145,8 +145,9 @@ def check_database(database: Database) -> IntegrityReport:
     )
 
 
-def repair_fts(database: Database) -> None:
+def repair_fts(database: Database, embedding: LocalHashEmbedding | None = None) -> None:
     """Rebuild deterministic FTS and local embedding indexes from authority."""
+    embedding = embedding or LocalHashEmbedding()
     with database.lock, database.connection:
         database.execute("DELETE FROM memory_fts")
         database.execute("DELETE FROM memory_embeddings")
@@ -164,8 +165,8 @@ def repair_fts(database: Database) -> None:
         ).fetchall()
         for row in rows:
             database.execute(
-                "INSERT INTO memory_embeddings(memory_version_id, namespace_id, provider, dimensions, vector_json) VALUES (?, ?, 'local-hash-v1', 32, ?)",
-                (row["id"], row["namespace_id"], json.dumps(embed_text(row["statement"]), separators=(",", ":"))),
+                "INSERT INTO memory_embeddings(memory_version_id, namespace_id, provider, dimensions, vector_json) VALUES (?, ?, ?, ?, ?)",
+                (row["id"], row["namespace_id"], embedding.name, embedding.dimensions, json.dumps(embedding.embed(row["statement"]), separators=(",", ":"))),
             )
 
 

@@ -8,7 +8,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any, cast
 
 from .db import Database
-from .embedding import cosine, embed_text
+from .embedding import EmbeddingProvider, LocalHashEmbedding, cosine
 from .errors import IdempotencyConflict
 from .extraction import ValidatedCandidate
 from .extractor import Candidate
@@ -63,8 +63,9 @@ def canonical_event_content(event: EventInput, redacted_payload: dict[str, Any])
 
 
 class Repository:
-    def __init__(self, database: Database):
+    def __init__(self, database: Database, embedding: EmbeddingProvider | None = None):
         self.db = database
+        self.embedding = embedding or LocalHashEmbedding()
 
     def ensure_namespace(self, namespace_id: str, org_id: str = "default") -> None:
         with self.db.connection:
@@ -457,8 +458,11 @@ class Repository:
                 (version_id, namespace_id, candidate.statement, candidate.statement),
             )
             self.db.execute(
-                "INSERT INTO memory_embeddings(memory_version_id, namespace_id, provider, dimensions, vector_json) VALUES (?, ?, 'local-hash-v1', 32, ?)",
-                (version_id, namespace_id, json.dumps(embed_text(candidate.statement), separators=(",", ":"))),
+                "INSERT INTO memory_embeddings(memory_version_id, namespace_id, provider, dimensions, vector_json) VALUES (?, ?, ?, ?, ?)",
+                (
+                    version_id, namespace_id, self.embedding.name, self.embedding.dimensions,
+                    json.dumps(self.embedding.embed(candidate.statement), separators=(",", ":")),
+                ),
             )
             return memory_id
 
@@ -483,14 +487,14 @@ class Repository:
 
     def list_extraction_runs(self, namespace_id: str, limit: int = 100, offset: int = 0) -> list[dict[str, Any]]:
         rows = self.db.execute(
-            "SELECT * FROM extraction_runs WHERE namespace_id=? ORDER BY started_at DESC, id DESC LIMIT ? OFFSET ?",
+            "SELECT * FROM extraction_runs WHERE namespace_id=? ORDER BY rowid DESC LIMIT ? OFFSET ?",
             (namespace_id, limit, offset),
         ).fetchall()
         return [dict(row) for row in rows]
 
     def list_extraction_decisions(self, namespace_id: str, limit: int = 100, offset: int = 0) -> list[dict[str, Any]]:
         rows = self.db.execute(
-            "SELECT * FROM extraction_decisions WHERE namespace_id=? ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
+            "SELECT * FROM extraction_decisions WHERE namespace_id=? ORDER BY rowid DESC LIMIT ? OFFSET ?",
             (namespace_id, limit, offset),
         ).fetchall()
         return [dict(row) for row in rows]
@@ -668,7 +672,7 @@ class Repository:
             ).fetchall()
             maximum = max((abs(float(row["score"])) for row in lexical_rows), default=1.0)
             lexical = {row["memory_version_id"]: min(1.0, abs(float(row["score"])) / maximum) for row in lexical_rows}
-        query_vector = embed_text(query)
+        query_vector = self.embedding.embed(query)
         vector_rows = self.db.execute(
             """SELECT e.memory_version_id, e.vector_json
             FROM memory_embeddings e JOIN memory_versions v ON v.id=e.memory_version_id AND v.namespace_id=e.namespace_id
@@ -831,8 +835,11 @@ class Repository:
                 (row["id"], namespace_id, row["statement"], row["evidence_excerpt"]),
             )
             self.db.execute(
-                "INSERT INTO memory_embeddings(memory_version_id, namespace_id, provider, dimensions, vector_json) VALUES (?, ?, 'local-hash-v1', 32, ?)",
-                (row["id"], namespace_id, json.dumps(embed_text(row["statement"]), separators=(",", ":"))),
+                "INSERT INTO memory_embeddings(memory_version_id, namespace_id, provider, dimensions, vector_json) VALUES (?, ?, ?, ?, ?)",
+                (
+                    row["id"], namespace_id, self.embedding.name, self.embedding.dimensions,
+                    json.dumps(self.embedding.embed(row["statement"]), separators=(",", ":")),
+                ),
             )
 
     def delete_namespace(self, namespace_id: str) -> bool:

@@ -3,7 +3,7 @@ def test_rule_mode_records_reinforce_for_duplicate_evidence(db):
     db.ingest({**event, "idempotency_key": "one"})
     db.ingest({**event, "idempotency_key": "two"})
     assert db.process("audit-actions").accepted == 2
-    actions = [row[0] for row in db.database.execute("SELECT action FROM extraction_decisions ORDER BY created_at, id").fetchall()]
+    actions = [row[0] for row in db.database.execute("SELECT action FROM extraction_decisions ORDER BY rowid").fetchall()]
     assert actions == ["INSERT", "REINFORCE"]
 
 
@@ -48,6 +48,6 @@ def test_model_reconciliation_records_dispute_and_ignore(tmp_path):
 
     database.processor.provider = Provider()
     assert database.process("model-actions").accepted == 2
-    actions = [row[0] for row in database.database.execute("SELECT action FROM extraction_decisions ORDER BY created_at, id").fetchall()]
+    actions = [row[0] for row in database.database.execute("SELECT action FROM extraction_decisions ORDER BY rowid").fetchall()]
     assert actions == ["INSERT", "DISPUTE"]
     database.close()
