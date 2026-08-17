@@ -33,6 +33,12 @@ def payload_text(payload: dict[str, Any]) -> str:
 
 RULES = (
     (
+        "fact",
+        re.compile(
+            r"(?im)^(?:the|this|service|repository|version|file|branch)\s+[^.!?\n]{1,160}\s+(?:is|runs on|uses|requires|contains)\s+[^.!?\n]{1,240}[.!?]"
+        ),
+    ),
+    (
         "decision",
         re.compile(r"(?i)\b(?:decision|decided|choose|chosen)\s*[:\-]\s*(.+?)(?:[.!?]|$)"),
     ),
@@ -54,7 +60,7 @@ def extract(payload: dict[str, Any]) -> list[Candidate]:
     for kind, pattern in RULES:
         for match in pattern.finditer(text):
             statement = match.group(0).strip()
-            body = match.group(1).strip()
+            body = match.group(1).strip() if match.lastindex else statement
             if not body:
                 continue
             subject_words = body.casefold().split()[:2]

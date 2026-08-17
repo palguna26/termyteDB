@@ -53,3 +53,4 @@
 - [x] Optional per-namespace HTTP sliding-window rate boundary
 - [x] Bounded limit/offset pagination for inspection collections
 - [x] Rule-only extraction for declared outcome/constraint/procedure/attempt/task/question kinds
+- [x] Conservative sentence-start declarative fact extraction with speculation rejection

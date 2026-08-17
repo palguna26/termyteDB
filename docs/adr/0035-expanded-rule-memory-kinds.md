@@ -6,7 +6,7 @@ Accepted
 
 ## Decision
 
-The offline rule extractor recognizes explicit `Outcome:`, `Constraint:`, `Procedure:`, `Attempt:`, `Task:`, and `Question:` labels in addition to decisions, failures, and corrections. It preserves the declared kind and exact full-match evidence span. It does not infer unlabeled facts or task state from ordinary prose.
+The offline rule extractor recognizes explicit `Outcome:`, `Constraint:`, `Procedure:`, `Attempt:`, `Task:`, and `Question:` labels in addition to decisions, failures, and corrections. It also recognizes a narrow sentence-start declarative fact form such as `The service runs on SQLite.` It preserves the declared kind and exact full-match evidence span, while rejecting speculative mid-sentence prose.
 
 ## Consequences
 
