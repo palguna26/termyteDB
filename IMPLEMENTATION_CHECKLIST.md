@@ -46,3 +46,4 @@
 - [x] Versioned canonical event identity with actor/agent/session/source fields and payload boundary
 - [x] Bounded content-addressed artifact descriptors with export/import and deletion coverage
 - [x] Optional HTTP namespace authorization boundary over all namespace-bearing routes
+- [x] Integrity detection and deterministic repair for both FTS and embedding indexes

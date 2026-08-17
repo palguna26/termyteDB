@@ -22,6 +22,15 @@ def test_integrity_tool_and_deterministic_fts_repair(db):
     assert check_database(db.database).ok
 
 
+def test_integrity_tool_repairs_embedding_index_too(db):
+    db.ingest(event("n1", "one", "Decision: storage uses SQLite."))
+    db.process("n1")
+    db.database.execute("DELETE FROM memory_embeddings")
+    assert check_database(db.database).missing_embeddings == 1
+    repair_fts(db.database)
+    assert check_database(db.database).missing_embeddings == 0
+
+
 def test_nested_secrets_are_absent_from_all_persistent_surfaces(db, tmp_path: Path):
     secret = "SUPERSECRET123456789"
     stream = io.StringIO()

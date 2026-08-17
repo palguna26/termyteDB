@@ -5,6 +5,7 @@ import json
 from dataclasses import asdict, dataclass
 
 from .db import MIGRATIONS, Database
+from .embedding import embed_text
 
 
 @dataclass(frozen=True)
@@ -16,6 +17,8 @@ class IntegrityReport:
     missing_evidence: int
     orphan_fts: int
     missing_fts: int
+    orphan_embeddings: int
+    missing_embeddings: int
     schema_compatible: bool
 
     @property
@@ -27,6 +30,8 @@ class IntegrityReport:
             or self.missing_evidence
             or self.orphan_fts
             or self.missing_fts
+            or self.orphan_embeddings
+            or self.missing_embeddings
             or not self.schema_compatible
         )
 
@@ -78,6 +83,21 @@ def check_database(database: Database) -> IntegrityReport:
             WHERE v.status='active' AND m.status='active' AND v.valid_to IS NULL AND f.memory_version_id IS NULL"""
         ).fetchone()[0]
     )
+    orphan_embeddings = int(
+        connection.execute(
+            """SELECT COUNT(*) FROM memory_embeddings e
+            LEFT JOIN memory_versions v ON v.id=e.memory_version_id AND v.namespace_id=e.namespace_id
+            WHERE v.id IS NULL OR v.status != 'active'"""
+        ).fetchone()[0]
+    )
+    missing_embeddings = int(
+        connection.execute(
+            """SELECT COUNT(*) FROM memory_versions v
+            JOIN memories m ON m.current_version_id=v.id AND m.namespace_id=v.namespace_id
+            LEFT JOIN memory_embeddings e ON e.memory_version_id=v.id AND e.namespace_id=v.namespace_id
+            WHERE v.status='active' AND m.status='active' AND v.valid_to IS NULL AND e.memory_version_id IS NULL"""
+        ).fetchone()[0]
+    )
     return IntegrityReport(
         schema_version,
         foreign_key_errors,
@@ -86,14 +106,17 @@ def check_database(database: Database) -> IntegrityReport:
         missing_evidence,
         orphan_fts,
         missing_fts,
+        orphan_embeddings,
+        missing_embeddings,
         compatible,
     )
 
 
 def repair_fts(database: Database) -> None:
-    """Rebuild only the deterministic FTS index from active authoritative rows."""
+    """Rebuild deterministic FTS and local embedding indexes from authority."""
     with database.lock, database.connection:
         database.execute("DELETE FROM memory_fts")
+        database.execute("DELETE FROM memory_embeddings")
         database.execute(
             """INSERT INTO memory_fts(memory_version_id, namespace_id, statement, evidence_text)
             SELECT v.id, v.namespace_id, v.statement, v.statement
@@ -101,6 +124,16 @@ def repair_fts(database: Database) -> None:
               ON m.current_version_id=v.id AND m.namespace_id=v.namespace_id
             WHERE v.status='active' AND m.status='active' AND v.valid_to IS NULL"""
         )
+        rows = database.execute(
+            """SELECT v.id, v.namespace_id, v.statement FROM memory_versions v JOIN memories m
+            ON m.current_version_id=v.id AND m.namespace_id=v.namespace_id
+            WHERE v.status='active' AND m.status='active' AND v.valid_to IS NULL"""
+        ).fetchall()
+        for row in rows:
+            database.execute(
+                "INSERT INTO memory_embeddings(memory_version_id, namespace_id, provider, dimensions, vector_json) VALUES (?, ?, 'local-hash-v1', 32, ?)",
+                (row["id"], row["namespace_id"], json.dumps(embed_text(row["statement"]), separators=(",", ":"))),
+            )
 
 
 def main() -> int:
