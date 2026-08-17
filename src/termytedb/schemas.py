@@ -194,6 +194,7 @@ class ContextResponse(BaseModel):
     token_count: int
     text: str
     results: list[SearchResult]
+    diagnostics: dict[str, Any] = Field(default_factory=dict)
 
 
 class MemoryResponse(BaseModel):

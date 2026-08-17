@@ -9,19 +9,27 @@ def token_count(text: str) -> int:
 
 
 def build_context(repository: Repository, namespace_id: str, query: str, limit: int, token_budget: int) -> ContextResponse:
-    results = repository.search(namespace_id, query, limit)
+    candidates = repository.search(namespace_id, query, limit)
+    results = [result for result in candidates if result.score >= 0.05]
     selected: list[SearchResult] = []
     chunks: list[str] = []
     used = 0
+    excluded: list[dict[str, str]] = []
+    seen_statements: set[str] = set()
     for result in results:
+        if result.statement.casefold() in seen_statements:
+            excluded.append({"memory_version_id": str(result.memory_version_id), "reason": "duplicate_statement"})
+            continue
         citation = result.citations[0] if result.citations else None
         line = f"[{result.kind}] {result.statement}"
         if citation:
             line += f" (evidence:{citation.event_id})"
         cost = token_count(line)
         if used + cost > token_budget:
+            excluded.append({"memory_version_id": str(result.memory_version_id), "reason": "token_budget"})
             continue
         selected.append(result)
+        seen_statements.add(result.statement.casefold())
         chunks.append(line)
         used += cost
     return ContextResponse(
@@ -31,4 +39,11 @@ def build_context(repository: Repository, namespace_id: str, query: str, limit: 
         token_count=used,
         text="\n".join(chunks),
         results=selected,
+        diagnostics={
+            "candidate_count": len(candidates),
+            "score_filtered_count": len(candidates) - len(results),
+            "selected_count": len(selected),
+            "excluded": excluded[:100],
+            "token_budget": token_budget,
+        },
     )
