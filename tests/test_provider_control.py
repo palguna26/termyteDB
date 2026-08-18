@@ -60,3 +60,15 @@ def test_provider_failure_records_failed_extraction_run(tmp_path):
     assert tuple(run) == ("failed", "transport_error")
     assert db.repository.memory_count("failed-provider") == 0
     db.close()
+
+
+def test_non_retryable_provider_failure_dead_letters_immediately(tmp_path):
+    class InvalidProvider(RecordingProvider):
+        def extract(self, request, timeout_seconds=30.0, cancellation=None):
+            raise ProviderError("invalid output", retryable=False, error_class="invalid_output")
+
+    db = TermyteDB(tmp_path / "provider-invalid.sqlite", extraction_provider=InvalidProvider())
+    db.ingest({"namespace_id": "invalid-provider", "idempotency_key": "one", "type": "note", "payload": {"text": "Decision: use SQLite."}})
+    assert db.process("invalid-provider").dead_lettered == 1
+    assert db.process("invalid-provider").processed == 0
+    db.close()

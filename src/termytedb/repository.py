@@ -368,7 +368,7 @@ class Repository:
             )
             return cursor.rowcount == 1
 
-    def fail_job(self, namespace_id: str, job_id: str, error: str) -> str:
+    def fail_job(self, namespace_id: str, job_id: str, error: str, *, retryable: bool = True) -> str:
         with self.db.connection:
             row = self.db.execute(
                 "SELECT status, attempts, max_attempts FROM processing_jobs WHERE id=? AND namespace_id=?",
@@ -378,11 +378,11 @@ class Repository:
                 raise KeyError(job_id)
             if row["status"] == "cancelled":
                 return "cancelled"
-            status = "dead" if row["attempts"] >= row["max_attempts"] else "failed"
+            status = "dead" if not retryable or row["attempts"] >= row["max_attempts"] else "failed"
             delay = min(300, 2 ** max(0, int(row["attempts"]) - 1))
             self.db.execute(
                 "UPDATE processing_jobs SET status=?, lease_until=NULL, next_attempt_at=?, last_error=?, updated_at=? WHERE id=? AND namespace_id=?",
-                (status, None if status == "dead" else f"{iso()}" , error, iso(), job_id, namespace_id),
+                (status, None, error, iso(), job_id, namespace_id),
             )
             if status != "dead":
                 self.db.execute(

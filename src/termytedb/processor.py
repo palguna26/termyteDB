@@ -172,7 +172,12 @@ class Processor:
                     )
                 if self._run_exists(namespace_id, run_id):
                     self.repository.finish_run(namespace_id, run_id, job_accepted, job_rejected, "failed", error_class)
-                status = self.repository.fail_job(namespace_id, job["id"], safe_error)
+                status = self.repository.fail_job(
+                    namespace_id,
+                    job["id"],
+                    safe_error,
+                    retryable=not isinstance(exc, ProviderError) or exc.retryable,
+                )
                 failed += 1
                 dead += status == "dead"
                 log(self.logger, logging.ERROR, "processing.failed", namespace_id=namespace_id, job_id=job["id"], status=status, error=safe_error)
