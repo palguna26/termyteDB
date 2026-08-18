@@ -16,7 +16,8 @@
 ## Measured local evidence
 
 - 122 automated tests pass with Ruff and mypy.
-- Retrieval smoke fixture: Recall@5 `1.0`, MRR `1.0`, NDCG@5 `1.0`.
+- Retrieval smoke fixture: Recall@5 `1.0`, Precision@5 `0.2`, MRR `1.0`, NDCG@5 `1.0`.
+- Namespace isolation fixture: zero search leaks and zero context leaks.
 - Synthetic continuation fixture: no-memory `0.0`, previous-summary `0.0`, raw history `1.0`, TermyteDB `1.0`.
 - Synthetic LongMemEval-shaped fixture: accuracy `1.0` over 2 items.
 - Ten-event local smoke run: batch ingest `781.15 events/s`, processing `43.455 ms`, search `0.768 ms`, context `0.332 ms`, restart search `0.725 ms`.
