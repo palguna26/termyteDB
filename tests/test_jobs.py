@@ -18,6 +18,9 @@ def test_failed_jobs_retry_without_duplicate_memories(db, monkeypatch):
 
     monkeypatch.setattr(processor_module, "extract", fail_once)
     assert db.process("n1").failed == 1
+    assert db.process("n1").processed == 0
+    with db.database.connection:
+        db.database.execute("UPDATE processing_jobs SET next_attempt_at='2000-01-01T00:00:00+00:00' WHERE namespace_id='n1'")
     assert db.process("n1").processed == 1
     assert db.repository.memory_count("n1") == 1
 
@@ -55,7 +58,11 @@ def test_permanently_failed_jobs_enter_dead_letter(db, monkeypatch):
         lambda payload: (_ for _ in ()).throw(RuntimeError("permanent")),
     )
     assert db.process("n1").dead_lettered == 0
+    with db.database.connection:
+        db.database.execute("UPDATE processing_jobs SET next_attempt_at='2000-01-01T00:00:00+00:00' WHERE namespace_id='n1'")
     assert db.process("n1").dead_lettered == 0
+    with db.database.connection:
+        db.database.execute("UPDATE processing_jobs SET next_attempt_at='2000-01-01T00:00:00+00:00' WHERE namespace_id='n1'")
     assert db.process("n1").dead_lettered == 1
     status = db.database.execute("SELECT status FROM processing_jobs WHERE namespace_id='n1'").fetchone()[0]
     assert status == "dead"

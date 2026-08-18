@@ -2,7 +2,7 @@
 
 ## Verified in this repository
 
-- SQLite WAL lifecycle, transactional migrations, foreign-key checks, restart recovery, leased jobs, heartbeats, retries, dead letters, and crash rollback.
+- SQLite WAL lifecycle, transactional migrations, foreign-key checks, restart recovery, leased jobs, heartbeats, exponential retry backoff, dead letters, and crash rollback.
 - Import-side-effect regression confirms importing the package and service modules creates no database or local files.
 - Redacted immutable events with namespace-scoped idempotency, `event-v1` identity fields, bounded payloads, and artifact descriptors.
 - Adversarial storage scan confirms a redacted secret is absent from the SQLite database and any WAL/journal files created during ingestion and processing.

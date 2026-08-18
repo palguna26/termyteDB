@@ -252,6 +252,9 @@ MIGRATIONS: tuple[str, ...] = (
     """
     ALTER TABLE extraction_runs ADD COLUMN estimated_cost_usd REAL;
     """,
+    """
+    ALTER TABLE processing_jobs ADD COLUMN next_attempt_at TEXT;
+    """,
 )
 
 

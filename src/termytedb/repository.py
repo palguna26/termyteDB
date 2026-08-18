@@ -328,8 +328,9 @@ class Repository:
         with self.db.lock, self.db.connection:
             rows = self.db.execute(
                 """SELECT * FROM processing_jobs
-                WHERE namespace_id = ? AND (status IN ('pending', 'failed') OR
-                    (status = 'processing' AND lease_until < datetime('now')))
+                WHERE namespace_id = ? AND ((status = 'pending' OR
+                    (status = 'failed' AND (next_attempt_at IS NULL OR next_attempt_at <= datetime('now'))) OR
+                    (status = 'processing' AND lease_until < datetime('now'))))
                 ORDER BY created_at, rowid LIMIT ?""",
                 (namespace_id, limit),
             ).fetchall()
@@ -378,10 +379,16 @@ class Repository:
             if row["status"] == "cancelled":
                 return "cancelled"
             status = "dead" if row["attempts"] >= row["max_attempts"] else "failed"
+            delay = min(300, 2 ** max(0, int(row["attempts"]) - 1))
             self.db.execute(
-                "UPDATE processing_jobs SET status=?, lease_until=NULL, last_error=?, updated_at=? WHERE id=? AND namespace_id=?",
-                (status, error, iso(), job_id, namespace_id),
+                "UPDATE processing_jobs SET status=?, lease_until=NULL, next_attempt_at=?, last_error=?, updated_at=? WHERE id=? AND namespace_id=?",
+                (status, None if status == "dead" else f"{iso()}" , error, iso(), job_id, namespace_id),
             )
+            if status != "dead":
+                self.db.execute(
+                    "UPDATE processing_jobs SET next_attempt_at=datetime('now', ?) WHERE id=? AND namespace_id=?",
+                    (f"+{delay} seconds", job_id, namespace_id),
+                )
             return status
 
     def cancel_job(self, namespace_id: str, job_id: str) -> bool:

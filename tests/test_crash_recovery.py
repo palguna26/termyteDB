@@ -10,7 +10,11 @@ def test_corrupted_payload_retries_then_dead_letters(db):
     with db.database.connection:
         db.database.execute("UPDATE events SET payload_json=? WHERE id=? AND namespace_id=?", ("{bad", str(receipt.event_id), "n1"))
     assert db.process("n1").failed == 1
+    with db.database.connection:
+        db.database.execute("UPDATE processing_jobs SET next_attempt_at='2000-01-01T00:00:00+00:00' WHERE namespace_id='n1'")
     assert db.process("n1").failed == 1
+    with db.database.connection:
+        db.database.execute("UPDATE processing_jobs SET next_attempt_at='2000-01-01T00:00:00+00:00' WHERE namespace_id='n1'")
     assert db.process("n1").dead_lettered == 1
     assert db.repository.memory_count("n1") == 0
 
@@ -54,6 +58,8 @@ def test_crash_after_memory_commit_does_not_duplicate_version(db, monkeypatch):
 
     monkeypatch.setattr(db.repository, "complete_job", crash_once)
     assert db.process("n1").failed == 1
+    with db.database.connection:
+        db.database.execute("UPDATE processing_jobs SET next_attempt_at='2000-01-01T00:00:00+00:00' WHERE namespace_id='n1'")
     assert db.process("n1").processed == 1
     memory = db.search("n1", "SQLite")[0]
     assert len(db.repository.list_versions("n1", str(memory.memory_id))) == 1
