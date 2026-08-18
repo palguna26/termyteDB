@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import time
 import uuid
 from typing import Any, cast
@@ -79,6 +80,7 @@ class Processor:
                         "rejected_count": 0,
                         "status": "processing",
                         "error_class": None,
+                        "estimated_cost_usd": self._estimated_cost(input_tokens, output_tokens),
                     },
                 )
                 fingerprints: set[str] = set()
@@ -145,6 +147,17 @@ class Processor:
                 dead += status == "dead"
                 log(self.logger, logging.ERROR, "processing.failed", namespace_id=namespace_id, job_id=job["id"], status=status, error=safe_error)
         return processed, failed, dead, accepted, rejected
+
+    @staticmethod
+    def _estimated_cost(input_tokens: int | None, output_tokens: int | None) -> float | None:
+        input_rate = os.environ.get("TERMYTEDB_INPUT_COST_PER_1K_USD")
+        output_rate = os.environ.get("TERMYTEDB_OUTPUT_COST_PER_1K_USD")
+        if input_tokens is None or output_tokens is None or input_rate is None or output_rate is None:
+            return None
+        try:
+            return round((input_tokens * float(input_rate) + output_tokens * float(output_rate)) / 1000, 8)
+        except ValueError:
+            return None
 
     def _run_exists(self, namespace_id: str, run_id: str) -> bool:
         return self.repository.db.execute("SELECT 1 FROM extraction_runs WHERE id=? AND namespace_id=?", (run_id, namespace_id)).fetchone() is not None

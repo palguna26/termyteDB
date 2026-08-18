@@ -252,6 +252,9 @@ class Repository:
             "jobs_cancelled": job_counts.get("cancelled", 0),
             "average_extraction_latency_ms": round(float(latency["average"] or 0), 3),
             "maximum_extraction_latency_ms": int(latency["maximum"] or 0),
+            "estimated_extraction_cost_usd": float(
+                self.db.execute("SELECT COALESCE(SUM(estimated_cost_usd), 0) FROM extraction_runs WHERE namespace_id=?", (namespace_id,)).fetchone()[0]
+            ),
         }
 
     def get_event(self, namespace_id: str, event_id: str) -> dict[str, Any] | None:
@@ -527,8 +530,8 @@ class Repository:
                 """INSERT INTO extraction_runs
                 (id, namespace_id, input_hash, provider_name, model_name, prompt_version, schema_version,
                  started_at, completed_at, input_events_json, input_characters, input_tokens, output_tokens,
-                 latency_ms, accepted_count, rejected_count, status, error_class)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                 latency_ms, accepted_count, rejected_count, status, error_class, estimated_cost_usd)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 tuple(run.values()),
             )
 

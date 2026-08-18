@@ -249,6 +249,9 @@ MIGRATIONS: tuple[str, ...] = (
     """
     ALTER TABLE memories ADD COLUMN importance REAL NOT NULL DEFAULT 0.5;
     """,
+    """
+    ALTER TABLE extraction_runs ADD COLUMN estimated_cost_usd REAL;
+    """,
 )
 
 
