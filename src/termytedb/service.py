@@ -10,6 +10,7 @@ from typing import cast
 from uuid import UUID, uuid4
 
 from fastapi import FastAPI, HTTPException, Query, Request, Response
+from fastapi.responses import JSONResponse
 
 from .db import Database
 from .engine import TermyteDB
@@ -40,6 +41,7 @@ def create_app(
     *,
     database: Database | None = None,
     extraction_provider: ExtractionProvider | None = None,
+    request_authorizer: Callable[[Request], bool] | None = None,
     namespace_authorizer: Callable[[str], bool] | None = None,
     rate_limit_per_minute: int | None = None,
 ) -> FastAPI:
@@ -80,6 +82,10 @@ def create_app(
     @app.middleware("http")
     async def request_id_middleware(request: Request, call_next: object) -> Response:
         request_id = request.headers.get("x-request-id") or str(uuid4())
+        if request_authorizer is not None and not request_authorizer(request):
+            response: Response = JSONResponse(status_code=401, content={"detail": "authentication required"})
+            response.headers["x-request-id"] = request_id
+            return response
         response = cast(Response, await call_next(request))  # type: ignore[operator]
         response.headers["x-request-id"] = request_id
         return response
