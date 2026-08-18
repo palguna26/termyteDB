@@ -11,7 +11,7 @@
 - Provider token counts, latency, configurable estimated extraction cost, and accurate per-job accepted/rejected counts are persisted and included in namespace metrics without assuming pricing.
 - Namespace-filtered FTS5 plus injectable embeddings (deterministic local default), explainable hybrid scores, context token budgets, abstention, selection diagnostics, feedback, export/import, deletion, backup, and integrity repair.
 - Versioned HTTP service with request IDs, optional request authentication and namespace authorization, health/readiness, paginated event and dedicated evidence/memory/job inspection, namespace metrics, and OpenAPI generation with a contract test.
-- Thin Python and TypeScript clients with optional bearer auth, bounded transient retries, request IDs, timeouts, structured errors, paginated inspection, memory history, and invalidation; Python behavior is contract-tested and the TypeScript source compiles with TypeScript 7.0.2.
+- Thin Python and TypeScript clients with optional bearer auth, bounded transient retries, request IDs, timeouts, structured errors, full lifecycle operations, and paginated inspection; Python behavior is contract-tested and the TypeScript source compiles with TypeScript 7.0.2.
 - Deterministic extraction, retrieval, temporal, continuation, LongMemEval-shaped, reconciliation, and local performance harnesses, including concurrent namespace smoke coverage.
 
 ## Measured local evidence

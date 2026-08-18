@@ -42,7 +42,7 @@ python -m termytedb --database .\memory.sqlite
 
 The service publishes OpenAPI at `/docs`. Main endpoints are `/v1/events`, `/v1/events:batch`, `/v1/process`, `/v1/evidence`, `/v1/search`, `/v1/context`, `/v1/memories/{id}`, `/v1/export`, `/v1/import`, `/v1/feedback`, `/v1/integrity`, `/health`, and `/ready`.
 
-Thin clients are available in `clients/python` and the `clients/typescript` package. Both send a request ID, optionally send a bearer token, apply bounded retries to transient HTTP failures, enforce request timeouts, and expose ingest, processing, search, context, paginated inspection, memory history, and invalidation helpers.
+Thin clients are available in `clients/python` and the `clients/typescript` package. Both send a request ID, optionally send a bearer token, apply bounded retries to transient HTTP failures, enforce request timeouts, and expose ingestion, processing, retrieval, inspection, feedback, export, deletion, metrics, integrity, and readiness helpers.
 
 Local database operations:
 

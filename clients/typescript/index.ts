@@ -36,6 +36,7 @@ export class TermyteDBClient {
   }
 
   ingest(event: unknown) { return this.request("POST", "/v1/events", event); }
+  ingestBatch(events: unknown[]) { return this.request("POST", "/v1/events:batch", { events }); }
   process(namespaceId: string, options: Record<string, unknown> = {}) { return this.request("POST", "/v1/process", { namespace_id: namespaceId, ...options }); }
   search(namespaceId: string, query: string, options: Record<string, unknown> = {}) { return this.request("POST", "/v1/search", { namespace_id: namespaceId, query, ...options }); }
   context(namespaceId: string, query: string, options: Record<string, unknown> = {}) { return this.request("POST", "/v1/context", { namespace_id: namespaceId, query, ...options }); }
@@ -47,4 +48,10 @@ export class TermyteDBClient {
   memory(namespaceId: string, memoryId: string) { return this.request("GET", `/v1/memories/${encodeURIComponent(memoryId)}?namespace_id=${encodeURIComponent(namespaceId)}`); }
   history(namespaceId: string, memoryId: string) { return this.request("GET", `/v1/memories/${encodeURIComponent(memoryId)}/history?namespace_id=${encodeURIComponent(namespaceId)}`); }
   invalidate(namespaceId: string, memoryId: string, reason: string) { return this.request("POST", `/v1/memories/${encodeURIComponent(memoryId)}/invalidate?namespace_id=${encodeURIComponent(namespaceId)}&reason=${encodeURIComponent(reason)}`); }
+  feedback(value: unknown) { return this.request("POST", "/v1/feedback", value); }
+  exportNamespace(namespaceId: string) { return this.request("GET", `/v1/export?namespace_id=${encodeURIComponent(namespaceId)}`); }
+  deleteNamespace(namespaceId: string) { return this.request("DELETE", `/v1/namespaces/${encodeURIComponent(namespaceId)}`); }
+  metrics(namespaceId: string) { return this.request("GET", `/v1/metrics?namespace_id=${encodeURIComponent(namespaceId)}`); }
+  integrity() { return this.request("GET", "/v1/integrity"); }
+  ready() { return this.request("GET", "/ready"); }
 }

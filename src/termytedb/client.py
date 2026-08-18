@@ -54,6 +54,9 @@ class TermyteDBClient:
     def ingest(self, event: Mapping[str, Any]) -> Any:
         return self.request("POST", "/v1/events", body=event)
 
+    def ingest_batch(self, events: list[Mapping[str, Any]]) -> Any:
+        return self.request("POST", "/v1/events:batch", body={"events": events})
+
     def process(self, namespace_id: str, **options: object) -> Any:
         return self.request("POST", "/v1/process", body={"namespace_id": namespace_id, **options})
 
@@ -87,3 +90,21 @@ class TermyteDBClient:
 
     def invalidate(self, namespace_id: str, memory_id: str, reason: str) -> Any:
         return self.request("POST", f"/v1/memories/{memory_id}/invalidate", query={"namespace_id": namespace_id, "reason": reason})
+
+    def feedback(self, feedback: Mapping[str, Any]) -> Any:
+        return self.request("POST", "/v1/feedback", body=feedback)
+
+    def export_namespace(self, namespace_id: str) -> Any:
+        return self.request("GET", "/v1/export", query={"namespace_id": namespace_id})
+
+    def delete_namespace(self, namespace_id: str) -> Any:
+        return self.request("DELETE", f"/v1/namespaces/{namespace_id}")
+
+    def metrics(self, namespace_id: str) -> Any:
+        return self.request("GET", "/v1/metrics", query={"namespace_id": namespace_id})
+
+    def integrity(self) -> Any:
+        return self.request("GET", "/v1/integrity")
+
+    def ready(self) -> Any:
+        return self.request("GET", "/ready")
