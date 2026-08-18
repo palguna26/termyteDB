@@ -17,8 +17,10 @@ def test_namespace_deletion_removes_secret_from_sqlite_files(tmp_path: Path):
     )
     db.process("delete-me")
     assert db.delete_namespace("delete-me") is True
+    for path in tmp_path.iterdir():
+        if path.is_file():
+            assert secret.encode() not in path.read_bytes(), path.name
     db.close()
-
     for path in tmp_path.iterdir():
         if path.is_file():
             assert secret.encode() not in path.read_bytes(), path.name

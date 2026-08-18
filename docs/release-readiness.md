@@ -6,7 +6,7 @@
 - Import-side-effect regression confirms importing the package and service modules creates no database or local files.
 - Redacted immutable events with namespace-scoped idempotency, `event-v1` identity fields, bounded payloads, and artifact descriptors.
 - Adversarial storage scan confirms a redacted secret is absent from the SQLite database and any WAL/journal files created during ingestion and processing.
-- Namespace deletion storage scan confirms deleted secrets are absent from the SQLite database and WAL/journal files after close.
+- Namespace deletion storage scan confirms deleted secrets are absent from the live SQLite database/WAL files and remain absent after close.
 - Deterministic episodes, evidence-span validation, rule extraction, fake provider, generic HTTP provider boundary, failed-provider run audits, append-only versions, corrections, disputes, invalidation, and audit decisions.
 - Provider token counts, latency, configurable estimated extraction cost, and accurate per-job accepted/rejected counts are persisted and included in namespace metrics without assuming pricing.
 - Namespace-filtered FTS5 plus injectable embeddings (deterministic local default), explainable hybrid scores, context token budgets, abstention, selection diagnostics, feedback, export/import, deletion, backup, and integrity repair.
