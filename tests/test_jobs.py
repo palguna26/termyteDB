@@ -35,6 +35,16 @@ def test_expired_leases_are_reclaimed(db):
     assert reclaimed[0]["id"] == job["id"]
 
 
+def test_active_job_heartbeat_extends_lease_and_respects_namespace(db):
+    db.ingest(event("n1", "one", "Decision: Use SQLite."))
+    job = db.repository.claim_jobs("n1", 1, 1)[0]
+    before = db.database.execute("SELECT lease_until FROM processing_jobs WHERE id=?", (job["id"],)).fetchone()[0]
+    assert db.repository.heartbeat_job("n1", job["id"], 60) is True
+    after = db.database.execute("SELECT lease_until FROM processing_jobs WHERE id=?", (job["id"],)).fetchone()[0]
+    assert after != before
+    assert db.repository.heartbeat_job("other", job["id"], 60) is False
+
+
 def test_permanently_failed_jobs_enter_dead_letter(db, monkeypatch):
     db.ingest(event("n1", "one", "Decision: Use SQLite."))
     import termytedb.processor as processor_module

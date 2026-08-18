@@ -34,6 +34,8 @@ class Processor:
             started = time.perf_counter()
             try:
                 event = self.repository.event_for_job(namespace_id, job["id"])
+                if not self.repository.heartbeat_job(namespace_id, job["id"], lease_seconds):
+                    raise RuntimeError("job lease is no longer active")
                 payload = json.loads(event["payload_json"])
                 source = payload_text(payload)
                 event_id = uuid.UUID(event["id"])

@@ -2,7 +2,7 @@
 
 ## Verified in this repository
 
-- SQLite WAL lifecycle, transactional migrations, foreign-key checks, restart recovery, leased jobs, retries, dead letters, and crash rollback.
+- SQLite WAL lifecycle, transactional migrations, foreign-key checks, restart recovery, leased jobs, heartbeats, retries, dead letters, and crash rollback.
 - Redacted immutable events with namespace-scoped idempotency, `event-v1` identity fields, bounded payloads, and artifact descriptors.
 - Adversarial storage scan confirms a redacted secret is absent from the SQLite database and any WAL/journal files created during ingestion and processing.
 - Deterministic episodes, evidence-span validation, rule extraction, fake provider, generic HTTP provider boundary, append-only versions, corrections, disputes, invalidation, and audit decisions.

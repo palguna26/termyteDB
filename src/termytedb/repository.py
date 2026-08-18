@@ -353,6 +353,17 @@ class Repository:
                 (iso(), job_id, namespace_id),
             )
 
+    def heartbeat_job(self, namespace_id: str, job_id: str, lease_seconds: int) -> bool:
+        """Extend an active lease without reviving cancelled or completed work."""
+        with self.db.lock, self.db.connection:
+            cursor = self.db.execute(
+                """UPDATE processing_jobs
+                SET lease_until=datetime('now', ?), updated_at=?
+                WHERE id=? AND namespace_id=? AND status='processing'""",
+                (f"+{lease_seconds} seconds", iso(), job_id, namespace_id),
+            )
+            return cursor.rowcount == 1
+
     def fail_job(self, namespace_id: str, job_id: str, error: str) -> str:
         with self.db.connection:
             row = self.db.execute(
