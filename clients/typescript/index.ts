@@ -40,4 +40,11 @@ export class TermyteDBClient {
   search(namespaceId: string, query: string, options: Record<string, unknown> = {}) { return this.request("POST", "/v1/search", { namespace_id: namespaceId, query, ...options }); }
   context(namespaceId: string, query: string, options: Record<string, unknown> = {}) { return this.request("POST", "/v1/context", { namespace_id: namespaceId, query, ...options }); }
   health() { return this.request("GET", "/health"); }
+  events(namespaceId: string, options: Record<string, unknown> = {}) { return this.request("GET", `/v1/events?namespace_id=${encodeURIComponent(namespaceId)}&limit=${options.limit ?? 100}&offset=${options.offset ?? 0}`); }
+  evidence(namespaceId: string, options: Record<string, unknown> = {}) { return this.request("GET", `/v1/evidence?namespace_id=${encodeURIComponent(namespaceId)}&limit=${options.limit ?? 100}&offset=${options.offset ?? 0}`); }
+  memories(namespaceId: string, options: Record<string, unknown> = {}) { return this.request("GET", `/v1/memories?namespace_id=${encodeURIComponent(namespaceId)}&limit=${options.limit ?? 100}&offset=${options.offset ?? 0}`); }
+  jobs(namespaceId: string, options: Record<string, unknown> = {}) { return this.request("GET", `/v1/jobs?namespace_id=${encodeURIComponent(namespaceId)}&limit=${options.limit ?? 100}&offset=${options.offset ?? 0}`); }
+  memory(namespaceId: string, memoryId: string) { return this.request("GET", `/v1/memories/${encodeURIComponent(memoryId)}?namespace_id=${encodeURIComponent(namespaceId)}`); }
+  history(namespaceId: string, memoryId: string) { return this.request("GET", `/v1/memories/${encodeURIComponent(memoryId)}/history?namespace_id=${encodeURIComponent(namespaceId)}`); }
+  invalidate(namespaceId: string, memoryId: string, reason: string) { return this.request("POST", `/v1/memories/${encodeURIComponent(memoryId)}/invalidate?namespace_id=${encodeURIComponent(namespaceId)}&reason=${encodeURIComponent(reason)}`); }
 }

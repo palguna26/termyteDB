@@ -64,3 +64,24 @@ class TermyteDBClient:
 
     def health(self) -> Any:
         return self.request("GET", "/health")
+
+    def events(self, namespace_id: str, *, limit: int = 100, offset: int = 0) -> Any:
+        return self.request("GET", "/v1/events", query={"namespace_id": namespace_id, "limit": limit, "offset": offset})
+
+    def evidence(self, namespace_id: str, *, limit: int = 100, offset: int = 0) -> Any:
+        return self.request("GET", "/v1/evidence", query={"namespace_id": namespace_id, "limit": limit, "offset": offset})
+
+    def memories(self, namespace_id: str, *, limit: int = 100, offset: int = 0) -> Any:
+        return self.request("GET", "/v1/memories", query={"namespace_id": namespace_id, "limit": limit, "offset": offset})
+
+    def jobs(self, namespace_id: str, *, limit: int = 100, offset: int = 0) -> Any:
+        return self.request("GET", "/v1/jobs", query={"namespace_id": namespace_id, "limit": limit, "offset": offset})
+
+    def memory(self, namespace_id: str, memory_id: str) -> Any:
+        return self.request("GET", f"/v1/memories/{memory_id}", query={"namespace_id": namespace_id})
+
+    def history(self, namespace_id: str, memory_id: str) -> Any:
+        return self.request("GET", f"/v1/memories/{memory_id}/history", query={"namespace_id": namespace_id})
+
+    def invalidate(self, namespace_id: str, memory_id: str, reason: str) -> Any:
+        return self.request("POST", f"/v1/memories/{memory_id}/invalidate", query={"namespace_id": namespace_id, "reason": reason})
