@@ -3,6 +3,7 @@
 ## Verified in this repository
 
 - SQLite WAL lifecycle, transactional migrations, foreign-key checks, restart recovery, leased jobs, heartbeats, retries, dead letters, and crash rollback.
+- Import-side-effect regression confirms importing the package and service modules creates no database or local files.
 - Redacted immutable events with namespace-scoped idempotency, `event-v1` identity fields, bounded payloads, and artifact descriptors.
 - Adversarial storage scan confirms a redacted secret is absent from the SQLite database and any WAL/journal files created during ingestion and processing.
 - Deterministic episodes, evidence-span validation, rule extraction, fake provider, generic HTTP provider boundary, failed-provider run audits, append-only versions, corrections, disputes, invalidation, and audit decisions.
@@ -14,7 +15,7 @@
 
 ## Measured local evidence
 
-- 121 automated tests pass with Ruff and mypy.
+- 122 automated tests pass with Ruff and mypy.
 - Retrieval smoke fixture: Recall@5 `1.0`, MRR `1.0`, NDCG@5 `1.0`.
 - Synthetic continuation fixture: no-memory `0.0`, previous-summary `0.0`, raw history `1.0`, TermyteDB `1.0`.
 - Synthetic LongMemEval-shaped fixture: accuracy `1.0` over 2 items.
