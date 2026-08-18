@@ -8,7 +8,6 @@ from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
-
 from termytedb.errors import IdempotencyConflict
 from termytedb.service import create_app
 

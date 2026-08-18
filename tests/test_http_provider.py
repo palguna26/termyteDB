@@ -2,7 +2,6 @@ import json
 from uuid import uuid4
 
 import pytest
-
 from termytedb.provider import HttpExtractionProvider, ProviderError
 from termytedb.schemas import ExtractionRequest
 

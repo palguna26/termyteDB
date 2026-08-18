@@ -1,6 +1,5 @@
 from fastapi import Request
 from fastapi.testclient import TestClient
-
 from termytedb.service import create_app
 
 

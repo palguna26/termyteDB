@@ -1,7 +1,7 @@
 from fastapi.testclient import TestClient
+from termytedb.service import create_app
 
 from termytedb import TermyteDB
-from termytedb.service import create_app
 
 
 def test_context_request_is_persisted_and_survives_restart(tmp_path):

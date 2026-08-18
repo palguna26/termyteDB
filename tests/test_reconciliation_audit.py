@@ -12,9 +12,10 @@ def test_rule_mode_records_reinforce_for_duplicate_evidence(db):
 def test_model_reconciliation_records_dispute_and_ignore(tmp_path):
     from time import perf_counter
 
-    from termytedb import TermyteDB
     from termytedb.provider import ProviderResult
     from termytedb.schemas import EvidenceSpan, ExtractionCandidate, ExtractionResponse
+
+    from termytedb import TermyteDB
 
     database = TermyteDB(tmp_path / "actions.sqlite")
     first = database.ingest({"namespace_id": "model-actions", "idempotency_key": "one", "type": "note", "payload": {"text": "Decision: use SQLite."}})

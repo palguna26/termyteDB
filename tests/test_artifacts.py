@@ -1,5 +1,4 @@
 import pytest
-
 from termytedb.errors import IdempotencyConflict
 
 

@@ -5,7 +5,6 @@ import logging
 from pathlib import Path
 
 import pytest
-
 from termytedb.integrity import check_database, repair_fts
 from termytedb.logging import JsonFormatter
 

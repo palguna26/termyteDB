@@ -1,8 +1,9 @@
 from time import perf_counter
 
-from termytedb import TermyteDB
 from termytedb.provider import ProviderError, ProviderResult
 from termytedb.schemas import ExtractionResponse
+
+from termytedb import TermyteDB
 
 
 class RecordingProvider:

@@ -1,7 +1,7 @@
 from fastapi.testclient import TestClient
+from termytedb.service import create_app
 
 from termytedb import TermyteDB
-from termytedb.service import create_app
 
 
 def test_job_cancellation_is_namespace_scoped(tmp_path):

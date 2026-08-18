@@ -6,11 +6,11 @@ from pathlib import Path
 
 import pytest
 from pydantic import ValidationError
-
-from termytedb import TermyteDB
 from termytedb.errors import IdempotencyConflict
 from termytedb.provider import FakeExtractionProvider
 from termytedb.schemas import EvidenceSpan, ExtractionCandidate, ExtractionResponse
+
+from termytedb import TermyteDB
 
 
 def model_db(tmp_path: Path, text: str, candidate_factory):

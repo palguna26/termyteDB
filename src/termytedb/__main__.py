@@ -3,8 +3,8 @@ import os
 
 import uvicorn
 
-from .provider import HttpExtractionProvider
-from .service import create_app
+from .api.service import create_app
+from .memory.provider import HttpExtractionProvider
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()

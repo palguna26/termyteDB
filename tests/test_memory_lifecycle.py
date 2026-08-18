@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import pytest
-
 from termytedb.integrity import check_database
 
 from .conftest import event

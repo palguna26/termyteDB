@@ -1,7 +1,8 @@
 import json
 
-from termytedb import TermyteDB
 from termytedb.operations import main
+
+from termytedb import TermyteDB
 
 
 def test_operations_cli_supports_init_export_import_backup_and_integrity(tmp_path):
