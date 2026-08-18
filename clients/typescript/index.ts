@@ -4,7 +4,7 @@ export class TermyteDBError extends Error {
   }
 }
 
-export type ClientOptions = { timeoutMs?: number; retries?: number; fetch?: typeof globalThis.fetch };
+export type ClientOptions = { timeoutMs?: number; retries?: number; authToken?: string; fetch?: typeof globalThis.fetch };
 
 export class TermyteDBClient {
   private readonly fetcher: typeof globalThis.fetch;
@@ -20,7 +20,7 @@ export class TermyteDBClient {
       const timer = setTimeout(() => controller.abort(), this.options.timeoutMs ?? 30000);
       try {
         const response = await this.fetcher(`${this.baseUrl.replace(/\/$/, "")}/${path.replace(/^\//, "")}`, {
-          method, signal: controller.signal, headers: { accept: "application/json", "x-request-id": requestId, ...(body === undefined ? {} : { "content-type": "application/json" }) },
+          method, signal: controller.signal, headers: { accept: "application/json", "x-request-id": requestId, ...(this.options.authToken ? { authorization: `Bearer ${this.options.authToken}` } : {}), ...(body === undefined ? {} : { "content-type": "application/json" }) },
           body: body === undefined ? undefined : JSON.stringify(body),
         });
         const text = await response.text();

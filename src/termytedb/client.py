@@ -18,8 +18,8 @@ class TermyteDBError(RuntimeError):
 
 
 class TermyteDBClient:
-    def __init__(self, base_url: str, *, timeout: float = 30.0, retries: int = 2):
-        self.base_url, self.timeout, self.retries = base_url.rstrip("/"), timeout, max(0, retries)
+    def __init__(self, base_url: str, *, timeout: float = 30.0, retries: int = 2, auth_token: str | None = None):
+        self.base_url, self.timeout, self.retries, self.auth_token = base_url.rstrip("/"), timeout, max(0, retries), auth_token
 
     def request(self, method: str, path: str, *, body: Mapping[str, Any] | None = None, query: Mapping[str, object] | None = None) -> Any:
         from urllib.parse import urlencode
@@ -27,6 +27,8 @@ class TermyteDBClient:
         data = None if body is None else json.dumps(body).encode()
         request_id = str(uuid4())
         headers = {"accept": "application/json", "x-request-id": request_id}
+        if self.auth_token:
+            headers["authorization"] = f"Bearer {self.auth_token}"
         if data:
             headers["content-type"] = "application/json"
         request = Request(url, data=data, method=method.upper(), headers=headers)

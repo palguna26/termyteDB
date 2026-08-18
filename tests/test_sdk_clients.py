@@ -34,9 +34,10 @@ def test_python_client_sends_request_id_and_retries(monkeypatch):
         return Response({"status": "ok"})
 
     monkeypatch.setattr("termytedb.client.urlopen", open_request)
-    assert TermyteDBClient("http://localhost", retries=1).health() == {"status": "ok"}
+    assert TermyteDBClient("http://localhost", retries=1, auth_token="test-token").health() == {"status": "ok"}
     assert len(calls) == 2
     assert calls[0][0].get_header("X-request-id")
+    assert calls[0][0].get_header("Authorization") == "Bearer test-token"
 
 
 def test_python_client_exposes_structured_errors(monkeypatch):
