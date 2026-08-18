@@ -33,6 +33,8 @@ class Processor:
                 break
             run_id = str(uuid.uuid4())
             started = time.perf_counter()
+            event = None
+            source = ""
             try:
                 event = self.repository.event_for_job(namespace_id, job["id"])
                 if not self.repository.heartbeat_job(namespace_id, job["id"], lease_seconds):
@@ -139,8 +141,33 @@ class Processor:
                 )
             except Exception as exc:
                 safe_error = redact_text(str(exc))
+                error_class = exc.error_class if isinstance(exc, ProviderError) else type(exc).__name__
+                if not self._run_exists(namespace_id, run_id) and event is not None and self.provider is not None:
+                    self.repository.record_run(
+                        namespace_id,
+                        {
+                            "id": run_id,
+                            "namespace_id": namespace_id,
+                            "input_hash": hashlib.sha256(source.encode()).hexdigest(),
+                            "provider_name": self.provider.name,
+                            "model_name": self.provider.model,
+                            "prompt_version": "unknown",
+                            "schema_version": "extraction-v1",
+                            "started_at": self._now(),
+                            "completed_at": None,
+                            "input_events_json": json.dumps([str(event["id"])]),
+                            "input_characters": len(source),
+                            "input_tokens": None,
+                            "output_tokens": None,
+                            "latency_ms": int((time.perf_counter() - started) * 1000),
+                            "accepted_count": 0,
+                            "rejected_count": 0,
+                            "status": "processing",
+                            "error_class": None,
+                            "estimated_cost_usd": None,
+                        },
+                    )
                 if self._run_exists(namespace_id, run_id):
-                    error_class = exc.error_class if isinstance(exc, ProviderError) else type(exc).__name__
                     self.repository.finish_run(namespace_id, run_id, accepted, rejected, "failed", error_class)
                 status = self.repository.fail_job(namespace_id, job["id"], safe_error)
                 failed += 1

@@ -5,7 +5,7 @@
 - SQLite WAL lifecycle, transactional migrations, foreign-key checks, restart recovery, leased jobs, heartbeats, retries, dead letters, and crash rollback.
 - Redacted immutable events with namespace-scoped idempotency, `event-v1` identity fields, bounded payloads, and artifact descriptors.
 - Adversarial storage scan confirms a redacted secret is absent from the SQLite database and any WAL/journal files created during ingestion and processing.
-- Deterministic episodes, evidence-span validation, rule extraction, fake provider, generic HTTP provider boundary, append-only versions, corrections, disputes, invalidation, and audit decisions.
+- Deterministic episodes, evidence-span validation, rule extraction, fake provider, generic HTTP provider boundary, failed-provider run audits, append-only versions, corrections, disputes, invalidation, and audit decisions.
 - Provider token counts, latency, and configurable estimated extraction cost are persisted and included in namespace metrics without assuming pricing.
 - Namespace-filtered FTS5 plus injectable embeddings (deterministic local default), explainable hybrid scores, context token budgets, abstention, selection diagnostics, feedback, export/import, deletion, backup, and integrity repair.
 - Versioned HTTP service with request IDs, optional namespace authorization, health/readiness, paginated event and dedicated evidence/memory/job inspection, namespace metrics, and OpenAPI generation with a contract test.
@@ -14,7 +14,7 @@
 
 ## Measured local evidence
 
-- 120 automated tests pass with Ruff and mypy.
+- 121 automated tests pass with Ruff and mypy.
 - Retrieval smoke fixture: Recall@5 `1.0`, MRR `1.0`, NDCG@5 `1.0`.
 - Synthetic continuation fixture: no-memory `0.0`, previous-summary `0.0`, raw history `1.0`, TermyteDB `1.0`.
 - Synthetic LongMemEval-shaped fixture: accuracy `1.0` over 2 items.
