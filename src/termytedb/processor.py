@@ -33,6 +33,7 @@ class Processor:
                 break
             run_id = str(uuid.uuid4())
             started = time.perf_counter()
+            job_accepted = job_rejected = 0
             event = None
             source = ""
             try:
@@ -123,10 +124,12 @@ class Processor:
                             version_id = reconciled_version_id
                         self.repository.record_decision(namespace_id, run_id, candidate, validated.fingerprint, "accepted", None, action, memory_id, version_id)
                         accepted += 1
+                        job_accepted += 1
                     except CandidateRejected as exc:
                         rejected += 1
+                        job_rejected += 1
                         self.repository.record_decision(namespace_id, run_id, candidate, self._safe_fingerprint(candidate), "rejected", exc.reason, "REJECT")
-                self.repository.finish_run(namespace_id, run_id, accepted, rejected, "completed")
+                self.repository.finish_run(namespace_id, run_id, job_accepted, job_rejected, "completed")
                 self.repository.complete_job(namespace_id, job["id"])
                 processed += 1
                 log(
@@ -136,8 +139,8 @@ class Processor:
                     namespace_id=namespace_id,
                     job_id=job["id"],
                     candidates=len(response.candidates),
-                    accepted=accepted,
-                    rejected=rejected,
+                    accepted=job_accepted,
+                    rejected=job_rejected,
                 )
             except Exception as exc:
                 safe_error = redact_text(str(exc))
@@ -168,7 +171,7 @@ class Processor:
                         },
                     )
                 if self._run_exists(namespace_id, run_id):
-                    self.repository.finish_run(namespace_id, run_id, accepted, rejected, "failed", error_class)
+                    self.repository.finish_run(namespace_id, run_id, job_accepted, job_rejected, "failed", error_class)
                 status = self.repository.fail_job(namespace_id, job["id"], safe_error)
                 failed += 1
                 dead += status == "dead"

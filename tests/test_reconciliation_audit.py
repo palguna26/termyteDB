@@ -5,6 +5,8 @@ def test_rule_mode_records_reinforce_for_duplicate_evidence(db):
     assert db.process("audit-actions").accepted == 2
     actions = [row[0] for row in db.database.execute("SELECT action FROM extraction_decisions ORDER BY rowid").fetchall()]
     assert actions == ["INSERT", "REINFORCE"]
+    counts = [tuple(row) for row in db.database.execute("SELECT accepted_count, rejected_count FROM extraction_runs ORDER BY rowid").fetchall()]
+    assert counts == [(1, 0), (1, 0)]
 
 
 def test_model_reconciliation_records_dispute_and_ignore(tmp_path):
