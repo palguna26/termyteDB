@@ -83,13 +83,16 @@ class TermyteDBClient:
         return self.request("GET", "/v1/jobs", query={"namespace_id": namespace_id, "limit": limit, "offset": offset})
 
     def memory(self, namespace_id: str, memory_id: str) -> Any:
-        return self.request("GET", f"/v1/memories/{memory_id}", query={"namespace_id": namespace_id})
+        from urllib.parse import quote
+        return self.request("GET", f"/v1/memories/{quote(memory_id, safe='')}", query={"namespace_id": namespace_id})
 
     def history(self, namespace_id: str, memory_id: str) -> Any:
-        return self.request("GET", f"/v1/memories/{memory_id}/history", query={"namespace_id": namespace_id})
+        from urllib.parse import quote
+        return self.request("GET", f"/v1/memories/{quote(memory_id, safe='')}/history", query={"namespace_id": namespace_id})
 
     def invalidate(self, namespace_id: str, memory_id: str, reason: str) -> Any:
-        return self.request("POST", f"/v1/memories/{memory_id}/invalidate", query={"namespace_id": namespace_id, "reason": reason})
+        from urllib.parse import quote
+        return self.request("POST", f"/v1/memories/{quote(memory_id, safe='')}/invalidate", query={"namespace_id": namespace_id, "reason": reason})
 
     def feedback(self, feedback: Mapping[str, Any]) -> Any:
         return self.request("POST", "/v1/feedback", body=feedback)
@@ -98,7 +101,8 @@ class TermyteDBClient:
         return self.request("GET", "/v1/export", query={"namespace_id": namespace_id})
 
     def delete_namespace(self, namespace_id: str) -> Any:
-        return self.request("DELETE", f"/v1/namespaces/{namespace_id}")
+        from urllib.parse import quote
+        return self.request("DELETE", f"/v1/namespaces/{quote(namespace_id, safe='')}")
 
     def metrics(self, namespace_id: str) -> Any:
         return self.request("GET", "/v1/metrics", query={"namespace_id": namespace_id})

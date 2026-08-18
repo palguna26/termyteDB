@@ -52,3 +52,15 @@ def test_python_client_exposes_structured_errors(monkeypatch):
         TermyteDBClient("http://localhost", retries=0).health()
     assert error.value.status == 422
     assert error.value.request_id == "request-1"
+
+
+def test_python_client_quotes_path_identifiers(monkeypatch):
+    captured = []
+
+    def open_request(request, timeout):
+        captured.append(request.full_url)
+        return Response({"ok": True})
+
+    monkeypatch.setattr("termytedb.client.urlopen", open_request)
+    TermyteDBClient("http://localhost").memory("scope", "memory/with space")
+    assert "/v1/memories/memory%2Fwith%20space?namespace_id=scope" in captured[0]
