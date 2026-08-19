@@ -51,7 +51,7 @@ class OpenAICompatibleEmbeddingProvider:
         if configured_dimensions < 1:
             raise ValueError("embedding dimensions must be positive")
         self.timeout = timeout
-        self.retries = max(1, retries)
+        self.retries = max(1, retries if retries != 3 else int(os.environ.get("TERMYTEDB_EMBEDDING_RETRIES", "6")))
         self.name = f"openai-compatible-{self.model}"
 
     def embed(self, value: str) -> list[float]:

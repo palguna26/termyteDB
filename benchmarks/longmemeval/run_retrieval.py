@@ -97,7 +97,8 @@ def main() -> int:
     parser.add_argument("--mode", choices=("dense", "fts"), default="dense")
     parser.add_argument("--provider", choices=("local", "openrouter"), default="local")
     args = parser.parse_args()
-    result = run(args.dataset, args.top_k, args.database, args.batch_size, args.mode, args.provider)
+    database = args.database or (Path("benchmarks/longmemeval") / f"{args.provider}.sqlite")
+    result = run(args.dataset, args.top_k, database, args.batch_size, args.mode, args.provider)
     rendered = json.dumps(result, indent=2, ensure_ascii=False)
     print(rendered)
     if args.output:

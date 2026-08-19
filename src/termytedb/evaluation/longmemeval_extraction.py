@@ -60,7 +60,12 @@ def insert_atoms(db: Database, atoms: list[L1Atom], *, created_at: str | None = 
 
 def index_atom_embeddings(db: Database, provider: Any, *, batch_size: int = 64) -> int:
     """Index current atoms with an injectable dense provider."""
-    rows = db.execute("SELECT atom_id, fact FROM atoms ORDER BY rowid").fetchall()
+    rows = db.execute(
+        """SELECT a.atom_id, a.fact FROM atoms a
+           LEFT JOIN atom_embeddings e ON e.atom_id=a.atom_id AND e.provider=?
+           WHERE e.atom_id IS NULL ORDER BY a.rowid""",
+        (provider.name,),
+    ).fetchall()
     count = 0
     for start in range(0, len(rows), batch_size):
         batch = rows[start : start + batch_size]
