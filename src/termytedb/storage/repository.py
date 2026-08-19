@@ -12,7 +12,7 @@ from ..core.errors import IdempotencyConflict
 from ..core.redaction import redact_text
 from ..memory.extraction import ValidatedCandidate
 from ..memory.extractor import Candidate
-from ..retrieval.embedding import EmbeddingProvider, LocalHashEmbedding, cosine
+from ..retrieval.embedding import EmbeddingProvider, FastEmbedProvider, cosine
 from .db import Database
 
 
@@ -65,7 +65,7 @@ def canonical_event_content(event: EventInput, redacted_payload: dict[str, Any])
 class Repository:
     def __init__(self, database: Database, embedding: EmbeddingProvider | None = None):
         self.db = database
-        self.embedding = embedding or LocalHashEmbedding()
+        self.embedding = embedding or FastEmbedProvider()
 
     def ensure_namespace(self, namespace_id: str, org_id: str = "default") -> None:
         with self.db.lock, self.db.connection:
@@ -398,7 +398,7 @@ class Repository:
             if row["status"] == "cancelled":
                 return "cancelled"
             status = "dead" if not retryable or row["attempts"] >= row["max_attempts"] else "failed"
-            delay = min(300, 2 ** max(0, int(row["attempts"]) - 1))
+            delay = min(300, 2 ** max(1, int(row["attempts"])))
             self.db.execute(
                 "UPDATE processing_jobs SET status=?, lease_until=NULL, next_attempt_at=?, last_error=?, updated_at=? WHERE id=? AND namespace_id=?",
                 (status, None, error, iso(), job_id, namespace_id),
@@ -493,7 +493,8 @@ class Repository:
                     "DELETE FROM memory_fts WHERE memory_version_id=? AND namespace_id=?",
                     (current["id"], namespace_id),
                 )
-                self.db.execute("DELETE FROM memory_embeddings WHERE memory_version_id=? AND namespace_id=?", (current["id"], namespace_id))
+                # Keep historical embeddings so explicit historical retrieval
+                # remains dense-searchable after supersession.
             version_id = str(uuid.uuid4())
             self.db.execute(
                 """INSERT INTO memory_versions
@@ -721,6 +722,11 @@ class Repository:
                 )
             elif status == "contradicted":
                 self.db.execute("UPDATE memories SET status='disputed' WHERE id=? AND namespace_id=?", (memory_id, namespace_id))
+            self.db.execute(
+                "INSERT INTO memory_embeddings(memory_version_id, namespace_id, provider, dimensions, vector_json) VALUES (?, ?, ?, ?, ?)",
+                (version_id, namespace_id, self.embedding.name, self.embedding.dimensions,
+                 json.dumps(self.embedding.embed(item.statement), separators=(",", ":"))),
+            )
             return memory_id, action, version_id
 
     def get_memory(self, namespace_id: str, memory_id: str) -> MemoryResponse | None:
@@ -791,7 +797,11 @@ class Repository:
             (namespace_id, historical),
         ).fetchall()
         vector = {row["memory_version_id"]: cosine(query_vector, json.loads(row["vector_json"])) for row in vector_rows}
-        vector_candidates = {memory_id for memory_id, score in vector.items() if score >= 0.75}
+        vector_candidates = {
+            memory_id
+            for memory_id, score in vector.items()
+            if score >= 0.6 and (memory_id in lexical or score >= 0.7)
+        }
         # Embeddings are required for retrieval. FTS5 remains a useful lexical
         # signal, but must not make a memory searchable when dense retrieval
         # did not select it. This prevents the system from silently reverting

@@ -21,11 +21,10 @@ The authoritative record is immutable evidence plus memory versions and evidence
 - Engine: domain models, transactions, processors, retrieval, lifecycle, providers.
 - HTTP service: authentication, request validation, serialization, health, limits.
 - Storage providers: SQLite now; PostgreSQL later; no provider leaks into domain code.
-- Model providers: extraction and optional embeddings only.
+- Model providers: extraction and required embeddings.
 - CLI/SDK/adapters: event mapping and client ergonomics, in separate repositories/packages.
 - Benchmark harness: feeds the same public ingest/process/search/context API.
 
 ## V1 scope
 
 Evidence events, artifacts, episodes, typed memories, versions, evidence links, namespaces, lexical retrieval, optional vector retrieval, temporal validity, contradiction/supersession, feedback, jobs, diagnostics, deletion, and local service. Exclude graph databases, autonomous agents, provider-specific adapters, hosted billing, and multi-region replication.
-

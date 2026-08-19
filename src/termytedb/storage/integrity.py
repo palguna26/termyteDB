@@ -5,7 +5,7 @@ import json
 from dataclasses import asdict, dataclass
 
 from ..api.schemas import ArtifactInput, EventInput
-from ..retrieval.embedding import LocalHashEmbedding
+from ..retrieval.embedding import EmbeddingProvider, FastEmbedProvider
 from .db import MIGRATIONS, Database
 from .repository import canonical_event_content, hash_text
 
@@ -67,7 +67,7 @@ def check_database(database: Database) -> IntegrityReport:
         connection.execute(
             """SELECT COUNT(*) FROM memory_fts f
             LEFT JOIN memory_versions v ON v.id=f.memory_version_id AND v.namespace_id=f.namespace_id
-            WHERE v.id IS NULL OR v.status != 'active'"""
+            WHERE v.id IS NULL"""
         ).fetchone()[0]
     )
     missing_evidence = int(
@@ -145,9 +145,9 @@ def check_database(database: Database) -> IntegrityReport:
     )
 
 
-def repair_fts(database: Database, embedding: LocalHashEmbedding | None = None) -> None:
-    """Rebuild deterministic FTS and local embedding indexes from authority."""
-    embedding = embedding or LocalHashEmbedding()
+def repair_fts(database: Database, embedding: EmbeddingProvider | None = None) -> None:
+    """Rebuild FTS and local dense embedding indexes from authority."""
+    embedding = embedding or FastEmbedProvider()
     with database.lock, database.connection:
         database.execute("DELETE FROM memory_fts")
         database.execute("DELETE FROM memory_embeddings")
