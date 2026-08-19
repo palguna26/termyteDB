@@ -60,13 +60,14 @@ def search_atoms(db: Database, query: str, limit: int = 20,
     return rrf_merge([lexical, semantic])[:limit]
 
 
-def dense_search_atoms(db: Database, query: str, limit: int = 20) -> list[AtomHit]:
-    available = db.execute("SELECT 1 FROM atom_embeddings WHERE provider=? LIMIT 1", ("fastembed-bge-small-en-v1.5",)).fetchone()
+def dense_search_atoms(db: Database, query: str, limit: int = 20, provider: EmbeddingProvider | None = None) -> list[AtomHit]:
+    if provider is None:
+        try:
+            provider = _cached_fastembed_provider()
+        except ImportError:
+            return []
+    available = db.execute("SELECT 1 FROM atom_embeddings WHERE provider=? LIMIT 1", (provider.name,)).fetchone()
     if available is None:
-        return []
-    try:
-        provider = _cached_fastembed_provider()
-    except ImportError:
         return []
     query_vector = provider.embed(query)
     rows = db.execute(
