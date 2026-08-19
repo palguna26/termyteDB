@@ -15,11 +15,42 @@ class Candidate:
 
 
 def payload_text(payload: dict[str, Any]) -> str:
+    """Project an event payload into stable extraction text.
+
+    Agent hooks often wrap the real request in volatile harness context. Keep
+    the stored redacted payload unchanged, but prefer explicit user/assistant
+    fields and remove known wrapper blocks before extraction. The processor and
+    rule extractor both use this function, so evidence offsets remain aligned
+    with the text supplied to the extraction contract.
+    """
     parts: list[str] = []
+
+    def clean(value: str) -> str:
+        cleaned = value
+        for tag in ("additional_data", "system_reminder", "environment_context"):
+            cleaned = re.sub(rf"<{tag}>.*?</{tag}>", "", cleaned, flags=re.IGNORECASE | re.DOTALL)
+        return cleaned.strip()
+
+    def visit_message(value: Any) -> None:
+        if not isinstance(value, dict):
+            visit(value)
+            return
+        role = value.get("role")
+        if isinstance(role, str) and role.casefold() == "system":
+            return
+        content = value.get("content", value.get("text"))
+        if isinstance(content, str):
+            text = clean(content)
+            if text:
+                parts.append(text)
+        elif content is not None:
+            visit(content)
 
     def visit(value: Any) -> None:
         if isinstance(value, str):
-            parts.append(value)
+            text = clean(value)
+            if text:
+                parts.append(text)
         elif isinstance(value, dict):
             for item in value.values():
                 visit(item)
@@ -27,7 +58,19 @@ def payload_text(payload: dict[str, Any]) -> str:
             for item in value:
                 visit(item)
 
-    visit(payload)
+    explicit = False
+    for key in ("user_query", "user_message", "query"):
+        value = payload.get(key)
+        if isinstance(value, str) and clean(value):
+            parts.append(clean(value))
+            explicit = True
+    messages = payload.get("messages")
+    if isinstance(messages, list):
+        for message in messages:
+            visit_message(message)
+        explicit = explicit or bool(parts)
+    if not explicit:
+        visit(payload)
     return "\n".join(parts)
 
 
