@@ -4,6 +4,7 @@ import array
 import re
 from collections.abc import Callable
 from dataclasses import dataclass
+from functools import lru_cache
 
 from ..storage.db import Database
 from .embedding import FastEmbedProvider, cosine
@@ -64,7 +65,7 @@ def dense_search_atoms(db: Database, query: str, limit: int = 20) -> list[AtomHi
     if available is None:
         return []
     try:
-        provider = FastEmbedProvider()
+        provider = _cached_fastembed_provider()
     except ImportError:
         return []
     query_vector = provider.embed(query)
@@ -78,6 +79,12 @@ def dense_search_atoms(db: Database, query: str, limit: int = 20) -> list[AtomHi
         vector = list(array.array("f", row["vector"]))
         hits.append(AtomHit(row["atom_id"], row["session_id"], row["fact"], row["timestamp"], row["source_role"], cosine(query_vector, vector)))
     return sorted(hits, key=lambda item: (-item.score, item.atom_id))[:limit]
+
+
+@lru_cache(maxsize=1)
+def _cached_fastembed_provider() -> FastEmbedProvider:
+    """Reuse the local model across queries instead of reloading it per search."""
+    return FastEmbedProvider()
 
 
 def rerank_and_filter(query: str, hits: list[AtomHit], threshold: float = 0.25) -> list[AtomHit] | None:
