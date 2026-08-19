@@ -871,6 +871,61 @@ class Repository:
     def memory_count(self, namespace_id: str) -> int:
         return int(self.db.execute("SELECT COUNT(*) FROM memories WHERE namespace_id=?", (namespace_id,)).fetchone()[0])
 
+    def upsert_entity(self, namespace_id: str, canonical_key: str, label: str, entity_type: str = "unknown", confidence: float = 1.0) -> str:
+        entity_id = str(uuid.uuid4())
+        with self.db.lock, self.db.connection:
+            self.db.execute(
+                "INSERT INTO entities(id, namespace_id, canonical_key, label, entity_type, confidence, created_at) VALUES (?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(namespace_id, canonical_key) DO UPDATE SET label=excluded.label, entity_type=excluded.entity_type, confidence=excluded.confidence",
+                (entity_id, namespace_id, canonical_key, label, entity_type, confidence, iso()),
+            )
+            row = self.db.execute("SELECT id FROM entities WHERE namespace_id=? AND canonical_key=?", (namespace_id, canonical_key)).fetchone()
+            return str(row["id"])
+
+    def add_entity_alias(self, namespace_id: str, entity_id: str, alias: str) -> bool:
+        with self.db.lock, self.db.connection:
+            cursor = self.db.execute("INSERT OR IGNORE INTO entity_aliases(entity_id, namespace_id, alias) VALUES (?, ?, ?)", (entity_id, namespace_id, alias))
+            return cursor.rowcount > 0
+
+    def add_relationship(self, namespace_id: str, subject_entity_id: str, predicate: str, object_entity_id: str, memory_version_id: str | None = None, valid_from: str | None = None, valid_until: str | None = None, confidence: float = 1.0) -> str:
+        relationship_id = str(uuid.uuid4())
+        with self.db.lock, self.db.connection:
+            self.db.execute(
+                "INSERT INTO relationships(id, namespace_id, subject_entity_id, predicate, object_entity_id, memory_version_id, valid_from, valid_until, confidence, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (relationship_id, namespace_id, subject_entity_id, predicate, object_entity_id, memory_version_id, valid_from or iso(), valid_until, confidence, iso()),
+            )
+        return relationship_id
+
+    def related_entities(self, namespace_id: str, entity_id: str, depth: int = 1) -> list[dict[str, Any]]:
+        depth = max(1, min(depth, 2))
+        seen = {entity_id}
+        frontier = [entity_id]
+        result: list[dict[str, Any]] = []
+        relationship_ids: set[str] = set()
+        for distance in range(1, depth + 1):
+            if not frontier:
+                break
+            placeholders = ",".join("?" for _ in frontier)
+            rows = self.db.execute(
+                f"""SELECT r.*, s.label AS subject_label, o.label AS object_label
+                    FROM relationships r JOIN entities s ON s.id=r.subject_entity_id JOIN entities o ON o.id=r.object_entity_id
+                    WHERE r.namespace_id=? AND r.status='active' AND (r.subject_entity_id IN ({placeholders}) OR r.object_entity_id IN ({placeholders}))""",
+                (namespace_id, *frontier, *frontier),
+            ).fetchall()
+            frontier = []
+            for row in rows:
+                if row["id"] in relationship_ids:
+                    continue
+                relationship_ids.add(row["id"])
+                item = dict(row)
+                item["distance"] = distance
+                result.append(item)
+                other = row["object_entity_id"] if row["subject_entity_id"] in seen else row["subject_entity_id"]
+                if other not in seen:
+                    seen.add(other)
+                    frontier.append(other)
+        return result
+
     def list_versions(self, namespace_id: str, memory_id: str) -> list[sqlite3.Row]:
         return self.db.execute(
             """SELECT * FROM memory_versions

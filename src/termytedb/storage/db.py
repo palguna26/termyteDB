@@ -298,6 +298,51 @@ MIGRATIONS: tuple[str, ...] = (
       VALUES (new.rowid, new.fact, coalesce(new.timestamp, ''), new.atom_id);
     END;
     """,
+    """
+    CREATE TABLE entities (
+      id TEXT PRIMARY KEY,
+      namespace_id TEXT NOT NULL REFERENCES namespaces(id),
+      canonical_key TEXT NOT NULL,
+      label TEXT NOT NULL,
+      entity_type TEXT NOT NULL DEFAULT 'unknown',
+      confidence REAL NOT NULL DEFAULT 1.0,
+      created_at TEXT NOT NULL,
+      UNIQUE(namespace_id, canonical_key)
+    );
+    CREATE INDEX entities_namespace_label_idx ON entities(namespace_id, label);
+    CREATE TABLE entity_aliases (
+      entity_id TEXT NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
+      namespace_id TEXT NOT NULL REFERENCES namespaces(id),
+      alias TEXT NOT NULL,
+      PRIMARY KEY(entity_id, alias)
+    );
+    CREATE INDEX entity_aliases_lookup_idx ON entity_aliases(namespace_id, alias);
+    CREATE TABLE relationships (
+      id TEXT PRIMARY KEY,
+      namespace_id TEXT NOT NULL REFERENCES namespaces(id),
+      subject_entity_id TEXT NOT NULL REFERENCES entities(id),
+      predicate TEXT NOT NULL,
+      object_entity_id TEXT NOT NULL REFERENCES entities(id),
+      memory_version_id TEXT REFERENCES memory_versions(id),
+      status TEXT NOT NULL DEFAULT 'active',
+      valid_from TEXT NOT NULL,
+      valid_until TEXT,
+      confidence REAL NOT NULL DEFAULT 1.0,
+      created_at TEXT NOT NULL,
+      UNIQUE(namespace_id, subject_entity_id, predicate, object_entity_id, memory_version_id)
+    );
+    CREATE INDEX relationships_subject_idx ON relationships(namespace_id, subject_entity_id, status);
+    CREATE INDEX relationships_object_idx ON relationships(namespace_id, object_entity_id, status);
+    CREATE TRIGGER relationships_namespace_guard
+    BEFORE INSERT ON relationships
+    BEGIN
+      SELECT CASE WHEN
+        (SELECT namespace_id FROM entities WHERE id=NEW.subject_entity_id) != NEW.namespace_id OR
+        (SELECT namespace_id FROM entities WHERE id=NEW.object_entity_id) != NEW.namespace_id OR
+        (NEW.memory_version_id IS NOT NULL AND (SELECT namespace_id FROM memory_versions WHERE id=NEW.memory_version_id) != NEW.namespace_id)
+        THEN RAISE(ABORT, 'relationship namespace mismatch') END;
+    END;
+    """,
 )
 
 
