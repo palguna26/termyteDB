@@ -296,6 +296,25 @@ class Repository:
         ).fetchall()
         return [dict(row) for row in rows]
 
+    def related_memory_context(self, namespace_id: str, query: str, limit: int = 20) -> list[dict[str, Any]]:
+        """Return bounded current memory context for extraction reconciliation.
+
+        This deliberately reuses the normal namespace-safe search path. The result is
+        comparison context for the provider; evidence for new claims must still come
+        from the current input events.
+        """
+        results = self.search(namespace_id, query, max(1, min(limit, 20)), historical=False)
+        return [
+            {
+                "memory_id": str(item.memory_id),
+                "memory_version_id": str(item.memory_version_id),
+                "kind": item.kind,
+                "statement": item.statement,
+                "status": item.status,
+            }
+            for item in results
+        ]
+
     def record_context_request(self, namespace_id: str, query: str, token_budget: int, response: Any) -> str:
         request_id = str(uuid.uuid4())
         with self.db.lock, self.db.connection:
@@ -773,7 +792,11 @@ class Repository:
         ).fetchall()
         vector = {row["memory_version_id"]: cosine(query_vector, json.loads(row["vector_json"])) for row in vector_rows}
         vector_candidates = {memory_id for memory_id, score in vector.items() if score >= 0.75}
-        candidate_ids = set(lexical) | vector_candidates
+        # Embeddings are required for retrieval. FTS5 remains a useful lexical
+        # signal, but must not make a memory searchable when dense retrieval
+        # did not select it. This prevents the system from silently reverting
+        # to lexical-only behavior when the embedding index is incomplete.
+        candidate_ids = vector_candidates
         if not candidate_ids:
             return []
         placeholders = ",".join("?" for _ in candidate_ids)

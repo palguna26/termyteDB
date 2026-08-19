@@ -51,7 +51,13 @@ class Processor:
                     provider_latency = 0
                     rule_mode = True
                 else:
-                    request = ExtractionRequest(namespace_id=namespace_id, events=[event_id], evidence_text=included)
+                    existing_memories = self.repository.related_memory_context(namespace_id, source)
+                    request = ExtractionRequest(
+                        namespace_id=namespace_id,
+                        events=[event_id],
+                        evidence_text=included,
+                        existing_memories=existing_memories,
+                    )
                     remaining = max(0.001, deadline - time.perf_counter())
                     provider_result = self.provider.extract(
                         request,

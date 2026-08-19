@@ -95,6 +95,7 @@ class ExtractionRequest(BaseModel):
     namespace_id: str = Field(min_length=1)
     events: list[UUID] = Field(min_length=1, max_length=20)
     evidence_text: dict[UUID, str]
+    existing_memories: list[dict[str, Any]] = Field(default_factory=list, max_length=20)
 
 
 class ExtractionResult(BaseModel):

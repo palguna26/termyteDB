@@ -15,3 +15,10 @@ def test_vector_candidates_remain_namespace_scoped(db):
     left = db.search("left", "SQLite")
     assert len(left) == 1
     assert left[0].citations[0].event_id != db.search("right", "SQLite")[0].citations[0].event_id
+
+
+def test_lexical_match_without_embedding_candidate_is_not_returned(db):
+    db.ingest({"namespace_id": "dense-required", "idempotency_key": "one", "type": "decision", "payload": {"text": "Decision: use SQLite."}})
+    db.process("dense-required")
+    db.database.execute("UPDATE memory_embeddings SET vector_json=? WHERE namespace_id=?", ("[0.0, 0.0, 0.0, 0.0]", "dense-required"))
+    assert db.search("dense-required", "SQLite") == []
