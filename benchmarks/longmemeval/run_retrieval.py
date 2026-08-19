@@ -40,7 +40,9 @@ def run(path: Path, top_k: int, database_path: Path | None = None, batch_size: i
             for session_index, session in enumerate(question.get("haystack_sessions", [])):
                 session_id = str(session_ids[session_index])
                 timestamp = str(dates[session_index]) if session_index < len(dates) else None
-                content = "\n".join(str(turn.get("content", "")) for turn in session if isinstance(turn, dict) and turn.get("content"))[:1200]
+                # Keep the compact session representation below the 512-token
+                # limit of the free Liquid embedding route.
+                content = "\n".join(str(turn.get("content", "")) for turn in session if isinstance(turn, dict) and turn.get("content"))[:500]
                 if content:
                     atoms.append(L1Atom(f"{question_id}:{session_id}", session_id, content, timestamp, "user"))
         inserted = insert_atoms(db, atoms)
