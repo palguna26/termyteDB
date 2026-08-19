@@ -13,3 +13,5 @@ research/
 *.egg-info/
 benchmarks/longmemeval/*.json
 benchmarks/longmemeval/*.sqlite*
+benchmarks/longmemeval/*.log
+benchmarks/longmemeval/*.err
