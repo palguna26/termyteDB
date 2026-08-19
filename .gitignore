@@ -8,4 +8,5 @@ __pycache__/
 *.pyc
 .env
 .codex/
-.research/s
+
+research/
