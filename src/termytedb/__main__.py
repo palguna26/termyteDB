@@ -5,6 +5,7 @@ import uvicorn
 
 from .api.service import create_app
 from .memory.provider import HttpExtractionProvider
+from .retrieval.embedding import OpenAICompatibleEmbeddingProvider
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -14,11 +15,17 @@ if __name__ == "__main__":
     parser.add_argument("--rate-limit-per-minute", type=int, default=None)
     parser.add_argument("--extraction-url", default=None)
     parser.add_argument("--extraction-model", default=None)
+    parser.add_argument("--embedding-provider", choices=("local", "openrouter"), default=None)
+    parser.add_argument("--embedding-model", default=None)
+    parser.add_argument("--embedding-dimensions", type=int, default=None)
     args = parser.parse_args()
     endpoint = args.extraction_url or os.environ.get("TERMYTEDB_EXTRACTION_URL")
     provider = HttpExtractionProvider(endpoint, args.extraction_model) if endpoint else None
+    embedding = None
+    if (args.embedding_provider or os.environ.get("TERMYTEDB_EMBEDDING_PROVIDER", "local")) == "openrouter":
+        embedding = OpenAICompatibleEmbeddingProvider(args.embedding_model, dimensions=args.embedding_dimensions)
     uvicorn.run(
-        create_app(args.database, extraction_provider=provider, rate_limit_per_minute=args.rate_limit_per_minute),
+        create_app(args.database, extraction_provider=provider, embedding_provider=embedding, rate_limit_per_minute=args.rate_limit_per_minute),
         host=args.host,
         port=args.port,
     )

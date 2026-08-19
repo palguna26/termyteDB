@@ -64,11 +64,13 @@ def index_atom_embeddings(db: Database, provider: Any, *, batch_size: int = 64) 
     count = 0
     for start in range(0, len(rows), batch_size):
         batch = rows[start : start + batch_size]
-        vectors = (
-            list(provider.model.embed([str(row["fact"]) for row in batch], batch_size=batch_size))
-            if hasattr(provider, "model")
-            else [provider.embed(str(row["fact"])) for row in batch]
-        )
+        values = [str(row["fact"]) for row in batch]
+        if hasattr(provider, "model"):
+            vectors = list(provider.model.embed(values, batch_size=batch_size))
+        elif hasattr(provider, "embed_many"):
+            vectors = provider.embed_many(values)
+        else:
+            vectors = [provider.embed(value) for value in values]
         with db.connection:
             for row, vector in zip(batch, vectors, strict=True):
                 values = [float(item) for item in vector]
