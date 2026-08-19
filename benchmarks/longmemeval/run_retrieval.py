@@ -21,7 +21,7 @@ def reciprocal_rank(retrieved: list[str], expected: set[str]) -> float:
     return 0.0
 
 
-def run(path: Path, top_k: int, database_path: Path | None = None, batch_size: int = 16, mode: str = "dense") -> dict[str, object]:
+def run(path: Path, top_k: int, database_path: Path | None = None, batch_size: int = 64, mode: str = "dense") -> dict[str, object]:
     questions = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(questions, list) or len(questions) != 500:
         raise ValueError("expected the official 500-question LongMemEval-S cleaned dataset")
@@ -40,7 +40,7 @@ def run(path: Path, top_k: int, database_path: Path | None = None, batch_size: i
             for session_index, session in enumerate(question.get("haystack_sessions", [])):
                 session_id = str(session_ids[session_index])
                 timestamp = str(dates[session_index]) if session_index < len(dates) else None
-                content = "\n".join(str(turn.get("content", "")) for turn in session if isinstance(turn, dict) and turn.get("content"))[:4000]
+                content = "\n".join(str(turn.get("content", "")) for turn in session if isinstance(turn, dict) and turn.get("content"))[:1200]
                 if content:
                     atoms.append(L1Atom(f"{question_id}:{session_id}", session_id, content, timestamp, "user"))
         inserted = insert_atoms(db, atoms)
@@ -91,7 +91,7 @@ def main() -> int:
     parser.add_argument("--top-k", type=int, default=5)
     parser.add_argument("--output", type=Path)
     parser.add_argument("--database", type=Path)
-    parser.add_argument("--batch-size", type=int, default=4)
+    parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--mode", choices=("dense", "fts"), default="dense")
     args = parser.parse_args()
     result = run(args.dataset, args.top_k, args.database, args.batch_size, args.mode)
