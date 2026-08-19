@@ -78,6 +78,12 @@ class TermyteDB:
     def invalidate(self, namespace_id: str, memory_id: str, reason: str) -> bool:
         return self.repository.invalidate_memory(namespace_id, memory_id, reason)
 
+    def forget(self, namespace_id: str, memory_id: str, reason: str) -> bool:
+        return self.repository.forget_memory(namespace_id, memory_id, reason)
+
+    def restore(self, namespace_id: str, memory_id: str) -> bool:
+        return self.repository.restore_memory(namespace_id, memory_id)
+
     def export_namespace(self, namespace_id: str) -> dict[str, Any]:
         return self.repository.export_namespace(namespace_id)
 

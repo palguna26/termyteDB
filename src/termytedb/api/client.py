@@ -94,6 +94,14 @@ class TermyteDBClient:
         from urllib.parse import quote
         return self.request("POST", f"/v1/memories/{quote(memory_id, safe='')}/invalidate", query={"namespace_id": namespace_id, "reason": reason})
 
+    def forget(self, namespace_id: str, memory_id: str, reason: str) -> Any:
+        from urllib.parse import quote
+        return self.request("POST", f"/v1/memories/{quote(memory_id, safe='')}/forget", query={"namespace_id": namespace_id, "reason": reason})
+
+    def restore(self, namespace_id: str, memory_id: str) -> Any:
+        from urllib.parse import quote
+        return self.request("POST", f"/v1/memories/{quote(memory_id, safe='')}/restore", query={"namespace_id": namespace_id})
+
     def feedback(self, feedback: Mapping[str, Any]) -> Any:
         return self.request("POST", "/v1/feedback", body=feedback)
 

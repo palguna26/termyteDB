@@ -69,6 +69,18 @@ def test_historical_search_can_request_superseded_truth(db):
     assert historical[0].status == "superseded"
 
 
+def test_forget_tombstones_memory_and_restore_reindexes_it(db):
+    db.ingest(event("n1", "forget", "Decision: storage uses SQLite."))
+    db.process("n1")
+    result = db.search("n1", "SQLite")[0]
+    memory_id = str(result.memory_id)
+    assert db.forget("n1", memory_id, "user requested forgetting") is True
+    assert db.search("n1", "SQLite") == []
+    assert db.repository.history("n1", memory_id)[0]["status"] == "deleted"
+    assert db.restore("n1", memory_id) is True
+    assert db.search("n1", "SQLite")
+
+
 def test_integrity_detects_tampered_event_payload(db):
     receipt = db.ingest(event("n1", "tamper", "Decision: storage uses SQLite."))
     with db.database.connection:

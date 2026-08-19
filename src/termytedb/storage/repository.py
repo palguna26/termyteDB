@@ -900,6 +900,45 @@ class Repository:
             )
             return True
 
+    def forget_memory(self, namespace_id: str, memory_id: str, reason: str) -> bool:
+        """Tombstone a memory while retaining its audit history and evidence."""
+        with self.db.lock, self.db.connection:
+            row = self.db.execute(
+                "SELECT current_version_id FROM memories WHERE id=? AND namespace_id=?",
+                (memory_id, namespace_id),
+            ).fetchone()
+            if not row:
+                return False
+            self.db.execute("UPDATE memories SET status='deleted' WHERE id=? AND namespace_id=?", (memory_id, namespace_id))
+            self.db.execute(
+                "UPDATE memory_versions SET status='deleted', reason=? WHERE memory_id=? AND namespace_id=? AND status NOT IN ('deleted', 'invalidated')",
+                (reason, memory_id, namespace_id),
+            )
+            self.db.execute("DELETE FROM memory_fts WHERE namespace_id=? AND memory_version_id=?", (namespace_id, row["current_version_id"]))
+            return True
+
+    def restore_memory(self, namespace_id: str, memory_id: str) -> bool:
+        """Restore the newest version that was not explicitly invalidated."""
+        with self.db.lock, self.db.connection:
+            memory = self.db.execute("SELECT id FROM memories WHERE id=? AND namespace_id=?", (memory_id, namespace_id)).fetchone()
+            version = self.db.execute(
+                "SELECT * FROM memory_versions WHERE memory_id=? AND namespace_id=? AND status != 'invalidated' ORDER BY version DESC LIMIT 1",
+                (memory_id, namespace_id),
+            ).fetchone()
+            if not memory or not version:
+                return False
+            self.db.execute(
+                "UPDATE memory_versions SET status='superseded' WHERE memory_id=? AND namespace_id=? AND id<>? AND status='active'",
+                (memory_id, namespace_id, version["id"]),
+            )
+            self.db.execute("UPDATE memory_versions SET status='active', valid_to=NULL, reason='RESTORE' WHERE id=? AND namespace_id=?", (version["id"], namespace_id))
+            self.db.execute("UPDATE memories SET status='active', current_version_id=? WHERE id=? AND namespace_id=?", (version["id"], memory_id, namespace_id))
+            self.db.execute(
+                "INSERT OR REPLACE INTO memory_fts(memory_version_id, namespace_id, statement, evidence_text) VALUES (?, ?, ?, ?)",
+                (version["id"], namespace_id, version["statement"], version["evidence_excerpt"] or ""),
+            )
+            return True
+
     def history(self, namespace_id: str, memory_id: str) -> list[dict[str, Any]] | None:
         memory = self.db.execute(
             "SELECT id FROM memories WHERE id=? AND namespace_id=?", (memory_id, namespace_id)

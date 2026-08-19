@@ -200,6 +200,18 @@ def create_app(
             raise HTTPException(status_code=404, detail="memory not found")
         return {"invalidated": True}
 
+    @app.post("/v1/memories/{memory_id}/forget")
+    def forget(memory_id: str, namespace_id: str, reason: str = Query(..., min_length=1)) -> dict[str, bool]:
+        if not engine.forget(namespace_id, memory_id, reason):
+            raise HTTPException(status_code=404, detail="memory not found")
+        return {"forgotten": True}
+
+    @app.post("/v1/memories/{memory_id}/restore")
+    def restore(memory_id: str, namespace_id: str) -> dict[str, bool]:
+        if not engine.restore(namespace_id, memory_id):
+            raise HTTPException(status_code=404, detail="restorable memory not found")
+        return {"restored": True}
+
     @app.get("/v1/export")
     def export(namespace_id: str = Query(...)) -> dict[str, object]:
         require_namespace(namespace_id)
