@@ -73,7 +73,7 @@ def run(path: Path, top_k: int, database_path: Path | None = None, process_batch
         with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="termytedb-worker") as executor:
             while True:
                 responses = list(executor.map(
-                    lambda _: db.process("longmemeval-e2e", limit=process_batch, timeout_seconds=120.0),
+                    lambda _: db.process_with_timeout("longmemeval-e2e", limit=process_batch, timeout_seconds=120.0),
                     range(workers),
                 ))
                 processed += sum(response.processed for response in responses)
