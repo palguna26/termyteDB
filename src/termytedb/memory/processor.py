@@ -93,12 +93,23 @@ class Processor:
                     },
                 )
                 fingerprints: set[str] = set()
+                validated_candidates: list[tuple[Any, Any]] = []
                 for candidate in response.candidates:
                     try:
                         validated = validate_candidate(namespace_id, candidate, included)
                         if validated.fingerprint in fingerprints:
                             raise CandidateRejected("duplicate_candidate")
                         fingerprints.add(validated.fingerprint)
+                        validated_candidates.append((candidate, validated))
+                    except CandidateRejected as exc:
+                        rejected += 1
+                        job_rejected += 1
+                        self.repository.record_decision(namespace_id, run_id, candidate, self._safe_fingerprint(candidate), "rejected", exc.reason, "REJECT")
+
+                embedding_values = [validated.candidate.statement for _, validated in validated_candidates]
+                embedding_vectors = self.repository.embed_many(embedding_values) if embedding_values else []
+                for (candidate, validated), embedding in zip(validated_candidates, embedding_vectors, strict=True):
+                    try:
                         memory_id: str | None = None
                         version_id: str | None = None
                         if rule_mode:
@@ -113,7 +124,7 @@ class Processor:
                             rule = RuleCandidate(
                                 validated.candidate.kind, validated.candidate.subject, validated.candidate.statement, span.start_offset, span.end_offset
                             )
-                            memory_id = self.repository.save_candidate(namespace_id, event, rule)
+                            memory_id = self.repository.save_candidate(namespace_id, event, rule, embedding)
                             row = self.repository.db.execute(
                                 "SELECT current_version_id FROM memories WHERE id=? AND namespace_id=?", (memory_id, namespace_id)
                             ).fetchone()
@@ -125,7 +136,9 @@ class Processor:
                             else:
                                 action = "INSERT"
                         else:
-                            reconciled_memory_id, action, reconciled_version_id = self.repository.reconcile_candidate(namespace_id, event, validated, run_id)
+                            reconciled_memory_id, action, reconciled_version_id = self.repository.reconcile_candidate(
+                                namespace_id, event, validated, run_id, embedding
+                            )
                             memory_id = reconciled_memory_id
                             version_id = reconciled_version_id
                         self.repository.record_decision(namespace_id, run_id, candidate, validated.fingerprint, "accepted", None, action, memory_id, version_id)

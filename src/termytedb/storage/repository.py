@@ -67,6 +67,12 @@ class Repository:
         self.db = database
         self.embedding = embedding or FastEmbedProvider()
 
+    def embed_many(self, values: list[str]) -> list[list[float]]:
+        embed_many = getattr(self.embedding, "embed_many", None)
+        if callable(embed_many):
+            return embed_many(values)
+        return [self.embedding.embed(value) for value in values]
+
     def ensure_namespace(self, namespace_id: str, org_id: str = "default") -> None:
         with self.db.lock, self.db.connection:
             self.db.execute(
@@ -429,7 +435,7 @@ class Repository:
             raise KeyError(job_id)
         return cast(sqlite3.Row, row)
 
-    def save_candidate(self, namespace_id: str, event: sqlite3.Row, candidate: Candidate) -> str:
+    def save_candidate(self, namespace_id: str, event: sqlite3.Row, candidate: Candidate, embedding: list[float] | None = None) -> str:
         now = iso()
         with self.db.lock, self.db.connection:
             stored_event = self.db.execute(
@@ -546,7 +552,7 @@ class Repository:
                 "INSERT INTO memory_embeddings(memory_version_id, namespace_id, provider, dimensions, vector_json) VALUES (?, ?, ?, ?, ?)",
                 (
                     version_id, namespace_id, self.embedding.name, self.embedding.dimensions,
-                    json.dumps(self.embedding.embed(candidate.statement), separators=(",", ":")),
+                    json.dumps(embedding if embedding is not None else self.embedding.embed(candidate.statement), separators=(",", ":")),
                 ),
             )
             return memory_id
@@ -619,7 +625,10 @@ class Repository:
                 ),
             )
 
-    def reconcile_candidate(self, namespace_id: str, event: sqlite3.Row, candidate: ValidatedCandidate, run_id: str) -> tuple[str | None, str, str | None]:
+    def reconcile_candidate(
+        self, namespace_id: str, event: sqlite3.Row, candidate: ValidatedCandidate, run_id: str,
+        embedding: list[float] | None = None,
+    ) -> tuple[str | None, str, str | None]:
         """Atomically apply one validated proposal. Returns memory id, action, version id."""
         item = candidate.candidate
         with self.db.lock, self.db.connection:
@@ -725,7 +734,7 @@ class Repository:
             self.db.execute(
                 "INSERT INTO memory_embeddings(memory_version_id, namespace_id, provider, dimensions, vector_json) VALUES (?, ?, ?, ?, ?)",
                 (version_id, namespace_id, self.embedding.name, self.embedding.dimensions,
-                 json.dumps(self.embedding.embed(item.statement), separators=(",", ":"))),
+                json.dumps(embedding if embedding is not None else self.embedding.embed(item.statement), separators=(",", ":"))),
             )
             return memory_id, action, version_id
 
@@ -1061,7 +1070,9 @@ class Repository:
                WHERE v.namespace_id=? AND v.status='active' AND m.status='active' AND v.valid_to IS NULL""",
             (namespace_id,),
         ).fetchall()
-        for row in rows:
+        statements = [str(row["statement"]) for row in rows]
+        vectors = self.embed_many(statements) if statements else []
+        for row, vector in zip(rows, vectors, strict=True):
             self.db.execute(
                 "INSERT INTO memory_fts(memory_version_id, namespace_id, statement, evidence_text) VALUES (?, ?, ?, ?)",
                 (row["id"], namespace_id, row["statement"], row["evidence_excerpt"]),
@@ -1070,7 +1081,7 @@ class Repository:
                 "INSERT INTO memory_embeddings(memory_version_id, namespace_id, provider, dimensions, vector_json) VALUES (?, ?, ?, ?, ?)",
                 (
                     row["id"], namespace_id, self.embedding.name, self.embedding.dimensions,
-                    json.dumps(self.embedding.embed(row["statement"]), separators=(",", ":")),
+                    json.dumps(vector, separators=(",", ":")),
                 ),
             )
 

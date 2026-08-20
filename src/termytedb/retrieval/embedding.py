@@ -3,15 +3,17 @@ from __future__ import annotations
 import json
 import os
 import time
+from typing import Protocol
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
-from typing import Protocol
 
 class EmbeddingProvider(Protocol):
     name: str
     dimensions: int
 
     def embed(self, value: str) -> list[float]: ...
+
+    def embed_many(self, values: list[str]) -> list[list[float]]: ...
 
 
 class FastEmbedProvider:
@@ -20,12 +22,18 @@ class FastEmbedProvider:
     name = "fastembed-bge-small-en-v1.5"
     dimensions = 384
 
-    def __init__(self) -> None:
+    def __init__(self, *, batch_size: int = 256, threads: int | None = None) -> None:
         from fastembed import TextEmbedding
-        self.model = TextEmbedding(model_name="BAAI/bge-small-en-v1.5")
+        self.batch_size = batch_size
+        self.model = TextEmbedding(model_name="BAAI/bge-small-en-v1.5", threads=threads)
 
     def embed(self, value: str) -> list[float]:
-        return [float(item) for item in next(iter(self.model.embed([value])))]
+        return self.embed_many([value])[0]
+
+    def embed_many(self, values: list[str]) -> list[list[float]]:
+        if not values:
+            return []
+        return [[float(item) for item in vector] for vector in self.model.embed(values, batch_size=self.batch_size)]
 
 
 class OpenAICompatibleEmbeddingProvider:
