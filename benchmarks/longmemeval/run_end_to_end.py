@@ -76,19 +76,27 @@ def run(path: Path, top_k: int, database_path: Path | None = None, process_batch
             raise ValueError("workers must be positive")
         log(f"Processing events through extraction, validation, reconciliation, and embedding with {workers} workers")
         processed = 0
-        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="termytedb-worker") as executor:
-            while True:
-                responses = list(executor.map(
-                    lambda _: db.process_with_timeout("longmemeval-e2e", limit=process_batch, timeout_seconds=120.0),
-                    range(workers),
-                ))
-                processed += sum(response.processed for response in responses)
-                accepted = sum(response.accepted for response in responses)
-                rejected = sum(response.rejected for response in responses)
-                pending = int(db.metrics("longmemeval-e2e")["jobs_pending"])
-                log(f"Processed {processed} jobs; accepted={accepted}; rejected={rejected}; pending={pending}")
-                if pending == 0:
-                    break
+        worker_databases = [
+            TermyteDB(database_path, logger=benchmark_logger, embedding_provider=embedding)
+            for _ in range(workers)
+        ]
+        try:
+            with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="termytedb-worker") as executor:
+                while True:
+                    responses = list(executor.map(
+                        lambda worker: worker.process_with_timeout("longmemeval-e2e", limit=process_batch, timeout_seconds=120.0),
+                        worker_databases,
+                    ))
+                    processed += sum(response.processed for response in responses)
+                    accepted = sum(response.accepted for response in responses)
+                    rejected = sum(response.rejected for response in responses)
+                    pending = int(db.metrics("longmemeval-e2e")["jobs_pending"])
+                    log(f"Processed {processed} jobs; accepted={accepted}; rejected={rejected}; pending={pending}")
+                    if pending == 0:
+                        break
+        finally:
+            for worker in worker_databases:
+                worker.close()
 
         rows: list[dict[str, object]] = []
         by_type: dict[str, list[bool]] = defaultdict(list)
