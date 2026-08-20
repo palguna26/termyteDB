@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import statistics
 import time
 from collections import defaultdict
@@ -38,7 +39,12 @@ def run(path: Path, top_k: int, database_path: Path | None = None, process_batch
 
     database_path.parent.mkdir(parents=True, exist_ok=True)
     embedding = FastEmbedProvider()
-    db = TermyteDB(database_path, embedding_provider=embedding)
+    benchmark_logger = logging.getLogger("termytedb.longmemeval")
+    benchmark_logger.handlers.clear()
+    benchmark_logger.addHandler(logging.NullHandler())
+    benchmark_logger.setLevel(logging.WARNING)
+    benchmark_logger.propagate = False
+    db = TermyteDB(database_path, logger=benchmark_logger, embedding_provider=embedding)
     event_sessions: dict[str, str] = {}
     session_payloads: dict[str, list[dict[str, Any]]] = {}
     try:
