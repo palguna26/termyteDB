@@ -5,6 +5,7 @@ import json
 import statistics
 import time
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any
@@ -24,7 +25,7 @@ def reciprocal_rank(retrieved: list[str], expected: set[str]) -> float:
     return 0.0
 
 
-def run(path: Path, top_k: int, database_path: Path | None = None, process_batch: int = 100) -> dict[str, object]:
+def run(path: Path, top_k: int, database_path: Path | None = None, process_batch: int = 100, workers: int = 2) -> dict[str, object]:
     log(f"Loading dataset: {path}")
     questions = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(questions, list) or len(questions) != 500:
@@ -65,15 +66,23 @@ def run(path: Path, top_k: int, database_path: Path | None = None, process_batch
             if index == 1 or index % 500 == 0:
                 log(f"Ingested {index}/{len(session_payloads)} sessions")
 
-        log("Processing events through extraction, validation, reconciliation, and embedding")
+        if workers < 1:
+            raise ValueError("workers must be positive")
+        log(f"Processing events through extraction, validation, reconciliation, and embedding with {workers} workers")
         processed = 0
-        while True:
-            response = db.process("longmemeval-e2e", limit=process_batch, timeout_seconds=120.0)
-            processed += response.processed
-            pending = int(db.metrics("longmemeval-e2e")["jobs_pending"])
-            log(f"Processed {processed} jobs; accepted={response.accepted}; rejected={response.rejected}; pending={pending}")
-            if pending == 0:
-                break
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="termytedb-worker") as executor:
+            while True:
+                responses = list(executor.map(
+                    lambda _: db.process("longmemeval-e2e", limit=process_batch, timeout_seconds=120.0),
+                    range(workers),
+                ))
+                processed += sum(response.processed for response in responses)
+                accepted = sum(response.accepted for response in responses)
+                rejected = sum(response.rejected for response in responses)
+                pending = int(db.metrics("longmemeval-e2e")["jobs_pending"])
+                log(f"Processed {processed} jobs; accepted={accepted}; rejected={rejected}; pending={pending}")
+                if pending == 0:
+                    break
 
         rows: list[dict[str, object]] = []
         by_type: dict[str, list[bool]] = defaultdict(list)
@@ -136,8 +145,9 @@ def main() -> int:
     parser.add_argument("--output", type=Path)
     parser.add_argument("--database", type=Path)
     parser.add_argument("--process-batch", type=int, default=100)
+    parser.add_argument("--workers", type=int, default=2)
     args = parser.parse_args()
-    result = run(args.dataset, args.top_k, args.database, args.process_batch)
+    result = run(args.dataset, args.top_k, args.database, args.process_batch, args.workers)
     rendered = json.dumps(result, indent=2, ensure_ascii=False)
     print(rendered)
     if args.output:
