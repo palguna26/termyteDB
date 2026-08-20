@@ -14,6 +14,10 @@ from termytedb.retrieval.retrieval import dense_search_atoms, search_atoms
 from termytedb.storage.db import Database
 
 
+def log(message: str) -> None:
+    print(f"[{time.strftime('%H:%M:%S')}] {message}", flush=True)
+
+
 def reciprocal_rank(retrieved: list[str], expected: set[str]) -> float:
     for rank, session_id in enumerate(retrieved, 1):
         if session_id in expected:
@@ -22,6 +26,7 @@ def reciprocal_rank(retrieved: list[str], expected: set[str]) -> float:
 
 
 def run(path: Path, top_k: int, database_path: Path | None = None, batch_size: int = 64, mode: str = "dense", provider_kind: str = "local") -> dict[str, object]:
+    log(f"Loading dataset: {path}")
     questions = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(questions, list) or len(questions) != 500:
         raise ValueError("expected the official 500-question LongMemEval-S cleaned dataset")
@@ -32,6 +37,7 @@ def run(path: Path, top_k: int, database_path: Path | None = None, batch_size: i
     db = Database(database_path)
     started = time.perf_counter()
     try:
+        log(f"Database: {database_path}")
         atoms: list[L1Atom] = []
         for question in questions:
             question_id = str(question["question_id"])
@@ -46,12 +52,18 @@ def run(path: Path, top_k: int, database_path: Path | None = None, batch_size: i
                 if content:
                     atoms.append(L1Atom(f"{question_id}:{session_id}", session_id, content, timestamp, "user"))
         inserted = insert_atoms(db, atoms)
+        log(f"Inserted {inserted} atoms from {len(questions)} questions")
         provider = (OpenAICompatibleEmbeddingProvider() if provider_kind == "openrouter" else FastEmbedProvider()) if mode == "dense" else None
+        log(f"Retrieval mode: {mode} (FTS5{' + dense embeddings' if provider is not None else ''})")
+        if provider is not None:
+            log(f"Embedding provider: {provider.name}; batch size: {batch_size}; dimensions: {provider.dimensions}")
         indexed = index_atom_embeddings(db, provider, batch_size=batch_size) if provider is not None else 0
+        log(f"Indexed {indexed} atoms in {(time.perf_counter() - started) * 1000:.0f} ms")
         index_ms = (time.perf_counter() - started) * 1000
         rows: list[dict[str, object]] = []
         by_type: dict[str, list[bool]] = defaultdict(list)
         query_times: list[float] = []
+        evaluated = 0
         for question in questions:
             expected = {str(item) for item in question.get("answer_session_ids", [])}
             if not expected:
@@ -68,6 +80,9 @@ def run(path: Path, top_k: int, database_path: Path | None = None, batch_size: i
             question_type = str(question.get("question_type", "unknown"))
             by_type[question_type].append(hit)
             rows.append({"question_id": question["question_id"], "question_type": question_type, "retrieved": retrieved, "expected": sorted(expected), "hit": hit, "mrr": reciprocal_rank(retrieved, expected)})
+            evaluated += 1
+            if evaluated == 1 or evaluated % 25 == 0:
+                log(f"Evaluated {evaluated} questions; latest hit={'yes' if hit else 'no'}")
         result = {
             "dataset": path.name,
             "questions": len(rows),
@@ -82,6 +97,7 @@ def run(path: Path, top_k: int, database_path: Path | None = None, batch_size: i
             "by_type": {key: round(sum(values) / len(values), 4) for key, values in sorted(by_type.items())},
             "misses": [row for row in rows if not row["hit"]],
         }
+        log(f"Completed: Recall@{top_k}={result['recall']}; MRR@{top_k}={result['mrr']}; query p95={result['query_p95_ms']} ms")
         return result
     finally:
         db.close()
