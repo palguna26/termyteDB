@@ -150,3 +150,75 @@ class HttpExtractionProvider:
             output_tokens=len(raw.split()),
             latency_ms=int((time.perf_counter() - started) * 1000),
         )
+
+
+class OpenRouterExtractionProvider:
+    """OpenAI-compatible structured extraction through OpenRouter."""
+
+    name = "openrouter"
+
+    def __init__(self, model: str | None = None, api_key: str | None = None, base_url: str | None = None):
+        self.model = model or os.environ.get("TERMYTEDB_EXTRACTION_MODEL", "openrouter/free")
+        self.api_key = api_key or os.environ.get("OPENROUTER_API_KEY")
+        self.base_url = (base_url or os.environ.get("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")).rstrip("/")
+        if not self.api_key:
+            raise ValueError("OPENROUTER_API_KEY is required")
+
+    def extract(
+        self,
+        request: ExtractionRequest,
+        timeout_seconds: float = 30.0,
+        cancellation: Callable[[], bool] | None = None,
+    ) -> ProviderResult:
+        if cancellation and cancellation():
+            raise ProviderError("extraction cancelled", retryable=True, error_class="cancelled")
+        prompt = build_extraction_prompt(request)
+        schema = ExtractionResponse.model_json_schema()
+        body = json.dumps({
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": "Return only valid JSON matching the supplied extraction-v1 schema."},
+                {"role": "user", "content": prompt},
+            ],
+            "temperature": 0,
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {"name": "extraction_v1", "strict": True, "schema": schema},
+            },
+        }).encode("utf-8")
+        headers = {
+            "authorization": f"Bearer {self.api_key}",
+            "content-type": "application/json",
+            "http-referer": "https://termyte.dev",
+            "x-title": "TermyteDB LongMemEval",
+        }
+        started = time.perf_counter()
+        try:
+            with urlopen(Request(f"{self.base_url}/chat/completions", data=body, headers=headers, method="POST"), timeout=timeout_seconds) as response:
+                raw_bytes = response.read()
+        except HTTPError as exc:
+            raise ProviderError(f"OpenRouter returned HTTP {exc.code}", retryable=exc.code in {408, 429, 500, 502, 503, 504}, error_class="http_error") from exc
+        except (TimeoutError, URLError, OSError) as exc:
+            raise ProviderError("OpenRouter request failed", retryable=True, error_class="transport_error") from exc
+        if cancellation and cancellation():
+            raise ProviderError("extraction cancelled", retryable=True, error_class="cancelled")
+        try:
+            payload = json.loads(raw_bytes.decode("utf-8"))
+            choice = payload["choices"][0]["message"]["content"]
+            if isinstance(choice, list):
+                choice = "".join(str(part.get("text", "")) for part in choice if isinstance(part, dict))
+            parsed = ExtractionResponse.model_validate(json.loads(choice))
+        except (UnicodeError, json.JSONDecodeError, KeyError, IndexError, TypeError, ValueError) as exc:
+            raise ProviderError("OpenRouter returned invalid extraction-v1 JSON", retryable=False, error_class="invalid_output") from exc
+        actual_model = str(payload.get("model", self.model))
+        usage = payload.get("usage") or {}
+        return ProviderResult(
+            response=parsed,
+            provider_name=self.name,
+            model_name=actual_model,
+            prompt_version=parsed.prompt_version,
+            raw_response_hash=hashlib.sha256(raw_bytes).hexdigest(),
+            input_tokens=usage.get("prompt_tokens") if isinstance(usage.get("prompt_tokens"), int) else None,
+            output_tokens=usage.get("completion_tokens") if isinstance(usage.get("completion_tokens"), int) else None,
+            latency_ms=int((time.perf_counter() - started) * 1000),
+        )

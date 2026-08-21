@@ -13,6 +13,7 @@ from typing import Any
 
 from termytedb import TermyteDB
 from termytedb.retrieval.embedding import FastEmbedProvider
+from termytedb.provider import OpenRouterExtractionProvider
 
 
 def log(message: str) -> None:
@@ -26,7 +27,7 @@ def reciprocal_rank(retrieved: list[str], expected: set[str]) -> float:
     return 0.0
 
 
-def run(path: Path, top_k: int, database_path: Path | None = None, process_batch: int = 100, workers: int = 2) -> dict[str, object]:
+def run(path: Path, top_k: int, database_path: Path | None = None, process_batch: int = 100, workers: int = 2, extraction: str = "rule") -> dict[str, object]:
     log(f"Loading dataset: {path}")
     questions = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(questions, list) or len(questions) != 500:
@@ -39,12 +40,13 @@ def run(path: Path, top_k: int, database_path: Path | None = None, process_batch
 
     database_path.parent.mkdir(parents=True, exist_ok=True)
     embedding = FastEmbedProvider()
+    extraction_provider = OpenRouterExtractionProvider() if extraction == "openrouter" else None
     benchmark_logger = logging.getLogger("termytedb.longmemeval")
     benchmark_logger.handlers.clear()
     benchmark_logger.addHandler(logging.NullHandler())
     benchmark_logger.setLevel(logging.WARNING)
     benchmark_logger.propagate = False
-    db = TermyteDB(database_path, logger=benchmark_logger, embedding_provider=embedding)
+    db = TermyteDB(database_path, logger=benchmark_logger, extraction_provider=extraction_provider, embedding_provider=embedding)
     event_sessions: dict[str, str] = {}
     session_payloads: dict[str, list[dict[str, Any]]] = {}
     try:
@@ -77,7 +79,7 @@ def run(path: Path, top_k: int, database_path: Path | None = None, process_batch
         log(f"Processing events through extraction, validation, reconciliation, and embedding with {workers} workers")
         processed = 0
         worker_databases = [
-            TermyteDB(database_path, logger=benchmark_logger, embedding_provider=embedding)
+            TermyteDB(database_path, logger=benchmark_logger, extraction_provider=extraction_provider, embedding_provider=embedding)
             for _ in range(workers)
         ]
         try:
@@ -132,6 +134,7 @@ def run(path: Path, top_k: int, database_path: Path | None = None, process_batch
         result = {
             "dataset": path.name,
             "pipeline": "TermyteDB.ingest -> process -> validate -> reconcile -> search",
+            "extraction": extraction,
             "questions": len(rows),
             "top_k": top_k,
             "unique_sessions": len(session_payloads),
@@ -160,8 +163,9 @@ def main() -> int:
     parser.add_argument("--database", type=Path)
     parser.add_argument("--process-batch", type=int, default=100)
     parser.add_argument("--workers", type=int, default=2)
+    parser.add_argument("--extraction", choices=("rule", "openrouter"), default="rule")
     args = parser.parse_args()
-    result = run(args.dataset, args.top_k, args.database, args.process_batch, args.workers)
+    result = run(args.dataset, args.top_k, args.database, args.process_batch, args.workers, args.extraction)
     rendered = json.dumps(result, indent=2, ensure_ascii=False)
     print(rendered)
     if args.output:
