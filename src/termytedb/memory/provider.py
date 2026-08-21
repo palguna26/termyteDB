@@ -159,8 +159,8 @@ class OpenRouterExtractionProvider:
 
     def __init__(self, model: str | None = None, api_key: str | None = None, base_url: str | None = None):
         self.model = model or os.environ.get("TERMYTEDB_EXTRACTION_MODEL", "openrouter/free")
-        self.api_key = api_key or os.environ.get("OPENROUTER_API_KEY")
-        self.base_url = (base_url or os.environ.get("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")).rstrip("/")
+        self.api_key = api_key or os.environ.get("TERMYTEDB_EXTRACTION_API_KEY") or os.environ.get("OPENROUTER_API_KEY")
+        self.base_url = (base_url or os.environ.get("TERMYTEDB_EXTRACTION_BASE_URL") or os.environ.get("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")).rstrip("/")
         if not self.api_key:
             raise ValueError("OPENROUTER_API_KEY is required")
 
