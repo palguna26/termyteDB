@@ -48,6 +48,20 @@ def test_active_job_heartbeat_extends_lease_and_respects_namespace(db):
     assert db.repository.heartbeat_job("other", job["id"], 60) is False
 
 
+def test_stale_lease_owner_cannot_complete_or_fail_reclaimed_job(db):
+    db.ingest(event("n1", "one", "Decision: Use SQLite."))
+    first = db.repository.claim_jobs("n1", 1, 30)[0]
+    first_token = str(first["lease_token"])
+    with db.database.connection:
+        db.database.execute("UPDATE processing_jobs SET lease_until='2000-01-01 00:00:00' WHERE id=?", (first["id"],))
+    second = db.repository.claim_jobs("n1", 1, 30)[0]
+    assert second["lease_token"] != first_token
+    assert db.repository.complete_job("n1", first["id"], first_token) is False
+    assert db.repository.fail_job("n1", first["id"], "late failure", lease_token=first_token) == "stale"
+    row = db.database.execute("SELECT status, lease_token FROM processing_jobs WHERE id=?", (first["id"],)).fetchone()
+    assert tuple(row) == ("processing", second["lease_token"])
+
+
 def test_permanently_failed_jobs_enter_dead_letter(db, monkeypatch):
     db.ingest(event("n1", "one", "Decision: Use SQLite."))
     import termytedb.processor as processor_module

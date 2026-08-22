@@ -38,7 +38,7 @@ class Processor:
             source = ""
             try:
                 event = self.repository.event_for_job(namespace_id, job["id"])
-                if not self.repository.heartbeat_job(namespace_id, job["id"], lease_seconds):
+                if not self.repository.heartbeat_job(namespace_id, job["id"], lease_seconds, str(job["lease_token"])):
                     raise RuntimeError("job lease is no longer active")
                 payload = json.loads(event["payload_json"])
                 source = payload_text(payload)
@@ -52,6 +52,7 @@ class Processor:
                     rule_mode = True
                 else:
                     existing_memories = self.repository.related_memory_context(namespace_id, source)
+                    existing_by_ref = {str(item["ref"]): str(item["memory_id"]) for item in existing_memories}
                     request = ExtractionRequest(
                         namespace_id=namespace_id,
                         events=[event_id],
@@ -65,6 +66,17 @@ class Processor:
                         cancellation=lambda: time.perf_counter() >= deadline,
                     )
                     response = provider_result.response
+                    resolved_candidates = []
+                    for candidate in response.candidates:
+                        if candidate.existing_memory_ref is None:
+                            resolved_candidates.append(candidate)
+                            continue
+                        existing_id = existing_by_ref.get(candidate.existing_memory_ref)
+                        if existing_id is None:
+                            resolved_candidates.append(candidate)
+                            continue
+                        resolved_candidates.append(candidate.model_copy(update={"existing_memory_id": uuid.UUID(existing_id)}))
+                    response = response.model_copy(update={"candidates": resolved_candidates})
                     provider_name, model_name = provider_result.provider_name, provider_result.model_name
                     input_tokens, output_tokens, provider_latency = provider_result.input_tokens, provider_result.output_tokens, provider_result.latency_ms
                     rule_mode = False
@@ -96,6 +108,8 @@ class Processor:
                 validated_candidates: list[tuple[Any, Any]] = []
                 for candidate in response.candidates:
                     try:
+                        if not rule_mode and candidate.existing_memory_ref is not None and candidate.existing_memory_id is None:
+                            raise CandidateRejected("unknown_existing_memory_ref")
                         validated = validate_candidate(namespace_id, candidate, included)
                         if validated.fingerprint in fingerprints:
                             raise CandidateRejected("duplicate_candidate")
@@ -124,7 +138,14 @@ class Processor:
                             rule = RuleCandidate(
                                 validated.candidate.kind, validated.candidate.subject, validated.candidate.statement, span.start_offset, span.end_offset
                             )
-                            memory_id = self.repository.save_candidate(namespace_id, event, rule, embedding)
+                            memory_id = self.repository.save_candidate(
+                                namespace_id,
+                                event,
+                                rule,
+                                embedding,
+                                job_id=str(job["id"]),
+                                lease_token=str(job["lease_token"]),
+                            )
                             row = self.repository.db.execute(
                                 "SELECT current_version_id FROM memories WHERE id=? AND namespace_id=?", (memory_id, namespace_id)
                             ).fetchone()
@@ -137,7 +158,13 @@ class Processor:
                                 action = "INSERT"
                         else:
                             reconciled_memory_id, action, reconciled_version_id = self.repository.reconcile_candidate(
-                                namespace_id, event, validated, run_id, embedding
+                                namespace_id,
+                                event,
+                                validated,
+                                run_id,
+                                embedding,
+                                job_id=str(job["id"]),
+                                lease_token=str(job["lease_token"]),
                             )
                             memory_id = reconciled_memory_id
                             version_id = reconciled_version_id
@@ -149,7 +176,8 @@ class Processor:
                         job_rejected += 1
                         self.repository.record_decision(namespace_id, run_id, candidate, self._safe_fingerprint(candidate), "rejected", exc.reason, "REJECT")
                 self.repository.finish_run(namespace_id, run_id, job_accepted, job_rejected, "completed")
-                self.repository.complete_job(namespace_id, job["id"])
+                if self.repository.complete_job(namespace_id, job["id"]) is False:
+                    raise RuntimeError("job lease is no longer active")
                 processed += 1
                 log(
                     self.logger,
@@ -196,6 +224,7 @@ class Processor:
                     job["id"],
                     safe_error,
                     retryable=not isinstance(exc, ProviderError) or exc.retryable,
+                    lease_token=str(job["lease_token"]),
                 )
                 failed += 1
                 dead += status == "dead"

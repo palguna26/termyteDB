@@ -13,6 +13,7 @@ dependencies = [
   "flashrank>=0.2,<1",
   "numpy>=1.26,<3",
   "pydantic>=2.7,<3",
+  "python-dotenv>=1,<2",
   "uvicorn>=0.30,<1",
 ]
 

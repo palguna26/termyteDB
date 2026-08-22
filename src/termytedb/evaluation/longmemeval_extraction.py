@@ -78,12 +78,12 @@ def index_atom_embeddings(db: Database, provider: Any, *, batch_size: int = 64) 
             vectors = [provider.embed(value) for value in values]
         with db.connection:
             for row, vector in zip(batch, vectors, strict=True):
-                values = [float(item) for item in vector]
+                vector_values = [float(item) for item in vector]
                 import array
-                blob = array.array("f", values).tobytes()
+                blob = array.array("f", vector_values).tobytes()
                 db.execute(
                     "INSERT OR REPLACE INTO atom_embeddings(atom_id, provider, dimensions, vector) VALUES (?, ?, ?, ?)",
-                    (row["atom_id"], provider.name, len(values), blob),
+                    (row["atom_id"], provider.name, len(vector_values), blob),
                 )
                 count += 1
     return count

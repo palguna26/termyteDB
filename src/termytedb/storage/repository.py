@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import sqlite3
 import uuid
 from datetime import UTC, datetime, timedelta
@@ -10,7 +11,7 @@ from typing import Any, cast
 from ..api.schemas import EventInput, EvidenceCitation, ExtractionCandidate, MemoryResponse, SearchResult
 from ..core.errors import IdempotencyConflict
 from ..core.redaction import redact_text
-from ..memory.extraction import ValidatedCandidate
+from ..memory.extraction import CandidateRejected, ValidatedCandidate
 from ..memory.extractor import Candidate
 from ..retrieval.embedding import EmbeddingProvider, FastEmbedProvider, cosine
 from .db import Database
@@ -66,11 +67,12 @@ class Repository:
     def __init__(self, database: Database, embedding: EmbeddingProvider | None = None):
         self.db = database
         self.embedding = embedding or FastEmbedProvider()
+        self._claimed_lease_tokens: dict[str, str] = {}
 
     def embed_many(self, values: list[str]) -> list[list[float]]:
         embed_many = getattr(self.embedding, "embed_many", None)
         if callable(embed_many):
-            return embed_many(values)
+            return cast(list[list[float]], embed_many(values))
         return [self.embedding.embed(value) for value in values]
 
     def ensure_namespace(self, namespace_id: str, org_id: str = "default") -> None:
@@ -312,13 +314,14 @@ class Repository:
         results = self.search(namespace_id, query, max(1, min(limit, 20)), historical=False)
         return [
             {
+                "ref": f"m{index}",
                 "memory_id": str(item.memory_id),
                 "memory_version_id": str(item.memory_version_id),
                 "kind": item.kind,
                 "statement": item.statement,
                 "status": item.status,
             }
-            for item in results
+            for index, item in enumerate(results)
         ]
 
     def record_context_request(self, namespace_id: str, query: str, token_budget: int, response: Any) -> str:
@@ -350,50 +353,75 @@ class Repository:
 
     def claim_jobs(self, namespace_id: str, limit: int, lease_seconds: int) -> list[sqlite3.Row]:
         # SQLite computes the lease consistently and avoids client clock formatting issues.
-        with self.db.lock, self.db.connection:
-            rows = self.db.execute(
-                """SELECT * FROM processing_jobs
-                WHERE namespace_id = ? AND ((status = 'pending' OR
-                    (status = 'failed' AND (next_attempt_at IS NULL OR next_attempt_at <= datetime('now'))) OR
-                    (status = 'processing' AND lease_until < datetime('now'))))
-                ORDER BY created_at, rowid LIMIT ?""",
-                (namespace_id, limit),
-            ).fetchall()
-            claimed: list[sqlite3.Row] = []
-            for row in rows:
-                self.db.execute(
-                    """UPDATE processing_jobs SET status='processing', attempts=attempts+1,
-                    lease_until=datetime('now', ?), updated_at=datetime('now')
-                    WHERE id=? AND namespace_id=?""",
-                    (f"+{lease_seconds} seconds", row["id"], namespace_id),
-                )
-                claimed_row = self.db.execute(
-                    "SELECT * FROM processing_jobs WHERE id=? AND namespace_id=?",
-                    (row["id"], namespace_id),
-                ).fetchone()
-                if claimed_row:
-                    claimed.append(claimed_row)
-        return claimed
+        with self.db.lock:
+            try:
+                self.db.connection.execute("BEGIN IMMEDIATE")
+                rows = self.db.execute(
+                    """SELECT * FROM processing_jobs
+                    WHERE namespace_id = ? AND ((status = 'pending' OR
+                        (status = 'failed' AND (next_attempt_at IS NULL OR next_attempt_at <= datetime('now'))) OR
+                        (status = 'processing' AND lease_until < datetime('now'))))
+                    ORDER BY created_at, rowid LIMIT ?""",
+                    (namespace_id, limit),
+                ).fetchall()
+                claimed: list[sqlite3.Row] = []
+                for row in rows:
+                    lease_token = str(uuid.uuid4())
+                    self.db.execute(
+                        """UPDATE processing_jobs SET status='processing', attempts=attempts+1,
+                        lease_until=datetime('now', ?), lease_token=?, updated_at=datetime('now')
+                        WHERE id=? AND namespace_id=?""",
+                        (f"+{lease_seconds} seconds", lease_token, row["id"], namespace_id),
+                    )
+                    claimed_row = self.db.execute(
+                        "SELECT * FROM processing_jobs WHERE id=? AND namespace_id=?",
+                        (row["id"], namespace_id),
+                    ).fetchone()
+                    if claimed_row:
+                        self._claimed_lease_tokens[str(row["id"])] = lease_token
+                        claimed.append(claimed_row)
+                self.db.connection.commit()
+                return claimed
+            except Exception:
+                self.db.connection.rollback()
+                raise
 
-    def complete_job(self, namespace_id: str, job_id: str) -> None:
+    def complete_job(self, namespace_id: str, job_id: str, lease_token: str | None = None) -> bool:
+        effective_token = lease_token or self._claimed_lease_tokens.get(str(job_id))
         with self.db.connection:
-            self.db.execute(
-                "UPDATE processing_jobs SET status='completed', lease_until=NULL, updated_at=? WHERE id=? AND namespace_id=? AND status='processing'",
-                (iso(), job_id, namespace_id),
+            cursor = self.db.execute(
+                """UPDATE processing_jobs SET status='completed', lease_until=NULL, lease_token=NULL, updated_at=?
+                WHERE id=? AND namespace_id=? AND status='processing'
+                  AND (? IS NULL OR lease_token=?)
+                  AND (lease_until IS NULL OR lease_until >= datetime('now'))""",
+                (iso(), job_id, namespace_id, effective_token, effective_token),
             )
+            if cursor.rowcount == 1:
+                self._claimed_lease_tokens.pop(str(job_id), None)
+            return cursor.rowcount == 1
 
-    def heartbeat_job(self, namespace_id: str, job_id: str, lease_seconds: int) -> bool:
+    def heartbeat_job(self, namespace_id: str, job_id: str, lease_seconds: int, lease_token: str | None = None) -> bool:
         """Extend an active lease without reviving cancelled or completed work."""
         with self.db.lock, self.db.connection:
             cursor = self.db.execute(
                 """UPDATE processing_jobs
                 SET lease_until=datetime('now', ?), updated_at=?
-                WHERE id=? AND namespace_id=? AND status='processing'""",
-                (f"+{lease_seconds} seconds", iso(), job_id, namespace_id),
+                WHERE id=? AND namespace_id=? AND status='processing'
+                  AND (? IS NULL OR lease_token=?)
+                  AND (lease_until IS NULL OR lease_until >= datetime('now'))""",
+                (f"+{lease_seconds} seconds", iso(), job_id, namespace_id, lease_token, lease_token),
             )
             return cursor.rowcount == 1
 
-    def fail_job(self, namespace_id: str, job_id: str, error: str, *, retryable: bool = True) -> str:
+    def fail_job(
+        self,
+        namespace_id: str,
+        job_id: str,
+        error: str,
+        *,
+        retryable: bool = True,
+        lease_token: str | None = None,
+    ) -> str:
         with self.db.connection:
             row = self.db.execute(
                 "SELECT status, attempts, max_attempts FROM processing_jobs WHERE id=? AND namespace_id=?",
@@ -403,10 +431,20 @@ class Repository:
                 raise KeyError(job_id)
             if row["status"] == "cancelled":
                 return "cancelled"
+            if lease_token is not None:
+                owner = self.db.execute(
+                    """SELECT 1 FROM processing_jobs WHERE id=? AND namespace_id=? AND status='processing'
+                    AND lease_token=? AND (lease_until IS NULL OR lease_until >= datetime('now'))""",
+                    (job_id, namespace_id, lease_token),
+                ).fetchone()
+                if not owner:
+                    return "stale"
             status = "dead" if not retryable or row["attempts"] >= row["max_attempts"] else "failed"
             delay = min(300, 2 ** max(1, int(row["attempts"])))
             self.db.execute(
-                "UPDATE processing_jobs SET status=?, lease_until=NULL, next_attempt_at=?, last_error=?, updated_at=? WHERE id=? AND namespace_id=?",
+                """UPDATE processing_jobs
+                SET status=?, lease_until=NULL, lease_token=NULL, next_attempt_at=?, last_error=?, updated_at=?
+                WHERE id=? AND namespace_id=?""",
                 (status, None, error, iso(), job_id, namespace_id),
             )
             if status != "dead":
@@ -419,7 +457,7 @@ class Repository:
     def cancel_job(self, namespace_id: str, job_id: str) -> bool:
         with self.db.connection:
             cursor = self.db.execute(
-                "UPDATE processing_jobs SET status='cancelled', lease_until=NULL, updated_at=? "
+                "UPDATE processing_jobs SET status='cancelled', lease_until=NULL, lease_token=NULL, updated_at=? "
                 "WHERE id=? AND namespace_id=? AND status IN ('pending', 'failed', 'processing')",
                 (iso(), job_id, namespace_id),
             )
@@ -435,9 +473,27 @@ class Repository:
             raise KeyError(job_id)
         return cast(sqlite3.Row, row)
 
-    def save_candidate(self, namespace_id: str, event: sqlite3.Row, candidate: Candidate, embedding: list[float] | None = None) -> str:
+    def save_candidate(
+        self,
+        namespace_id: str,
+        event: sqlite3.Row,
+        candidate: Candidate,
+        embedding: list[float] | None = None,
+        *,
+        job_id: str | None = None,
+        lease_token: str | None = None,
+    ) -> str:
         now = iso()
         with self.db.lock, self.db.connection:
+            self.db.connection.execute("BEGIN IMMEDIATE")
+            if job_id is not None and lease_token is not None:
+                owner = self.db.execute(
+                    """SELECT 1 FROM processing_jobs WHERE id=? AND namespace_id=? AND status='processing'
+                    AND lease_token=? AND lease_until >= datetime('now')""",
+                    (job_id, namespace_id, lease_token),
+                ).fetchone()
+                if not owner:
+                    raise RuntimeError("job lease is no longer active")
             stored_event = self.db.execute(
                 "SELECT id, namespace_id, created_at FROM events WHERE id=? AND namespace_id=?",
                 (event["id"], namespace_id),
@@ -628,115 +684,150 @@ class Repository:
     def reconcile_candidate(
         self, namespace_id: str, event: sqlite3.Row, candidate: ValidatedCandidate, run_id: str,
         embedding: list[float] | None = None,
+        *,
+        job_id: str | None = None,
+        lease_token: str | None = None,
     ) -> tuple[str | None, str, str | None]:
         """Atomically apply one validated proposal. Returns memory id, action, version id."""
+        with self.db.lock:
+            self.db.connection.execute("BEGIN IMMEDIATE")
+            try:
+                if job_id is not None and lease_token is not None:
+                    owner = self.db.execute(
+                        """SELECT 1 FROM processing_jobs WHERE id=? AND namespace_id=? AND status='processing'
+                        AND lease_token=? AND lease_until >= datetime('now')""",
+                        (job_id, namespace_id, lease_token),
+                    ).fetchone()
+                    if not owner:
+                        raise RuntimeError("job lease is no longer active")
+                result = self._reconcile_candidate_in_transaction(namespace_id, event, candidate, run_id, embedding)
+                self.db.connection.commit()
+                return result
+            except Exception:
+                self.db.connection.rollback()
+                raise
+
+    def _reconcile_candidate_in_transaction(
+        self,
+        namespace_id: str,
+        event: sqlite3.Row,
+        candidate: ValidatedCandidate,
+        run_id: str,
+        embedding: list[float] | None,
+    ) -> tuple[str | None, str, str | None]:
         item = candidate.candidate
-        with self.db.lock, self.db.connection:
-            source = self.db.execute(
-                "SELECT namespace_id, created_at, occurred_at, payload_json FROM events WHERE id=? AND namespace_id=?",
-                (str(item.evidence[0].event_id), namespace_id),
-            ).fetchone()
-            if not source:
-                raise ValueError("evidence event is not in the requested namespace")
-            if source["created_at"] > iso():
-                raise ValueError("evidence postdates derived version")
-            memory = self.db.execute(
-                "SELECT * FROM memories WHERE namespace_id=? AND kind=? AND subject_key=?",
-                (namespace_id, item.kind, item.subject),
-            ).fetchone()
-            memory_id = memory["id"] if memory else str(uuid.uuid4())
-            if item.intent == "ignore":
-                return memory_id if memory else None, "IGNORE", None
-            if not memory:
+        source = self.db.execute(
+            "SELECT namespace_id, created_at, occurred_at, payload_json FROM events WHERE id=? AND namespace_id=?",
+            (str(item.evidence[0].event_id), namespace_id),
+        ).fetchone()
+        if not source:
+            raise ValueError("evidence event is not in the requested namespace")
+        if source["created_at"] > iso():
+            raise ValueError("evidence postdates derived version")
+        memory = self.db.execute(
+            "SELECT * FROM memories WHERE namespace_id=? AND kind=? AND subject_key=?",
+            (namespace_id, item.kind, item.subject),
+        ).fetchone()
+        memory_id = memory["id"] if memory else str(uuid.uuid4())
+        if item.existing_memory_id is not None and (not memory or str(item.existing_memory_id) != memory_id):
+            raise CandidateRejected("existing_memory_identity_mismatch")
+        if item.intent == "ignore":
+            return memory_id if memory else None, "IGNORE", None
+        if not memory:
+            self.db.execute(
+                "INSERT INTO memories(id, namespace_id, kind, subject_key, status, confidence, importance, created_at) "
+                "VALUES (?, ?, ?, ?, 'active', ?, ?, ?)",
+                (memory_id, namespace_id, item.kind, item.subject, item.confidence, item.importance, iso()),
+            )
+        current = self.db.execute(
+            "SELECT * FROM memory_versions WHERE memory_id=? AND namespace_id=? ORDER BY version DESC LIMIT 1", (memory_id, namespace_id)
+        ).fetchone()
+        if current and current["statement"] == item.statement and current["status"] == "active":
+            for span in item.evidence:
                 self.db.execute(
-                    "INSERT INTO memories(id, namespace_id, kind, subject_key, status, confidence, importance, created_at) "
-                    "VALUES (?, ?, ?, ?, 'active', ?, ?, ?)",
-                    (memory_id, namespace_id, item.kind, item.subject, item.confidence, item.importance, iso()),
+                    """INSERT OR IGNORE INTO evidence_refs
+                    (id, memory_version_id, namespace_id, event_id, start_offset, end_offset, excerpt)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                    (str(uuid.uuid4()), current["id"], namespace_id, str(span.event_id), span.start_offset, span.end_offset, span.excerpt),
                 )
-            current = self.db.execute(
-                "SELECT * FROM memory_versions WHERE memory_id=? AND namespace_id=? ORDER BY version DESC LIMIT 1", (memory_id, namespace_id)
-            ).fetchone()
-            if current and current["statement"] == item.statement and current["status"] == "active":
-                for span in item.evidence:
-                    self.db.execute(
-                        """INSERT OR IGNORE INTO evidence_refs
-                        (id, memory_version_id, namespace_id, event_id, start_offset, end_offset, excerpt)
-                        VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                        (str(uuid.uuid4()), current["id"], namespace_id, str(span.event_id), span.start_offset, span.end_offset, span.excerpt),
-                    )
-                return memory_id, "REINFORCE", current["id"]
-            if item.intent == "dispute":
-                action = "DISPUTE"
-                status = "contradicted"
-            elif current and item.intent in {"update", "supersede"}:
-                explicit = any(
-                    word in item.statement.casefold() or word in span.excerpt.casefold()
-                    for span in item.evidence
-                    for word in ("correction", "corrected", "replace", "supersede", "instead")
-                )
-                action = "UPDATE" if item.intent == "update" else "SUPERSEDE"
-                if not explicit:
-                    action, status = "DISPUTE", "contradicted"
-                else:
-                    status = "active"
-            elif current:
+            return memory_id, "REINFORCE", current["id"]
+        if item.intent == "dispute":
+            action = "DISPUTE"
+            status = "contradicted"
+        elif current and item.intent in {"update", "supersede"}:
+            explicit = any(
+                word in item.statement.casefold() or word in span.excerpt.casefold()
+                for span in item.evidence
+                for word in ("correction", "corrected", "replace", "supersede", "instead")
+            )
+            action = "UPDATE" if item.intent == "update" else "SUPERSEDE"
+            if not explicit:
                 action, status = "DISPUTE", "contradicted"
             else:
-                action, status = "INSERT", "active"
-            version = current["version"] + 1 if current else 1
-            if current and status == "active":
-                self.db.execute(
-                    "UPDATE memory_versions SET status='superseded', valid_to=? WHERE id=? AND namespace_id=?", (iso(), current["id"], namespace_id)
-                )
-                self.db.execute("DELETE FROM memory_fts WHERE memory_version_id=? AND namespace_id=?", (current["id"], namespace_id))
-            span = item.evidence[0]
-            version_id = str(uuid.uuid4())
+                status = "active"
+        elif current:
+            action, status = "DISPUTE", "contradicted"
+        else:
+            action, status = "INSERT", "active"
+        version = current["version"] + 1 if current else 1
+        if current and status == "active":
             self.db.execute(
-                """INSERT INTO memory_versions
-                (id, memory_id, namespace_id, source_event_id, evidence_start_offset, evidence_end_offset, evidence_excerpt,
-                 version, statement, valid_from, valid_until, recorded_at, status, reason, durability, model_run_id)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (
-                    version_id,
-                    memory_id,
-                    namespace_id,
-                    str(span.event_id),
-                    span.start_offset,
-                    span.end_offset,
-                    span.excerpt,
-                    version,
-                    item.statement,
-                    item.valid_from.astimezone(UTC).isoformat() if item.valid_from else source["occurred_at"],
-                    item.valid_until.astimezone(UTC).isoformat() if item.valid_until else None,
-                    iso(),
-                    status,
-                    action,
-                    item.durability,
-                    run_id,
-                ),
+                "UPDATE memory_versions SET status='superseded', valid_to=? WHERE id=? AND namespace_id=?", (iso(), current["id"], namespace_id)
             )
-            for ref in item.evidence:
-                self.db.execute(
-                    "INSERT INTO evidence_refs(id, memory_version_id, namespace_id, event_id, start_offset, end_offset, excerpt) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                    (str(uuid.uuid4()), version_id, namespace_id, str(ref.event_id), ref.start_offset, ref.end_offset, ref.excerpt),
-                )
-            if status == "active":
-                self.db.execute(
-                    "UPDATE memories SET current_version_id=?, status='active', confidence=?, importance=? WHERE id=? AND namespace_id=?",
-                    (version_id, item.confidence, item.importance, memory_id, namespace_id),
-                )
-                self.db.execute(
-                    "INSERT INTO memory_fts(memory_version_id, namespace_id, statement, evidence_text) VALUES (?, ?, ?, ?)",
-                    (version_id, namespace_id, item.statement, span.excerpt),
-                )
-            elif status == "contradicted":
-                self.db.execute("UPDATE memories SET status='disputed' WHERE id=? AND namespace_id=?", (memory_id, namespace_id))
+            self.db.execute("DELETE FROM memory_fts WHERE memory_version_id=? AND namespace_id=?", (current["id"], namespace_id))
+        span = item.evidence[0]
+        version_id = str(uuid.uuid4())
+        self.db.execute(
+            """INSERT INTO memory_versions
+            (id, memory_id, namespace_id, source_event_id, evidence_start_offset, evidence_end_offset, evidence_excerpt,
+             version, statement, valid_from, valid_until, recorded_at, status, reason, durability, model_run_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                version_id,
+                memory_id,
+                namespace_id,
+                str(span.event_id),
+                span.start_offset,
+                span.end_offset,
+                span.excerpt,
+                version,
+                item.statement,
+                item.valid_from.astimezone(UTC).isoformat() if item.valid_from else source["occurred_at"],
+                item.valid_until.astimezone(UTC).isoformat() if item.valid_until else None,
+                iso(),
+                status,
+                action,
+                item.durability,
+                run_id,
+            ),
+        )
+        for ref in item.evidence:
             self.db.execute(
-                "INSERT INTO memory_embeddings(memory_version_id, namespace_id, provider, dimensions, vector_json) VALUES (?, ?, ?, ?, ?)",
-                (version_id, namespace_id, self.embedding.name, self.embedding.dimensions,
-                json.dumps(embedding if embedding is not None else self.embedding.embed(item.statement), separators=(",", ":"))),
+                "INSERT INTO evidence_refs(id, memory_version_id, namespace_id, event_id, start_offset, end_offset, excerpt) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (str(uuid.uuid4()), version_id, namespace_id, str(ref.event_id), ref.start_offset, ref.end_offset, ref.excerpt),
             )
-            return memory_id, action, version_id
+        if status == "active":
+            self.db.execute(
+                "UPDATE memories SET current_version_id=?, status='active', confidence=?, importance=? WHERE id=? AND namespace_id=?",
+                (version_id, item.confidence, item.importance, memory_id, namespace_id),
+            )
+            self.db.execute(
+                "INSERT INTO memory_fts(memory_version_id, namespace_id, statement, evidence_text) VALUES (?, ?, ?, ?)",
+                (version_id, namespace_id, item.statement, span.excerpt),
+            )
+        elif status == "contradicted":
+            self.db.execute("UPDATE memories SET status='disputed' WHERE id=? AND namespace_id=?", (memory_id, namespace_id))
+        self.db.execute(
+            "INSERT INTO memory_embeddings(memory_version_id, namespace_id, provider, dimensions, vector_json) VALUES (?, ?, ?, ?, ?)",
+            (
+                version_id,
+                namespace_id,
+                self.embedding.name,
+                self.embedding.dimensions,
+                json.dumps(embedding if embedding is not None else self.embedding.embed(item.statement), separators=(",", ":")),
+            ),
+        )
+        return memory_id, action, version_id
 
     def get_memory(self, namespace_id: str, memory_id: str) -> MemoryResponse | None:
         row = self.db.execute(
@@ -780,23 +871,30 @@ class Repository:
         ]
 
     def search(self, namespace_id: str, query: str, limit: int, historical: bool = False) -> list[SearchResult]:
-        terms = [part for part in query.split() if part.isalnum()]
+        terms = list(dict.fromkeys(term.casefold() for term in re.findall(r"[\w./:-]+", query) if len(term) > 1))
         lexical: dict[str, float] = {}
+        lexical_rank: dict[str, int] = {}
         if terms:
             match = " OR ".join(f'"{term.replace(chr(34), "")}"' for term in terms)
             if historical:
                 lexical_rows = self.db.execute(
-                    "SELECT id AS memory_version_id, 0.0 AS score FROM memory_versions WHERE namespace_id=? AND statement LIKE ? LIMIT ?",
-                    (namespace_id, f"%{query}%", max(limit * 5, 20)),
+                    """SELECT id AS memory_version_id,
+                    CASE WHEN lower(statement) LIKE ? THEN 0 ELSE 1 END AS score
+                    FROM memory_versions WHERE namespace_id=? AND ("""
+                    + " OR ".join("lower(statement) LIKE ?" for _ in terms)
+                    + ") ORDER BY score, recorded_at DESC, id LIMIT ?",
+                    (f"%{query.casefold()}%", namespace_id, *(f"%{term}%" for term in terms), max(limit * 5, 20)),
                 ).fetchall()
             else:
                 lexical_rows = self.db.execute(
                     "SELECT memory_version_id, bm25(memory_fts) AS score FROM memory_fts WHERE namespace_id=? AND memory_fts MATCH ? ORDER BY score LIMIT ?",
                     (namespace_id, match, max(limit * 5, 20)),
                 ).fetchall()
-            maximum = max((abs(float(row["score"])) for row in lexical_rows), default=0.0) or 1.0
-            lexical = {row["memory_version_id"]: min(1.0, abs(float(row["score"])) / maximum) for row in lexical_rows}
-        query_vector = self.embedding.embed(query)
+            lexical_rank = {str(row["memory_version_id"]): index for index, row in enumerate(lexical_rows, start=1)}
+            lexical = {memory_id: 1.0 / (1.0 + 0.08 * (rank - 1)) for memory_id, rank in lexical_rank.items()}
+
+        vector: dict[str, float] = {}
+        vector_rank: dict[str, int] = {}
         vector_rows = self.db.execute(
             """SELECT e.memory_version_id, e.vector_json
             FROM memory_embeddings e JOIN memory_versions v ON v.id=e.memory_version_id AND v.namespace_id=e.namespace_id
@@ -805,17 +903,20 @@ class Repository:
               AND (v.valid_until IS NULL OR julianday(v.valid_until) > julianday('now'))))""",
             (namespace_id, historical),
         ).fetchall()
-        vector = {row["memory_version_id"]: cosine(query_vector, json.loads(row["vector_json"])) for row in vector_rows}
-        vector_candidates = {
-            memory_id
-            for memory_id, score in vector.items()
-            if score >= 0.6 and (memory_id in lexical or score >= 0.7)
-        }
-        # Embeddings are required for retrieval. FTS5 remains a useful lexical
-        # signal, but must not make a memory searchable when dense retrieval
-        # did not select it. This prevents the system from silently reverting
-        # to lexical-only behavior when the embedding index is incomplete.
-        candidate_ids = vector_candidates
+        if vector_rows:
+            try:
+                query_vector = self.embedding.embed(query)
+                raw_vector = {str(row["memory_version_id"]): cosine(query_vector, json.loads(row["vector_json"])) for row in vector_rows}
+                ordered_vector = sorted(raw_vector.items(), key=lambda item: (-item[1], item[0]))
+                vector_rank = {memory_id: index for index, (memory_id, score) in enumerate(ordered_vector, start=1) if score >= 0.6}
+                vector = {memory_id: score for memory_id, score in raw_vector.items() if memory_id in vector_rank}
+            except Exception:
+                # Lexical retrieval is the complete local fallback. Embedding
+                # failures must not make already indexed evidence disappear.
+                vector = {}
+                vector_rank = {}
+
+        candidate_ids = set(lexical) | {memory_id for memory_id, score in vector.items() if score >= 0.7}
         if not candidate_ids:
             return []
         placeholders = ",".join("?" for _ in candidate_ids)
@@ -826,23 +927,31 @@ class Repository:
               AND (v.valid_until IS NULL OR julianday(v.valid_until) > julianday('now'))))""",
             (namespace_id, namespace_id, *candidate_ids, historical),
         ).fetchall()
-        ranked = sorted(
-            rows,
-            key=lambda row: (-(0.6 * lexical.get(row["version_id"], 0.0) + 0.4 * vector.get(row["version_id"], 0.0)), row["version_id"]),
-        )[:limit]
-        query_terms = {term.casefold() for term in query.split()}
+        def score_row(row: sqlite3.Row) -> float:
+            version_id = str(row["version_id"])
+            lexical_rrf = 1.0 / (60 + lexical_rank[version_id]) if version_id in lexical_rank else 0.0
+            vector_rrf = 1.0 / (60 + vector_rank[version_id]) if version_id in vector_rank else 0.0
+            fused = 60 * (lexical_rrf + vector_rrf) / 2
+            exact = 0.08 if query.casefold() in str(row["statement"]).casefold() else 0.0
+            support = min(0.04, 0.01 * len(self._citations(namespace_id, version_id)))
+            quality = 0.03 * float(row["confidence"]) + 0.02 * float(row["importance"])
+            return min(1.0, fused + exact + support + quality)
+
+        ranked = sorted(rows, key=lambda row: (-score_row(row), row["version_id"]))[:limit]
+        query_terms = set(terms)
         results: list[SearchResult] = []
         for row in ranked:
             citations = self._citations(namespace_id, row["version_id"])
             lexical_score = round(lexical.get(row["version_id"], 0.0), 6)
             vector_score = round(vector.get(row["version_id"], 0.0), 6)
+            final_score = round(score_row(row), 6)
             results.append(
                 SearchResult(
                     memory_id=uuid.UUID(row["id"]),
                     memory_version_id=uuid.UUID(row["version_id"]),
                     statement=row["statement"],
                     kind=row["kind"],
-                    score=round(0.6 * lexical_score + 0.4 * vector_score, 6),
+                    score=final_score,
                     lexical_score=lexical_score,
                     vector_score=vector_score,
                     component_scores={
@@ -852,6 +961,9 @@ class Repository:
                         "memory_type_signal": float(row["kind"].casefold() in query_terms),
                         "temporal_signal": float(row["status"] == "active"),
                         "staleness_penalty": float(row["status"] != "active"),
+                        "lexical_rank": float(lexical_rank.get(str(row["version_id"]), 0)),
+                        "vector_rank": float(vector_rank.get(str(row["version_id"]), 0)),
+                        "exact_match": float(query.casefold() in str(row["statement"]).casefold()),
                     },
                     status=row["status"],
                     citations=citations,
@@ -896,12 +1008,36 @@ class Repository:
             cursor = self.db.execute("INSERT OR IGNORE INTO entity_aliases(entity_id, namespace_id, alias) VALUES (?, ?, ?)", (entity_id, namespace_id, alias))
             return cursor.rowcount > 0
 
-    def add_relationship(self, namespace_id: str, subject_entity_id: str, predicate: str, object_entity_id: str, memory_version_id: str | None = None, valid_from: str | None = None, valid_until: str | None = None, confidence: float = 1.0) -> str:
+    def add_relationship(
+        self,
+        namespace_id: str,
+        subject_entity_id: str,
+        predicate: str,
+        object_entity_id: str,
+        memory_version_id: str | None = None,
+        valid_from: str | None = None,
+        valid_until: str | None = None,
+        confidence: float = 1.0,
+    ) -> str:
         relationship_id = str(uuid.uuid4())
         with self.db.lock, self.db.connection:
             self.db.execute(
-                "INSERT INTO relationships(id, namespace_id, subject_entity_id, predicate, object_entity_id, memory_version_id, valid_from, valid_until, confidence, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (relationship_id, namespace_id, subject_entity_id, predicate, object_entity_id, memory_version_id, valid_from or iso(), valid_until, confidence, iso()),
+                """INSERT INTO relationships
+                (id, namespace_id, subject_entity_id, predicate, object_entity_id, memory_version_id,
+                 valid_from, valid_until, confidence, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    relationship_id,
+                    namespace_id,
+                    subject_entity_id,
+                    predicate,
+                    object_entity_id,
+                    memory_version_id,
+                    valid_from or iso(),
+                    valid_until,
+                    confidence,
+                    iso(),
+                ),
             )
         return relationship_id
 
@@ -995,7 +1131,10 @@ class Repository:
                 "UPDATE memory_versions SET status='superseded' WHERE memory_id=? AND namespace_id=? AND id<>? AND status='active'",
                 (memory_id, namespace_id, version["id"]),
             )
-            self.db.execute("UPDATE memory_versions SET status='active', valid_to=NULL, reason='RESTORE' WHERE id=? AND namespace_id=?", (version["id"], namespace_id))
+            self.db.execute(
+                "UPDATE memory_versions SET status='active', valid_to=NULL, reason='RESTORE' WHERE id=? AND namespace_id=?",
+                (version["id"], namespace_id),
+            )
             self.db.execute("UPDATE memories SET status='active', current_version_id=? WHERE id=? AND namespace_id=?", (version["id"], memory_id, namespace_id))
             self.db.execute(
                 "INSERT OR REPLACE INTO memory_fts(memory_version_id, namespace_id, statement, evidence_text) VALUES (?, ?, ?, ?)",

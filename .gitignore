@@ -8,6 +8,7 @@ __pycache__/
 *.pyc
 .env
 .codex/
+.termytedb-work/
 
 research/
 *.egg-info/
@@ -15,3 +16,4 @@ benchmarks/longmemeval/*.json
 benchmarks/longmemeval/*.sqlite*
 benchmarks/longmemeval/*.log
 benchmarks/longmemeval/*.err
+benchmarks/runs/*

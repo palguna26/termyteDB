@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from functools import lru_cache
 
 from ..storage.db import Database
-from .embedding import FastEmbedProvider, cosine
+from .embedding import EmbeddingProvider, FastEmbedProvider, cosine
 
 RRF_K = 60
 HISTORY_RE = re.compile(r"\b(previously|used to|former|formerly|before|previous|history|historical)\b", re.I)

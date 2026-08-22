@@ -77,6 +77,7 @@ class ExtractionCandidate(BaseModel):
     valid_until: datetime | None = None
     intent: ReconciliationIntent = "insert"
     existing_memory_id: UUID | None = None
+    existing_memory_ref: str | None = Field(default=None, pattern=r"^m[0-9]+$")
     timestamp: datetime | None = None
     source_role: Literal["user", "assistant"] = "user"
 

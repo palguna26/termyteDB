@@ -343,6 +343,10 @@ MIGRATIONS: tuple[str, ...] = (
         THEN RAISE(ABORT, 'relationship namespace mismatch') END;
     END;
     """,
+    """
+    ALTER TABLE processing_jobs ADD COLUMN lease_token TEXT;
+    CREATE INDEX jobs_lease_owner_idx ON processing_jobs(namespace_id, id, status, lease_token, lease_until);
+    """,
 )
 
 

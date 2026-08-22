@@ -31,8 +31,8 @@ from ..api.schemas import (
 )
 from ..core.errors import IdempotencyConflict
 from ..memory.provider import ExtractionProvider
-from ..runtime.engine import TermyteDB
 from ..retrieval.embedding import EmbeddingProvider
+from ..runtime.engine import TermyteDB
 from ..storage.db import Database
 from ..storage.integrity import check_database
 

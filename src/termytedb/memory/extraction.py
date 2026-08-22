@@ -54,6 +54,7 @@ def validate_candidate(
         raise CandidateRejected("secret_in_statement")
     if candidate.valid_from and candidate.valid_until and candidate.valid_until <= candidate.valid_from:
         raise CandidateRejected("invalid_validity_interval")
+    evidence_excerpts: list[str] = []
     for span in candidate.evidence:
         if str(span.event_id) not in {str(event_id) for event_id in included_events}:
             raise CandidateRejected("evidence_not_in_extraction_input")
@@ -65,8 +66,9 @@ def validate_candidate(
             raise CandidateRejected("evidence_excerpt_mismatch")
         if redact_text(actual) != actual:
             raise CandidateRejected("secret_in_evidence")
-        if not semantic_support(statement, actual):
-            raise CandidateRejected("unsupported_statement")
+        evidence_excerpts.append(actual)
+    if not semantic_support(statement, " ".join(evidence_excerpts)):
+        raise CandidateRejected("unsupported_statement")
     normalized = candidate.model_copy(update={"subject": subject, "statement": statement})
     return ValidatedCandidate(normalized, candidate_fingerprint(normalized))
 

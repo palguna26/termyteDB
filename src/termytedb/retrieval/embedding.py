@@ -7,6 +7,7 @@ from typing import Protocol
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
+
 class EmbeddingProvider(Protocol):
     name: str
     dimensions: int

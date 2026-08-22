@@ -9,7 +9,6 @@ from .evaluation import longmemeval_extraction
 from .memory import extraction, extractor, processor, provider
 from .retrieval import context, embedding, retrieval
 from .runtime import engine as runtime_engine
-from .runtime import operations
 from .runtime.engine import TermyteDB
 from .storage import db, integrity, repository
 
@@ -18,7 +17,7 @@ _COMPAT_MODULES = {
     "engine": runtime_engine,
     "errors": errors, "extraction": extraction, "extractor": extractor,
     "integrity": integrity, "logging": logging, "longmemeval_extraction": longmemeval_extraction,
-    "operations": operations, "processor": processor, "provider": provider,
+    "processor": processor, "provider": provider,
     "redaction": redaction, "repository": repository, "retrieval": retrieval,
     "schemas": schemas, "service": service,
 }

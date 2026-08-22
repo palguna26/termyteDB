@@ -65,6 +65,28 @@ def test_unsupported_model_candidate_is_rejected_without_memory(tmp_path: Path):
     db.close()
 
 
+def test_candidate_support_can_be_combined_across_exact_evidence_spans(tmp_path: Path):
+    text = "The service uses SQLite and it runs locally."
+    db = model_db(
+        tmp_path,
+        text,
+        lambda event_id, _end: ExtractionCandidate(
+            kind="fact",
+            subject="storage",
+            statement="The service uses SQLite and runs locally.",
+            evidence=[
+                EvidenceSpan(event_id=event_id, start_offset=0, end_offset=27, excerpt="The service uses SQLite and"),
+                EvidenceSpan(event_id=event_id, start_offset=28, end_offset=44, excerpt="it runs locally."),
+            ],
+            confidence=0.9,
+            durability="session",
+        ),
+    )
+    assert db.process("model").accepted == 1
+    assert db.search("model", "runs locally")
+    db.close()
+
+
 def test_model_retry_is_idempotent_and_correction_is_explicit(tmp_path: Path):
     text = "Correction: the service uses PostgreSQL instead."
     db = model_db(

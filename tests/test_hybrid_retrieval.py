@@ -17,9 +17,13 @@ def test_vector_candidates_remain_namespace_scoped(db):
     assert left[0].citations[0].event_id != db.search("right", "SQLite")[0].citations[0].event_id
 
 
-def test_lexical_match_without_embedding_candidate_is_not_returned(db):
+def test_lexical_match_remains_available_without_embedding_candidate(db):
     db.ingest({"namespace_id": "dense-required", "idempotency_key": "one", "type": "decision", "payload": {"text": "Decision: use SQLite."}})
     db.process("dense-required")
     db.database.execute("DELETE FROM memory_embeddings WHERE namespace_id=?", ("dense-required",))
     db.database.connection.commit()
-    assert db.search("dense-required", "SQLite") == []
+    results = db.search("dense-required", "SQLite")
+    assert len(results) == 1
+    assert results[0].statement == "Decision: use SQLite."
+    assert results[0].lexical_score > 0
+    assert results[0].vector_score == 0
