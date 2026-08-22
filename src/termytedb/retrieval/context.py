@@ -1,11 +1,29 @@
 from __future__ import annotations
 
+import math
+from functools import lru_cache
+from typing import Any
+
 from ..api.schemas import ContextResponse, SearchResult
 from ..storage.repository import Repository
 
 
+@lru_cache(maxsize=1)
+def _token_encoder() -> Any | None:
+    try:
+        import tiktoken  # type: ignore[import-not-found]
+
+        return tiktoken.get_encoding("cl100k_base")
+    except (ImportError, OSError, ValueError):
+        return None
+
+
 def token_count(text: str) -> int:
-    return len(text.split())
+    encoder = _token_encoder()
+    if encoder is not None:
+        return len(encoder.encode(text, disallowed_special=()))
+    words = len(text.split())
+    return math.ceil(words * 1.35) if words else 0
 
 
 def build_context(repository: Repository, namespace_id: str, query: str, limit: int, token_budget: int, historical: bool = False) -> ContextResponse:

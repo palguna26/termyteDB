@@ -5,7 +5,7 @@ import json
 from dataclasses import asdict, dataclass
 
 from ..api.schemas import ArtifactInput, EventInput
-from ..retrieval.embedding import EmbeddingProvider, FastEmbedProvider
+from ..retrieval.embedding import EmbeddingProvider, FastEmbedProvider, pack_embedding
 from .db import MIGRATIONS, Database
 from .repository import canonical_event_content, hash_text
 
@@ -165,8 +165,8 @@ def repair_fts(database: Database, embedding: EmbeddingProvider | None = None) -
         ).fetchall()
         for row in rows:
             database.execute(
-                "INSERT INTO memory_embeddings(memory_version_id, namespace_id, provider, dimensions, vector_json) VALUES (?, ?, ?, ?, ?)",
-                (row["id"], row["namespace_id"], embedding.name, embedding.dimensions, json.dumps(embedding.embed(row["statement"]), separators=(",", ":"))),
+                "INSERT INTO memory_embeddings(memory_version_id, namespace_id, provider, dimensions, vector) VALUES (?, ?, ?, ?, ?)",
+                (row["id"], row["namespace_id"], embedding.name, embedding.dimensions, pack_embedding(embedding.embed(row["statement"]))),
             )
 
 

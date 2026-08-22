@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import re
@@ -13,8 +14,14 @@ from ..core.errors import IdempotencyConflict
 from ..core.redaction import redact_text
 from ..memory.extraction import CandidateRejected, ValidatedCandidate
 from ..memory.extractor import Candidate
-from ..retrieval.embedding import EmbeddingProvider, FastEmbedProvider, cosine
+from ..retrieval.embedding import EmbeddingProvider, FastEmbedProvider, batch_dot, pack_embedding
 from .db import Database
+
+TRANSITION_MARKERS = (
+    "correction", "corrected", "replace", "supersede", "instead",
+    "switched", "moved", "migrated", "changed", "no longer", "now using",
+    "updated", "prefer", "renamed", "deprecated", "stopped",
+)
 
 
 def iso(value: datetime | None = None) -> str:
@@ -605,10 +612,10 @@ class Repository:
                 (version_id, namespace_id, candidate.statement, candidate.statement),
             )
             self.db.execute(
-                "INSERT INTO memory_embeddings(memory_version_id, namespace_id, provider, dimensions, vector_json) VALUES (?, ?, ?, ?, ?)",
+                "INSERT INTO memory_embeddings(memory_version_id, namespace_id, provider, dimensions, vector) VALUES (?, ?, ?, ?, ?)",
                 (
                     version_id, namespace_id, self.embedding.name, self.embedding.dimensions,
-                    json.dumps(embedding if embedding is not None else self.embedding.embed(candidate.statement), separators=(",", ":")),
+                    pack_embedding(embedding if embedding is not None else self.embedding.embed(candidate.statement)),
                 ),
             )
             return memory_id
@@ -755,10 +762,10 @@ class Repository:
             action = "DISPUTE"
             status = "contradicted"
         elif current and item.intent in {"update", "supersede"}:
-            explicit = any(
-                word in item.statement.casefold() or word in span.excerpt.casefold()
+            explicit = item.confidence >= 0.85 or any(
+                marker in item.statement.casefold() or marker in span.excerpt.casefold()
                 for span in item.evidence
-                for word in ("correction", "corrected", "replace", "supersede", "instead")
+                for marker in TRANSITION_MARKERS
             )
             action = "UPDATE" if item.intent == "update" else "SUPERSEDE"
             if not explicit:
@@ -818,13 +825,13 @@ class Repository:
         elif status == "contradicted":
             self.db.execute("UPDATE memories SET status='disputed' WHERE id=? AND namespace_id=?", (memory_id, namespace_id))
         self.db.execute(
-            "INSERT INTO memory_embeddings(memory_version_id, namespace_id, provider, dimensions, vector_json) VALUES (?, ?, ?, ?, ?)",
+            "INSERT INTO memory_embeddings(memory_version_id, namespace_id, provider, dimensions, vector) VALUES (?, ?, ?, ?, ?)",
             (
                 version_id,
                 namespace_id,
                 self.embedding.name,
                 self.embedding.dimensions,
-                json.dumps(embedding if embedding is not None else self.embedding.embed(item.statement), separators=(",", ":")),
+                pack_embedding(embedding if embedding is not None else self.embedding.embed(item.statement)),
             ),
         )
         return memory_id, action, version_id
@@ -896,17 +903,22 @@ class Repository:
         vector: dict[str, float] = {}
         vector_rank: dict[str, int] = {}
         vector_rows = self.db.execute(
-            """SELECT e.memory_version_id, e.vector_json
+            """SELECT e.memory_version_id, e.vector
             FROM memory_embeddings e JOIN memory_versions v ON v.id=e.memory_version_id AND v.namespace_id=e.namespace_id
             JOIN memories m ON m.id=v.memory_id AND m.namespace_id=v.namespace_id
-            WHERE e.namespace_id=? AND (? OR (v.status='active' AND m.status='active' AND v.valid_to IS NULL
+            WHERE e.namespace_id=? AND e.provider=? AND e.dimensions=? AND (? OR (v.status='active' AND m.status='active' AND v.valid_to IS NULL
+              AND (v.valid_from IS NULL OR julianday(v.valid_from) <= julianday('now'))
               AND (v.valid_until IS NULL OR julianday(v.valid_until) > julianday('now'))))""",
-            (namespace_id, historical),
+            (namespace_id, self.embedding.name, self.embedding.dimensions, historical),
         ).fetchall()
         if vector_rows:
             try:
                 query_vector = self.embedding.embed(query)
-                raw_vector = {str(row["memory_version_id"]): cosine(query_vector, json.loads(row["vector_json"])) for row in vector_rows}
+                scores = batch_dot(query_vector, [bytes(row["vector"]) for row in vector_rows], self.embedding.dimensions)
+                raw_vector = {
+                    str(row["memory_version_id"]): float(score)
+                    for row, score in zip(vector_rows, scores, strict=True)
+                }
                 ordered_vector = sorted(raw_vector.items(), key=lambda item: (-item[1], item[0]))
                 vector_rank = {memory_id: index for index, (memory_id, score) in enumerate(ordered_vector, start=1) if score >= 0.6}
                 vector = {memory_id: score for memory_id, score in raw_vector.items() if memory_id in vector_rank}
@@ -924,6 +936,7 @@ class Repository:
             f"""SELECT m.id, m.kind, m.confidence, m.importance, v.id AS version_id, v.statement, v.status
             FROM memory_versions v JOIN memories m ON m.id=v.memory_id AND m.namespace_id=?
             WHERE v.namespace_id=? AND v.id IN ({placeholders}) AND (? OR (v.status='active' AND m.status='active' AND v.valid_to IS NULL
+              AND (v.valid_from IS NULL OR julianday(v.valid_from) <= julianday('now'))
               AND (v.valid_until IS NULL OR julianday(v.valid_until) > julianday('now'))))""",
             (namespace_id, namespace_id, *candidate_ids, historical),
         ).fetchall()
@@ -1160,7 +1173,11 @@ class Repository:
             "namespaces": [dict(row) for row in self.db.execute("SELECT * FROM namespaces WHERE id=?", (namespace_id,))],
         }
         for table in tables[1:]:
-            result[table] = [dict(row) for row in self.db.execute(f"SELECT * FROM {table} WHERE namespace_id=?", (namespace_id,))]
+            rows = [dict(row) for row in self.db.execute(f"SELECT * FROM {table} WHERE namespace_id=?", (namespace_id,))]
+            if table == "memory_embeddings":
+                for row in rows:
+                    row["vector"] = base64.b64encode(bytes(row["vector"])).decode("ascii")
+            result[table] = rows
         return result
 
     def import_namespace(self, document: dict[str, Any], namespace_id: str) -> dict[str, int]:
@@ -1191,9 +1208,12 @@ class Repository:
                     if not columns:
                         continue
                     placeholders = ",".join("?" for _ in columns)
+                    values = dict(row)
+                    if table == "memory_embeddings" and isinstance(values.get("vector"), str):
+                        values["vector"] = base64.b64decode(values["vector"], validate=True)
                     cursor = self.db.execute(
                         f"INSERT OR IGNORE INTO {table} ({','.join(columns)}) VALUES ({placeholders})",
-                        tuple(row[column] for column in columns),
+                        tuple(values[column] for column in columns),
                     )
                     inserted += cursor.rowcount
                 counts[table] = inserted
@@ -1217,10 +1237,10 @@ class Repository:
                 (row["id"], namespace_id, row["statement"], row["evidence_excerpt"]),
             )
             self.db.execute(
-                "INSERT INTO memory_embeddings(memory_version_id, namespace_id, provider, dimensions, vector_json) VALUES (?, ?, ?, ?, ?)",
+                "INSERT INTO memory_embeddings(memory_version_id, namespace_id, provider, dimensions, vector) VALUES (?, ?, ?, ?, ?)",
                 (
                     row["id"], namespace_id, self.embedding.name, self.embedding.dimensions,
-                    json.dumps(vector, separators=(",", ":")),
+                    pack_embedding(vector),
                 ),
             )
 

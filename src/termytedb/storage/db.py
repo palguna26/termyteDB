@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 import sqlite3
+import struct
 import threading
 from pathlib import Path
 from typing import Any
@@ -347,7 +349,27 @@ MIGRATIONS: tuple[str, ...] = (
     ALTER TABLE processing_jobs ADD COLUMN lease_token TEXT;
     CREATE INDEX jobs_lease_owner_idx ON processing_jobs(namespace_id, id, status, lease_token, lease_until);
     """,
+    """
+    CREATE TABLE memory_embeddings_binary (
+      memory_version_id TEXT PRIMARY KEY REFERENCES memory_versions(id),
+      namespace_id TEXT NOT NULL REFERENCES namespaces(id),
+      provider TEXT NOT NULL,
+      dimensions INTEGER NOT NULL,
+      vector BLOB NOT NULL
+    );
+    INSERT INTO memory_embeddings_binary(memory_version_id, namespace_id, provider, dimensions, vector)
+    SELECT memory_version_id, namespace_id, provider, dimensions, vector_json_to_blob(vector_json)
+    FROM memory_embeddings;
+    DROP TABLE memory_embeddings;
+    ALTER TABLE memory_embeddings_binary RENAME TO memory_embeddings;
+    CREATE INDEX memory_embeddings_namespace_idx ON memory_embeddings(namespace_id);
+    """,
 )
+
+
+def _vector_json_to_blob(value: str) -> bytes:
+    values = [float(item) for item in json.loads(value)]
+    return struct.pack(f"<{len(values)}f", *values)
 
 
 class Database:
@@ -356,6 +378,7 @@ class Database:
         self.lock = threading.RLock()
         self.connection = sqlite3.connect(self.path, check_same_thread=False, timeout=30)
         self.connection.row_factory = sqlite3.Row
+        self.connection.create_function("vector_json_to_blob", 1, _vector_json_to_blob, deterministic=True)
         self.connection.execute("PRAGMA foreign_keys = ON")
         self.connection.execute("PRAGMA secure_delete = ON")
         self.connection.execute("PRAGMA journal_mode = WAL")

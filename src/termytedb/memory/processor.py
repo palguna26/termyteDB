@@ -41,11 +41,12 @@ class Processor:
                 if not self.repository.heartbeat_job(namespace_id, job["id"], lease_seconds, str(job["lease_token"])):
                     raise RuntimeError("job lease is no longer active")
                 payload = json.loads(event["payload_json"])
-                source = payload_text(payload)
+                extraction_payload = {**payload, "__termytedb_event_type": event["type"]}
+                source = payload_text(extraction_payload)
                 event_id = uuid.UUID(event["id"])
                 included = {event_id: source}
                 if self.provider is None:
-                    raw_candidates = [rule_candidate_to_contract(item, event_id, source) for item in extract(payload)]
+                    raw_candidates = [rule_candidate_to_contract(item, event_id, source) for item in extract(extraction_payload)]
                     response = ExtractionResponse(schema_version="extraction-v1", prompt_version="rule-v1", candidates=raw_candidates)
                     provider_name, model_name, input_tokens, output_tokens = "rule", "rule-v1", None, None
                     provider_latency = 0

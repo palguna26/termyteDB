@@ -1,4 +1,5 @@
 from termytedb import TermyteDB
+from termytedb.retrieval.embedding import batch_dot, pack_embedding
 
 
 class ConstantEmbedding:
@@ -15,5 +16,17 @@ def test_embedding_provider_is_injectable_and_persisted(tmp_path):
     db.process("embedding")
     row = db.database.execute("SELECT provider, dimensions FROM memory_embeddings WHERE namespace_id='embedding'").fetchone()
     assert tuple(row) == ("test-constant-v1", 2)
+    columns = {item["name"]: item["type"] for item in db.database.execute("PRAGMA table_info(memory_embeddings)")}
+    assert columns["vector"] == "BLOB"
+    assert "vector_json" not in columns
+    vector = db.database.execute("SELECT vector FROM memory_embeddings WHERE namespace_id='embedding'").fetchone()[0]
+    assert isinstance(vector, bytes)
+    assert len(vector) == 2 * 4
     assert db.search("embedding", "target")
     db.close()
+
+
+def test_binary_embedding_batch_dot_product():
+    vectors = [pack_embedding([1.0, 0.0]), pack_embedding([0.0, 1.0])]
+    scores = batch_dot([1.0, 0.0], vectors, 2)
+    assert scores.tolist() == [1.0, 0.0]

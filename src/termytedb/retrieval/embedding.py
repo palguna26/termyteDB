@@ -7,6 +7,9 @@ from typing import Protocol
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
+import numpy as np
+import numpy.typing as npt
+
 
 class EmbeddingProvider(Protocol):
     name: str
@@ -102,4 +105,26 @@ class OpenAICompatibleEmbeddingProvider:
         raise RuntimeError("embedding provider request failed") from last_error
 
 def cosine(left: list[float], right: list[float]) -> float:
-    return max(0.0, min(1.0, sum(a * b for a, b in zip(left, right, strict=True))))
+    if len(left) != len(right):
+        raise ValueError("embedding dimensions do not match")
+    score = float(np.dot(np.asarray(left, dtype=np.float32), np.asarray(right, dtype=np.float32)))
+    return max(0.0, min(1.0, score))
+
+
+def pack_embedding(vector: list[float]) -> bytes:
+    """Serialize one embedding as compact little-endian float32 bytes."""
+    return np.asarray(vector, dtype="<f4").tobytes()
+
+
+def batch_dot(query: list[float], vectors: list[bytes], dimensions: int) -> npt.NDArray[np.float32]:
+    """Score fixed-width float32 vector buffers in one NumPy operation."""
+    if not vectors:
+        return np.empty(0, dtype=np.float32)
+    query_array = np.asarray(query, dtype=np.float32)
+    if query_array.size != dimensions:
+        raise ValueError("query embedding dimensions do not match stored vectors")
+    expected_bytes = dimensions * np.dtype("<f4").itemsize
+    if any(len(vector) != expected_bytes for vector in vectors):
+        raise ValueError("stored embedding BLOB has an invalid size")
+    matrix = np.frombuffer(b"".join(vectors), dtype="<f4").reshape(len(vectors), dimensions)
+    return np.clip(matrix @ query_array, 0.0, 1.0)

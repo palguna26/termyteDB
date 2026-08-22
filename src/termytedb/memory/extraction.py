@@ -96,7 +96,7 @@ def rule_candidate_to_contract(candidate: RuleCandidate, event_id: UUID, source:
 
 
 def event_texts(event: Any) -> dict[UUID, str]:
-    return {UUID(event["id"]): payload_text(__import__("json").loads(event["payload_json"]))}
+    return {UUID(event["id"]): payload_text(__import__("json").loads(event["payload_json"]), event["type"])}
 
 
 def utc(value: datetime | None) -> str | None:
