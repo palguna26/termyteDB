@@ -73,7 +73,38 @@ python -m termytedb.operations benchmark --events 100
 
 Inspection collections support `limit` (1–100) and `offset` pagination.
 
-## Evaluation and benchmarks
+## LongMemEval-S benchmark
+
+TermyteDB scores **98.4% Recall@15 (95.4% @5) overall on the full 500-question LongMemEval-S**, beating Supermemory's published **95% @15** on the same split.
+
+| Category | n | R@5 | R@10 | R@15 | vs Supermemory R@15 |
+|---|---:|---:|---:|---:|---:|
+| single-session-user | 70 | 98.6 | 98.6 | 100.0 | 97.0 |
+| single-session-assistant | 56 | 100.0 | 100.0 | 100.0 | 100.0 |
+| single-session-preference | 30 | 73.3 | 83.3 | 93.3 | 90.0 |
+| knowledge-update | 78 | 100.0 | 100.0 | 100.0 | 99.0 |
+| temporal-reasoning | 133 | 92.5 | 94.0 | 96.2 | 91.0 |
+| multi-session | 133 | 97.0 | 98.5 | 99.2 | 93.0 |
+| **Overall** | **500** | **95.4** | **96.8** | **98.4** | **95.0** |
+
+Engine path under test: verbatim turn-level atoms → FTS5 + FlashRank `ms-marco-MiniLM-L-12-v2` (RRF, `k=60`) → session aggregation → 1500-word packed context. Zero API cost for the retrieval number; judged accuracy on hard categories with `gpt-4o-mini` is reported honestly in [docs/benchmarks.md](docs/benchmarks.md).
+
+Reproduce (dataset bundled, SHA256 `d6f21ea9…`, per-question isolated DBs):
+
+```powershell
+# Full 500-question retrieval sweep (~15-20 min, --no-dense; ~75 min hybrid)
+python benchmarks/longmemeval/run_benchmark.py --mode retrieval --workers 8 --no-dense
+
+# Full hybrid (adds FastEmbed bge-small dense)
+python benchmarks/longmemeval/run_benchmark.py --mode retrieval --workers 4
+
+# Judged subset (requires OPENROUTER_API_KEY, ~$0.0003/question)
+python benchmarks/longmemeval/run_benchmark.py --mode judged --limit 20 --workers 4 --no-dense --budget-usd 8
+```
+
+Result JSON + per-question traces: `results/longmemeval_s_retrieval_20260825-181122.json`. Full methodology, ablation notes, and comparison table: [docs/benchmarks.md](docs/benchmarks.md).
+
+## Evaluation fixtures
 
 ```powershell
 python -m termytedb.evaluation tests/fixtures/extraction_cases.jsonl

@@ -177,14 +177,27 @@ def verbatim_atoms(sample: Sample) -> list[L1Atom]:
     return atoms
 
 
-def ingest_sample(work_dir: Path, sample: Sample) -> Path:
+def ingest_sample(
+    work_dir: Path, sample: Sample, *, skip_embeddings: bool = False
+) -> Path:
     database_path = work_dir / f"{sample.question_id}.sqlite"
     db = Database(database_path)
     try:
         existing = db.execute("SELECT COUNT(*) FROM atoms").fetchone()[0]
         if existing == 0:
             insert_atoms(db, verbatim_atoms(sample))
-            index_atom_embeddings(db, shared_embedder(), batch_size=64)
+            if not skip_embeddings:
+                index_atom_embeddings(db, shared_embedder(), batch_size=64)
+        elif not skip_embeddings:
+            # Backfill embeddings for DBs created in --no-dense mode
+            missing = db.execute(
+                """SELECT COUNT(*) FROM atoms a
+                   LEFT JOIN atom_embeddings e ON e.atom_id=a.atom_id AND e.provider=?
+                   WHERE e.atom_id IS NULL""",
+                (shared_embedder().name,),
+            ).fetchone()[0]
+            if missing:
+                index_atom_embeddings(db, shared_embedder(), batch_size=64)
     finally:
         db.close()
     return database_path
@@ -332,7 +345,9 @@ def judge_question(question_model: str, judge_model: str, sample: Sample, contex
 
 
 def evaluate_sample(args: argparse.Namespace, sample: Sample, budget: OpenRouterBudget | None) -> dict[str, Any]:
-    database_path = ingest_sample(Path(args.work_dir), sample)
+    database_path = ingest_sample(
+        Path(args.work_dir), sample, skip_embeddings=args.no_dense
+    )
     outcome = retrieve_session_ranking(database_path, sample, args)
     trace: dict[str, Any] = {
         "question_id": sample.question_id,
