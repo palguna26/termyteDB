@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -11,6 +12,18 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 from ..api.schemas import ExtractionRequest, ExtractionResponse
+
+
+def clean_json_response(value: str) -> str:
+    """Remove common markdown/preamble noise before schema validation."""
+    cleaned = str(value or "").strip()
+    cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\s*```$", "", cleaned).strip()
+    start = cleaned.find("{")
+    end = cleaned.rfind("}")
+    if start >= 0 and end > start:
+        cleaned = cleaned[start : end + 1]
+    return cleaned
 
 
 def build_extraction_prompt(request: ExtractionRequest) -> str:
@@ -213,8 +226,10 @@ class OpenRouterExtractionProvider:
             payload = json.loads(raw_bytes.decode("utf-8"))
             choice = payload["choices"][0]["message"]["content"]
             if isinstance(choice, list):
-                choice = "".join(str(part.get("text", "")) for part in choice if isinstance(part, dict))
-            parsed = ExtractionResponse.model_validate(json.loads(choice))
+                choice = "".join(str(part.get("text") or "") for part in choice if isinstance(part, dict))
+            if not isinstance(choice, str) or not choice.strip():
+                raise ProviderError("OpenRouter returned empty extraction content", retryable=True, error_class="empty_output")
+            parsed = ExtractionResponse.model_validate(json.loads(clean_json_response(choice)))
         except (UnicodeError, json.JSONDecodeError, KeyError, IndexError, TypeError, ValueError) as exc:
             raise ProviderError("OpenRouter returned invalid extraction-v1 JSON", retryable=False, error_class="invalid_output") from exc
         actual_model = str(payload.get("model", self.model))

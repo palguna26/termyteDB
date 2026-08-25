@@ -115,6 +115,15 @@ class TermyteDBClient:
     def metrics(self, namespace_id: str) -> Any:
         return self.request("GET", "/v1/metrics", query={"namespace_id": namespace_id})
 
+    def encoding_decisions(self, namespace_id: str, *, limit: int = 100, offset: int = 0) -> Any:
+        return self.request("GET", "/v1/encoding/decisions", query={"namespace_id": namespace_id, "limit": limit, "offset": offset})
+
+    def consolidate(self, namespace_id: str, *, limit: int = 5, dry_run: bool = True) -> Any:
+        return self.request("POST", "/v1/consolidate", query={"namespace_id": namespace_id, "limit": limit, "dry_run": str(dry_run).lower()})
+
+    def procedures(self, namespace_id: str, goal: str, *, environment: str = "*", limit: int = 5) -> Any:
+        return self.request("GET", "/v1/procedures", query={"namespace_id": namespace_id, "goal": goal, "environment": environment, "limit": limit})
+
     def integrity(self) -> Any:
         return self.request("GET", "/v1/integrity")
 

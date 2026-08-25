@@ -17,6 +17,7 @@ from ..api.schemas import (
 )
 from ..core.logging import get_logger, log
 from ..core.redaction import redact
+from ..memory.consolidator import consolidate
 from ..memory.processor import Processor
 from ..memory.provider import ExtractionProvider
 from ..retrieval.context import build_context
@@ -129,11 +130,33 @@ class TermyteDB:
     def metrics(self, namespace_id: str) -> dict[str, float | int]:
         return self.repository.metrics(namespace_id)
 
-    def process(self, namespace_id: str, limit: int = 100, lease_seconds: int = 30) -> ProcessResponse:
+    def encoding_decisions(self, namespace_id: str, limit: int = 100, offset: int = 0) -> list[dict[str, Any]]:
+        return self.repository.encoding_decisions(namespace_id, limit, offset)
+
+    def consolidate(self, namespace_id: str, *, limit: int = 5, dry_run: bool = True) -> dict[str, Any]:
+        return consolidate(self.repository, namespace_id, limit=limit, mode="dry-run" if dry_run else "apply")
+
+    def procedures(self, namespace_id: str, goal: str, environment: str, limit: int = 5) -> list[dict[str, Any]]:
+        return self.repository.retrieve_procedure(namespace_id, goal, environment, limit)
+
+    def save_procedure(
+        self, namespace_id: str, goal: str, environment: str, preconditions: list[str], actions: list[str],
+        expected_outcome: str, observed_outcome: str | None, failures: list[str], success: bool,
+        evidence: list[tuple[str, str]],
+    ) -> str:
+        return self.repository.upsert_procedure(
+            namespace_id, goal, environment, preconditions, actions, expected_outcome,
+            observed_outcome, failures, success, evidence,
+        )
+
+    def refresh_accessibility(self, namespace_id: str) -> int:
+        return self.repository.accessibility(namespace_id)
+
+    def process(self, namespace_id: str, limit: int = 100, lease_seconds: int = 180) -> ProcessResponse:
         processed, failed, dead, accepted, rejected = self.processor.process_namespace(namespace_id, limit, lease_seconds)
         return ProcessResponse(processed=processed, failed=failed, dead_lettered=dead, accepted=accepted, rejected=rejected)
 
-    def process_with_timeout(self, namespace_id: str, limit: int = 100, lease_seconds: int = 30, timeout_seconds: float = 30.0) -> ProcessResponse:
+    def process_with_timeout(self, namespace_id: str, limit: int = 100, lease_seconds: int = 180, timeout_seconds: float = 30.0) -> ProcessResponse:
         processed, failed, dead, accepted, rejected = self.processor.process_namespace(namespace_id, limit, lease_seconds, timeout_seconds)
         return ProcessResponse(processed=processed, failed=failed, dead_lettered=dead, accepted=accepted, rejected=rejected)
 

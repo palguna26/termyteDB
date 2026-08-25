@@ -364,6 +364,90 @@ MIGRATIONS: tuple[str, ...] = (
     ALTER TABLE memory_embeddings_binary RENAME TO memory_embeddings;
     CREATE INDEX memory_embeddings_namespace_idx ON memory_embeddings(namespace_id);
     """,
+    """
+    ALTER TABLE events ADD COLUMN episode_id TEXT;
+    ALTER TABLE events ADD COLUMN observation_hash TEXT;
+    ALTER TABLE events ADD COLUMN sequence_number INTEGER;
+    ALTER TABLE events ADD COLUMN importance_score REAL NOT NULL DEFAULT 0.5;
+    ALTER TABLE events ADD COLUMN encoding_reason TEXT;
+    CREATE INDEX events_episode_order_idx ON events(namespace_id, episode_id, sequence_number);
+    ALTER TABLE memories ADD COLUMN accessibility REAL NOT NULL DEFAULT 1.0;
+    ALTER TABLE memories ADD COLUMN last_accessed_at TEXT;
+    ALTER TABLE memories ADD COLUMN access_count INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE memories ADD COLUMN retrieval_success_count INTEGER NOT NULL DEFAULT 0;
+    CREATE TABLE encoding_decisions (
+      id TEXT PRIMARY KEY,
+      namespace_id TEXT NOT NULL REFERENCES namespaces(id),
+      event_id TEXT NOT NULL REFERENCES events(id),
+      importance_score REAL NOT NULL,
+      novelty REAL NOT NULL,
+      surprise REAL NOT NULL,
+      task_relevance REAL NOT NULL,
+      repetition REAL NOT NULL,
+      outcome_signal REAL NOT NULL,
+      correction_signal REAL NOT NULL,
+      future_use REAL NOT NULL,
+      privacy_penalty REAL NOT NULL,
+      reason TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      UNIQUE(namespace_id, event_id)
+    );
+    CREATE TABLE consolidation_runs (
+      id TEXT PRIMARY KEY,
+      namespace_id TEXT NOT NULL REFERENCES namespaces(id),
+      mode TEXT NOT NULL,
+      status TEXT NOT NULL,
+      input_episode_ids_json TEXT NOT NULL,
+      started_at TEXT NOT NULL,
+      completed_at TEXT,
+      proposal_count INTEGER NOT NULL DEFAULT 0,
+      accepted_count INTEGER NOT NULL DEFAULT 0,
+      rejected_count INTEGER NOT NULL DEFAULT 0,
+      error TEXT
+    );
+    CREATE TABLE consolidation_proposals (
+      id TEXT PRIMARY KEY,
+      run_id TEXT NOT NULL REFERENCES consolidation_runs(id),
+      namespace_id TEXT NOT NULL REFERENCES namespaces(id),
+      proposal_hash TEXT NOT NULL,
+      kind TEXT NOT NULL,
+      subject_key TEXT NOT NULL,
+      statement TEXT NOT NULL,
+      evidence_event_ids_json TEXT NOT NULL,
+      status TEXT NOT NULL,
+      reason TEXT,
+      memory_id TEXT,
+      memory_version_id TEXT,
+      created_at TEXT NOT NULL,
+      UNIQUE(namespace_id, proposal_hash)
+    );
+    CREATE TABLE procedures (
+      id TEXT PRIMARY KEY,
+      namespace_id TEXT NOT NULL REFERENCES namespaces(id),
+      goal TEXT NOT NULL,
+      environment TEXT NOT NULL,
+      preconditions_json TEXT NOT NULL,
+      actions_json TEXT NOT NULL,
+      expected_outcome TEXT NOT NULL,
+      observed_outcome TEXT,
+      failures_json TEXT NOT NULL,
+      success_count INTEGER NOT NULL DEFAULT 0,
+      verification_at TEXT,
+      confidence REAL NOT NULL DEFAULT 0.5,
+      accessibility REAL NOT NULL DEFAULT 1.0,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      UNIQUE(namespace_id, goal, environment)
+    );
+    CREATE TABLE procedure_evidence (
+      procedure_id TEXT NOT NULL REFERENCES procedures(id) ON DELETE CASCADE,
+      namespace_id TEXT NOT NULL REFERENCES namespaces(id),
+      event_id TEXT NOT NULL REFERENCES events(id),
+      excerpt TEXT NOT NULL,
+      PRIMARY KEY(procedure_id, event_id)
+    );
+    CREATE INDEX procedures_lookup_idx ON procedures(namespace_id, environment, accessibility, confidence);
+    """,
 )
 
 

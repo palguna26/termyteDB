@@ -15,6 +15,22 @@ mypy src
 
 Local operation uses SQLite, WAL, FTS5, and the deterministic rule path. It needs no account or network.
 
+## Memory loop
+
+The memory layer adds explainable observation encoding, episode ordering, replay
+consolidation, adaptive accessibility, and procedure retrieval. It is available
+through the embedded API and a zero-key local CLI:
+
+```powershell
+termytedb init --database .\memory.sqlite --namespace demo
+termytedb status --database .\memory.sqlite --namespace demo
+termytedb context "continue the authentication work" --database .\memory.sqlite --namespace demo
+termytedb consolidate --dry-run --database .\memory.sqlite --namespace demo
+```
+
+`termytedb connect claude-code` and `termytedb connect codex` currently register the
+local event-capture adapter boundary. They do not require provider keys.
+
 ## Embedded Python
 
 ```python

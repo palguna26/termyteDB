@@ -24,7 +24,7 @@ class Processor:
         self.logger = logger
         self.provider = provider
 
-    def process_namespace(self, namespace_id: str, limit: int = 100, lease_seconds: int = 30, timeout_seconds: float = 30.0) -> tuple[int, int, int, int, int]:
+    def process_namespace(self, namespace_id: str, limit: int = 100, lease_seconds: int = 180, timeout_seconds: float = 30.0) -> tuple[int, int, int, int, int]:
         deadline = time.perf_counter() + timeout_seconds
         jobs = self.repository.claim_jobs(namespace_id, limit, lease_seconds)
         processed = failed = dead = accepted = rejected = 0
@@ -61,11 +61,15 @@ class Processor:
                         existing_memories=existing_memories,
                     )
                     remaining = max(0.001, deadline - time.perf_counter())
+                    if not self.repository.heartbeat_job(namespace_id, job["id"], lease_seconds, str(job["lease_token"])):
+                        raise RuntimeError("job lease is no longer active")
                     provider_result = self.provider.extract(
                         request,
                         timeout_seconds=remaining,
                         cancellation=lambda: time.perf_counter() >= deadline,
                     )
+                    if not self.repository.heartbeat_job(namespace_id, job["id"], lease_seconds, str(job["lease_token"])):
+                        raise RuntimeError("job lease is no longer active")
                     response = provider_result.response
                     resolved_candidates = []
                     for candidate in response.candidates:

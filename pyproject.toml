@@ -17,6 +17,9 @@ dependencies = [
   "uvicorn>=0.30,<1",
 ]
 
+[project.scripts]
+termytedb = "termytedb.cli:main"
+
 [project.optional-dependencies]
 tokenizer = [
   "tiktoken>=0.7,<1",

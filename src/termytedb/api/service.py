@@ -174,6 +174,23 @@ def create_app(
         require_namespace(namespace_id)
         return engine.extraction_decisions(namespace_id, limit, offset)
 
+    @app.get("/v1/encoding/decisions")
+    def encoding_decisions(namespace_id: str = Query(...), limit: int = Query(100, ge=1, le=100), offset: int = Query(0, ge=0)) -> list[dict[str, object]]:
+        require_namespace(namespace_id)
+        return engine.encoding_decisions(namespace_id, limit, offset)
+
+    @app.post("/v1/consolidate")
+    def consolidate(namespace_id: str = Query(...), limit: int = Query(5, ge=1, le=100), dry_run: bool = Query(True)) -> dict[str, object]:
+        require_namespace(namespace_id)
+        return engine.consolidate(namespace_id, limit=limit, dry_run=dry_run)
+
+    @app.get("/v1/procedures")
+    def procedures(
+        namespace_id: str = Query(...), goal: str = Query(..., min_length=1), environment: str = Query("*"), limit: int = Query(5, ge=1, le=20)
+    ) -> list[dict[str, object]]:
+        require_namespace(namespace_id)
+        return engine.procedures(namespace_id, goal, environment, limit)
+
     @app.get("/v1/memories", response_model=list[MemoryResponse])
     def memories(namespace_id: str = Query(...), limit: int = Query(100, ge=1, le=100), offset: int = Query(0, ge=0)) -> list[MemoryResponse]:
         require_namespace(namespace_id)

@@ -12,8 +12,9 @@ from typing import Any, cast
 from ..api.schemas import EventInput, EvidenceCitation, ExtractionCandidate, MemoryResponse, SearchResult
 from ..core.errors import IdempotencyConflict
 from ..core.redaction import redact_text
+from ..memory.encoding import score_observation
 from ..memory.extraction import CandidateRejected, ValidatedCandidate
-from ..memory.extractor import Candidate
+from ..memory.extractor import Candidate, payload_text
 from ..retrieval.embedding import EmbeddingProvider, FastEmbedProvider, batch_dot, pack_embedding
 from .db import Database
 
@@ -99,6 +100,12 @@ class Repository:
             payload_json = json.dumps(redacted_payload, sort_keys=True, separators=(",", ":"))
             content_hash = hash_text(canonical_event_content(event, redacted_payload))
             occurred = iso(event.occurred_at)
+            observation_text = payload_text({**redacted_payload, "__termytedb_event_type": event.type})
+            prior_count = int(self.db.execute(
+                "SELECT COUNT(*) FROM events WHERE namespace_id=? AND stream_id IS ? AND payload_json LIKE ?",
+                (namespace_id, event.stream_id, f"%{observation_text[:80]}%"),
+            ).fetchone()[0]) if observation_text else 0
+            encoding = score_observation(observation_text, repeated=min(1.0, prior_count / 3))
             job_id = str(uuid.uuid4())
             with self.db.connection:
                 existing = self.db.execute(
@@ -118,9 +125,8 @@ class Repository:
                 self.db.execute(
                     """INSERT INTO events
                     (id, namespace_id, protocol_version, stream_id, actor_id, agent_id, session_id, source_id, idempotency_hash, type, occurred_at,
-                     payload_json,
-                     content_hash, redaction_state, created_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'redacted', ?)""",
+                     payload_json, content_hash, redaction_state, created_at, observation_hash, importance_score, encoding_reason)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'redacted', ?, ?, ?, ?)""",
                     (
                         event_id,
                         namespace_id,
@@ -135,7 +141,7 @@ class Repository:
                         occurred,
                         payload_json,
                         content_hash,
-                        iso(),
+                        iso(), content_hash, encoding.importance_score, encoding.reason,
                     ),
                 )
                 for artifact in event.artifacts:
@@ -155,7 +161,21 @@ class Repository:
                     VALUES (?, ?, ?, ?, 'pending', ?, ?)""",
                     (job_id, namespace_id, event_id, content_hash, iso(), iso()),
                 )
-                self._assign_episode(namespace_id, event_id, event.stream_id, occurred)
+                episode_id = self._assign_episode(namespace_id, event_id, event.stream_id, occurred)
+                ordinal = int(self.db.execute("SELECT ordinal FROM episode_events WHERE episode_id=? AND event_id=?", (episode_id, event_id)).fetchone()[0])
+                self.db.execute(
+                    "UPDATE events SET episode_id=?, sequence_number=? WHERE id=? AND namespace_id=?",
+                    (episode_id, ordinal, event_id, namespace_id),
+                )
+                self.db.execute(
+                    """INSERT INTO encoding_decisions
+                    (id, namespace_id, event_id, importance_score, novelty, surprise, task_relevance,
+                     repetition, outcome_signal, correction_signal, future_use, privacy_penalty, reason, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (str(uuid.uuid4()), namespace_id, event_id, encoding.importance_score, encoding.novelty,
+                     encoding.surprise, encoding.task_relevance, encoding.repetition, encoding.outcome_signal,
+                     encoding.correction_signal, encoding.future_use, encoding.privacy_penalty, encoding.reason, iso()),
+                )
             return event_id, False, content_hash, job_id
 
     def _assign_episode(self, namespace_id: str, event_id: str, stream_id: str | None, occurred: str) -> str:
@@ -358,7 +378,7 @@ class Repository:
             result.append(item)
         return result
 
-    def claim_jobs(self, namespace_id: str, limit: int, lease_seconds: int) -> list[sqlite3.Row]:
+    def claim_jobs(self, namespace_id: str, limit: int, lease_seconds: int = 180) -> list[sqlite3.Row]:
         # SQLite computes the lease consistently and avoids client clock formatting issues.
         with self.db.lock:
             try:
@@ -906,7 +926,8 @@ class Repository:
             """SELECT e.memory_version_id, e.vector
             FROM memory_embeddings e JOIN memory_versions v ON v.id=e.memory_version_id AND v.namespace_id=e.namespace_id
             JOIN memories m ON m.id=v.memory_id AND m.namespace_id=v.namespace_id
-            WHERE e.namespace_id=? AND e.provider=? AND e.dimensions=? AND (? OR (v.status='active' AND m.status='active' AND v.valid_to IS NULL
+            WHERE e.namespace_id=? AND e.provider=? AND e.dimensions=? AND (? OR (v.status='active' AND m.status='active'
+              AND m.accessibility >= 0.05 AND v.valid_to IS NULL
               AND (v.valid_from IS NULL OR julianday(v.valid_from) <= julianday('now'))
               AND (v.valid_until IS NULL OR julianday(v.valid_until) > julianday('now'))))""",
             (namespace_id, self.embedding.name, self.embedding.dimensions, historical),
@@ -935,7 +956,8 @@ class Repository:
         rows = self.db.execute(
             f"""SELECT m.id, m.kind, m.confidence, m.importance, v.id AS version_id, v.statement, v.status
             FROM memory_versions v JOIN memories m ON m.id=v.memory_id AND m.namespace_id=?
-            WHERE v.namespace_id=? AND v.id IN ({placeholders}) AND (? OR (v.status='active' AND m.status='active' AND v.valid_to IS NULL
+            WHERE v.namespace_id=? AND v.id IN ({placeholders}) AND (? OR (v.status='active' AND m.status='active'
+              AND m.accessibility >= 0.05 AND v.valid_to IS NULL
               AND (v.valid_from IS NULL OR julianday(v.valid_from) <= julianday('now'))
               AND (v.valid_until IS NULL OR julianday(v.valid_until) > julianday('now'))))""",
             (namespace_id, namespace_id, *candidate_ids, historical),
@@ -982,6 +1004,7 @@ class Repository:
                     citations=citations,
                 )
             )
+        self.record_retrieval(namespace_id, [str(item.memory_id) for item in results])
         return results
 
     def _citations(self, namespace_id: str, version_id: str) -> list[EvidenceCitation]:
@@ -1004,6 +1027,149 @@ class Repository:
 
     def memory_count(self, namespace_id: str) -> int:
         return int(self.db.execute("SELECT COUNT(*) FROM memories WHERE namespace_id=?", (namespace_id,)).fetchone()[0])
+
+    def encoding_decisions(self, namespace_id: str, limit: int = 100, offset: int = 0) -> list[dict[str, Any]]:
+        rows = self.db.execute(
+            "SELECT * FROM encoding_decisions WHERE namespace_id=? ORDER BY created_at, id LIMIT ? OFFSET ?",
+            (namespace_id, limit, offset),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def record_retrieval(self, namespace_id: str, memory_ids: list[str], *, successful: bool = False) -> None:
+        if not memory_ids:
+            return
+        placeholders = ",".join("?" for _ in memory_ids)
+        with self.db.connection:
+            self.db.execute(
+                f"""UPDATE memories SET last_accessed_at=?, access_count=access_count+1,
+                retrieval_success_count=retrieval_success_count+? WHERE namespace_id=? AND id IN ({placeholders})""",
+                (iso(), int(successful), namespace_id, *memory_ids),
+            )
+
+    def accessibility(self, namespace_id: str, *, now: datetime | None = None) -> int:
+        """Recalculate access probability without deleting historical evidence."""
+        current = now or datetime.now(UTC)
+        rows = self.db.execute(
+            "SELECT id, confidence, importance, last_accessed_at, access_count, retrieval_success_count, status FROM memories WHERE namespace_id=?",
+            (namespace_id,),
+        ).fetchall()
+        changed = 0
+        with self.db.lock, self.db.connection:
+            for row in rows:
+                if row["status"] in {"deleted", "invalidated"}:
+                    score = 0.0
+                else:
+                    age_days = 365.0
+                    if row["last_accessed_at"]:
+                        try:
+                            age_days = max(0.0, (current - datetime.fromisoformat(row["last_accessed_at"])).total_seconds() / 86400)
+                        except ValueError:
+                            pass
+                    recency = max(0.0, min(1.0, 1.0 - age_days / 90.0))
+                    success = min(1.0, float(row["retrieval_success_count"]) / max(1.0, float(row["access_count"]))) if row["access_count"] else 0.0
+                    score = min(1.0, max(0.05, 0.30 * float(row["confidence"]) + 0.30 * float(row["importance"]) + 0.25 * recency + 0.15 * success))
+                self.db.execute("UPDATE memories SET accessibility=? WHERE id=? AND namespace_id=?", (score, row["id"], namespace_id))
+                changed += 1
+        return changed
+
+    def create_consolidation_run(self, namespace_id: str, episode_ids: list[str], mode: str = "dry-run") -> str:
+        run_id = str(uuid.uuid4())
+        with self.db.connection:
+            self.db.execute(
+                """INSERT INTO consolidation_runs(id, namespace_id, mode, status, input_episode_ids_json, started_at)
+                VALUES (?, ?, ?, 'processing', ?, ?)""",
+                (run_id, namespace_id, mode, json.dumps(episode_ids, separators=(",", ":")), iso()),
+            )
+        return run_id
+
+    def record_consolidation_proposal(
+        self, namespace_id: str, run_id: str, kind: str, subject_key: str, statement: str,
+        evidence_event_ids: list[str], status: str, reason: str | None = None,
+        memory_id: str | None = None, memory_version_id: str | None = None,
+    ) -> str:
+        proposal_hash = hash_text(json.dumps(
+            {"kind": kind, "subject": subject_key, "statement": statement, "evidence": sorted(evidence_event_ids)}, sort_keys=True,
+        ))
+        proposal_id = str(uuid.uuid4())
+        with self.db.connection:
+            self.db.execute(
+                """INSERT INTO consolidation_proposals
+                (id, run_id, namespace_id, proposal_hash, kind, subject_key, statement, evidence_event_ids_json,
+                 status, reason, memory_id, memory_version_id, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(namespace_id, proposal_hash) DO UPDATE SET
+                  run_id=excluded.run_id,
+                  status=CASE WHEN consolidation_proposals.status='accepted' THEN consolidation_proposals.status ELSE excluded.status END,
+                  reason=excluded.reason,
+                  memory_id=COALESCE(excluded.memory_id, consolidation_proposals.memory_id),
+                  memory_version_id=COALESCE(excluded.memory_version_id, consolidation_proposals.memory_version_id)""",
+                (proposal_id, run_id, namespace_id, proposal_hash, kind, subject_key, redact_text(statement),
+                 json.dumps(evidence_event_ids, separators=(",", ":")), status, redact_text(reason) if reason else None,
+                 memory_id, memory_version_id, iso()),
+            )
+        return proposal_id
+
+    def finish_consolidation_run(self, namespace_id: str, run_id: str, status: str, accepted: int, rejected: int, error: str | None = None) -> None:
+        with self.db.connection:
+            self.db.execute(
+                """UPDATE consolidation_runs SET status=?, completed_at=?, proposal_count=?, accepted_count=?, rejected_count=?, error=?
+                WHERE id=? AND namespace_id=?""",
+                (status, iso(), accepted + rejected, accepted, rejected, redact_text(error) if error else None, run_id, namespace_id),
+            )
+
+    def list_consolidation_runs(self, namespace_id: str, limit: int = 100) -> list[dict[str, Any]]:
+        rows = self.db.execute("SELECT * FROM consolidation_runs WHERE namespace_id=? ORDER BY started_at DESC LIMIT ?", (namespace_id, limit)).fetchall()
+        return [dict(row) for row in rows]
+
+    def retrieve_procedure(self, namespace_id: str, goal: str, environment: str, limit: int = 5) -> list[dict[str, Any]]:
+        terms = [term for term in re.findall(r"[\w-]+", goal.casefold()) if len(term) > 2]
+        rows = self.db.execute(
+            """SELECT * FROM procedures WHERE namespace_id=? AND accessibility >= 0.15
+            AND (environment=? OR environment='*') ORDER BY confidence DESC, success_count DESC LIMIT ?""",
+            (namespace_id, environment, limit * 3),
+        ).fetchall()
+        ranked = sorted(
+            rows,
+            key=lambda row: (-sum(term in str(row["goal"]).casefold() for term in terms),
+                             -float(row["confidence"]), -int(row["success_count"]), row["id"]),
+        )
+        result = []
+        for row in ranked[:limit]:
+            item = dict(row)
+            for key in ("preconditions_json", "actions_json", "failures_json"):
+                item[key] = json.loads(item[key])
+            result.append(item)
+        return result
+
+    def upsert_procedure(self, namespace_id: str, goal: str, environment: str, preconditions: list[str], actions: list[str], expected_outcome: str,
+                         observed_outcome: str | None, failures: list[str], success: bool, evidence: list[tuple[str, str]]) -> str:
+        now = iso()
+        procedure_id = str(uuid.uuid4())
+        with self.db.lock, self.db.connection:
+            current = self.db.execute(
+                "SELECT * FROM procedures WHERE namespace_id=? AND goal=? AND environment=?",
+                (namespace_id, goal, environment),
+            ).fetchone()
+            if current:
+                procedure_id = str(current["id"])
+                self.db.execute(
+                    """UPDATE procedures SET preconditions_json=?, actions_json=?, expected_outcome=?, observed_outcome=?, failures_json=?,
+                    success_count=success_count+?, verification_at=?, confidence=?, updated_at=? WHERE id=? AND namespace_id=?""",
+                    (json.dumps(preconditions), json.dumps(actions), expected_outcome, observed_outcome, json.dumps(failures), int(success), now,
+                     min(1.0, float(current["confidence"]) + (0.1 if success else -0.05)), now, procedure_id, namespace_id),
+                )
+            else:
+                self.db.execute(
+                    """INSERT INTO procedures(id, namespace_id, goal, environment, preconditions_json, actions_json, expected_outcome,
+                    observed_outcome, failures_json, success_count, verification_at, confidence, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (procedure_id, namespace_id, goal, environment, json.dumps(preconditions), json.dumps(actions), expected_outcome, observed_outcome,
+                     json.dumps(failures), int(success), now, 0.7 if success else 0.4, now, now),
+                )
+            for event_id, excerpt in evidence:
+                self.db.execute("INSERT OR IGNORE INTO procedure_evidence(procedure_id, namespace_id, event_id, excerpt) VALUES (?, ?, ?, ?)",
+                                (procedure_id, namespace_id, event_id, redact_text(excerpt)))
+        return procedure_id
 
     def upsert_entity(self, namespace_id: str, canonical_key: str, label: str, entity_type: str = "unknown", confidence: float = 1.0) -> str:
         entity_id = str(uuid.uuid4())
@@ -1168,6 +1334,7 @@ class Repository:
         tables = (
             "namespaces", "events", "artifacts", "memories", "memory_versions", "evidence_refs", "processing_jobs", "context_requests",
             "extraction_runs", "extraction_decisions", "episodes", "episode_events", "memory_embeddings", "feedback",
+            "encoding_decisions", "consolidation_runs", "consolidation_proposals", "procedures", "procedure_evidence",
         )
         result: dict[str, Any] = {
             "namespaces": [dict(row) for row in self.db.execute("SELECT * FROM namespaces WHERE id=?", (namespace_id,))],
@@ -1191,6 +1358,7 @@ class Repository:
         ordered = (
             "namespaces", "events", "artifacts", "memories", "extraction_runs", "memory_versions", "processing_jobs", "context_requests",
             "evidence_refs", "extraction_decisions", "episodes", "episode_events", "memory_embeddings", "feedback",
+            "encoding_decisions", "consolidation_runs", "consolidation_proposals", "procedures", "procedure_evidence",
         )
         counts: dict[str, int] = {}
         with self.db.lock, self.db.connection:
@@ -1258,7 +1426,10 @@ class Repository:
             self.db.execute("DELETE FROM feedback WHERE namespace_id=?", (namespace_id,))
             self.db.execute("DELETE FROM context_requests WHERE namespace_id=?", (namespace_id,))
             self.db.execute("DELETE FROM artifacts WHERE namespace_id=?", (namespace_id,))
-            for table in ("evidence_refs", "memory_versions", "memories", "processing_jobs", "events"):
+            for table in (
+                "procedure_evidence", "procedures", "consolidation_proposals", "consolidation_runs",
+                "encoding_decisions", "evidence_refs", "memory_versions", "memories", "processing_jobs", "events",
+            ):
                 self.db.execute(f"DELETE FROM {table} WHERE namespace_id=?", (namespace_id,))
             self.db.execute("DELETE FROM namespaces WHERE id=?", (namespace_id,))
             return True

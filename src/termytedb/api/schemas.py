@@ -158,7 +158,7 @@ class ProcessRequest(BaseModel):
 
     namespace_id: str = Field(min_length=1)
     limit: int = Field(default=100, ge=1, le=1000)
-    lease_seconds: int = Field(default=30, ge=1, le=3600)
+    lease_seconds: int = Field(default=180, ge=1, le=3600)
     timeout_seconds: float = Field(default=30.0, gt=0, le=300)
 
 

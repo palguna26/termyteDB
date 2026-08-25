@@ -65,6 +65,25 @@ def test_unsupported_model_candidate_is_rejected_without_memory(tmp_path: Path):
     db.close()
 
 
+def test_model_paraphrase_with_supported_evidence_is_accepted(tmp_path: Path):
+    text = "I used to live in Paris."
+    db = model_db(
+        tmp_path,
+        text,
+        lambda event_id, end: ExtractionCandidate(
+            kind="fact",
+            subject="user",
+            statement="User lived in Paris.",
+            evidence=[EvidenceSpan(event_id=event_id, start_offset=0, end_offset=end, excerpt=text)],
+            confidence=0.9,
+            durability="session",
+        ),
+    )
+    assert db.process("model").accepted == 1
+    assert db.repository.memory_count("model") == 1
+    db.close()
+
+
 def test_candidate_support_can_be_combined_across_exact_evidence_spans(tmp_path: Path):
     text = "The service uses SQLite and it runs locally."
     db = model_db(

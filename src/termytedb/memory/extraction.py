@@ -67,17 +67,45 @@ def validate_candidate(
         if redact_text(actual) != actual:
             raise CandidateRejected("secret_in_evidence")
         evidence_excerpts.append(actual)
-    if not semantic_support(statement, " ".join(evidence_excerpts)):
+    if not semantic_support(statement, " ".join(evidence_excerpts), subject):
         raise CandidateRejected("unsupported_statement")
     normalized = candidate.model_copy(update={"subject": subject, "statement": statement})
     return ValidatedCandidate(normalized, candidate_fingerprint(normalized))
 
 
-def semantic_support(statement: str, excerpt: str) -> bool:
-    """Conservative deterministic verifier; model agreement is never authoritative."""
-    statement_terms = {term.casefold() for term in re.findall(r"[\w./:-]+", statement) if len(term) > 2}
-    excerpt_terms = {term.casefold() for term in re.findall(r"[\w./:-]+", excerpt)}
-    return bool(statement_terms) and len(statement_terms & excerpt_terms) == len(statement_terms)
+def semantic_support(statement: str, excerpt: str, subject: str = "") -> bool:
+    """Require most meaningful terms, while allowing normal LLM paraphrasing."""
+    statement_terms = _significant_terms(statement)
+    excerpt_terms = _significant_terms(excerpt)
+    if not statement_terms:
+        return False
+    overlap = len(statement_terms & excerpt_terms) / len(statement_terms)
+    if overlap >= 0.60:
+        return True
+    subject_terms = _significant_terms(subject)
+    predicate_terms = statement_terms - subject_terms
+    return bool(subject_terms and predicate_terms and subject_terms <= excerpt_terms and predicate_terms & excerpt_terms)
+
+
+_STOP_WORDS = {
+    "a", "an", "and", "are", "as", "at", "be", "by", "for", "from", "in", "is", "it", "of", "on", "or", "service", "the", "to", "use", "user", "was", "were",
+}
+
+
+def _significant_terms(value: str) -> set[str]:
+    terms: set[str] = set()
+    for raw in re.findall(r"[\w./:-]+", value.casefold()):
+        if len(raw) <= 2 or raw in _STOP_WORDS:
+            continue
+        term = raw
+        for suffix in ("ing", "ed", "es", "s"):
+            if len(term) > len(suffix) + 2 and term.endswith(suffix):
+                term = term[: -len(suffix)]
+                break
+        if len(term) > 3 and term.endswith("e"):
+            term = term[:-1]
+        terms.add(term)
+    return terms
 
 
 def rule_candidate_to_contract(candidate: RuleCandidate, event_id: UUID, source: str) -> ExtractionCandidate:
