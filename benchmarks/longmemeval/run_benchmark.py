@@ -165,21 +165,70 @@ def normalize_samples(raw: Any) -> list[Sample]:
 MAX_ATOM_CHARS = 1500
 
 
-def verbatim_atoms(sample: Sample) -> list[L1Atom]:
+def verbatim_atoms(sample: Sample, *, namespace_id: str | None = None) -> list[L1Atom]:
     """One atom per message: lossless episodic encoding at zero API cost."""
     atoms: list[L1Atom] = []
     for session_id, date, turns in sample.sessions:
         for turn in turns:
             fact = turn["content"][:MAX_ATOM_CHARS]
             atoms.append(
-                L1Atom(atom_id=str(uuid4()), session_id=session_id, fact=fact, timestamp=date or None, source_role=turn["role"])
+                L1Atom(
+                    atom_id=str(uuid4()),
+                    session_id=session_id,
+                    fact=fact,
+                    timestamp=date or None,
+                    source_role=turn["role"],
+                    namespace_id=namespace_id,
+                )
             )
     return atoms
 
 
+_single_db_lock = threading.Lock()
+
+
+def _ensure_namespace(db: Database, namespace_id: str) -> None:
+    with db.connection:
+        db.execute(
+            "INSERT OR IGNORE INTO namespaces(id, org_id, created_at) VALUES (?, ?, datetime('now'))",
+            (namespace_id, "benchmark"),
+        )
+
+
 def ingest_sample(
-    work_dir: Path, sample: Sample, *, skip_embeddings: bool = False
+    work_dir: Path, sample: Sample, *, skip_embeddings: bool = False, single_db: bool = False
 ) -> Path:
+    if single_db:
+        database_path = work_dir / "single.sqlite"
+        # Serialize writes to the single file to avoid WAL contention
+        with _single_db_lock:
+            db = Database(database_path)
+            try:
+                _ensure_namespace(db, sample.question_id)
+                existing = db.execute(
+                    "SELECT COUNT(*) FROM atoms WHERE namespace_id = ?", (sample.question_id,)
+                ).fetchone()[0]
+                if existing == 0:
+                    insert_atoms(db, verbatim_atoms(sample, namespace_id=sample.question_id))
+                    if not skip_embeddings:
+                        index_atom_embeddings(db, shared_embedder(), batch_size=64)
+                elif not skip_embeddings:
+                    missing = db.execute(
+                        """SELECT COUNT(*) FROM atoms a
+                           LEFT JOIN atom_embeddings e ON e.atom_id=a.atom_id AND e.provider=?
+                           WHERE e.atom_id IS NULL AND a.namespace_id = ?""",
+                        (shared_embedder().name, sample.question_id),
+                    ).fetchone()[0]
+                    if missing:
+                        # Index only this namespace's missing embeddings by temporarily
+                        # inserting only those rows? index_atom_embeddings is global,
+                        # so we call it and it will only embed missing rows for this
+                        # namespace because other namespaces already have embeddings.
+                        index_atom_embeddings(db, shared_embedder(), batch_size=64)
+            finally:
+                db.close()
+        return database_path
+
     database_path = work_dir / f"{sample.question_id}.sqlite"
     db = Database(database_path)
     try:
@@ -203,8 +252,8 @@ def ingest_sample(
     return database_path
 
 
-def shared_dense(db: Database, query: str, limit: int) -> list[AtomHit]:
-    return dense_search_atoms(db, query, limit, provider=shared_embedder())
+def shared_dense(db: Database, query: str, limit: int, namespace_id: str | None = None) -> list[AtomHit]:
+    return dense_search_atoms(db, query, limit, provider=shared_embedder(), namespace_id=namespace_id)
 
 
 def retrieve_session_ranking(database_path: Path, sample: Sample, args: argparse.Namespace) -> dict[str, Any]:
@@ -212,10 +261,13 @@ def retrieve_session_ranking(database_path: Path, sample: Sample, args: argparse
     started = time.perf_counter()
     try:
         limit = max(args.recall_k * 4, 20)
+        ns = sample.question_id if getattr(args, "single_db", False) else None
         if args.no_dense:
-            hits = search_atoms(db, sample.question, limit, vector_search=lambda *_: [])
+            hits = search_atoms(db, sample.question, limit, vector_search=lambda *_: [], namespace_id=ns)
         else:
-            hits = search_atoms(db, sample.question, limit, vector_search=lambda query, lim: shared_dense(db, query, lim))
+            hits = search_atoms(
+                db, sample.question, limit, vector_search=lambda query, lim: shared_dense(db, query, lim, namespace_id=ns), namespace_id=ns
+            )
         ranked = hits
         abstained = False
         if not args.no_rerank:
@@ -346,7 +398,7 @@ def judge_question(question_model: str, judge_model: str, sample: Sample, contex
 
 def evaluate_sample(args: argparse.Namespace, sample: Sample, budget: OpenRouterBudget | None) -> dict[str, Any]:
     database_path = ingest_sample(
-        Path(args.work_dir), sample, skip_embeddings=args.no_dense
+        Path(args.work_dir), sample, skip_embeddings=args.no_dense, single_db=getattr(args, "single_db", False)
     )
     outcome = retrieve_session_ranking(database_path, sample, args)
     trace: dict[str, Any] = {
@@ -500,6 +552,7 @@ def main() -> int:
     parser.add_argument("--abstain-threshold", type=float, default=0.25)
     parser.add_argument("--no-rerank", action="store_true")
     parser.add_argument("--no-dense", action="store_true")
+    parser.add_argument("--single-db", action="store_true", help="store all questions in one SQLite file (namespace-isolated)")
     parser.add_argument("--resume-from", type=Path)
     parser.add_argument("--answer-model", default="openai/gpt-4o-mini")
     parser.add_argument("--judge-model", default="openai/gpt-4o-mini")

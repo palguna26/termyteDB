@@ -24,6 +24,7 @@ class L1Atom:
     fact: str
     timestamp: str | None
     source_role: str
+    namespace_id: str | None = None
 
 
 class AtomProvider(Protocol):
@@ -51,9 +52,9 @@ def insert_atoms(db: Database, atoms: list[L1Atom], *, created_at: str | None = 
                 raise ValueError("source_role must be user or assistant")
             db.execute(
                 """INSERT OR IGNORE INTO atoms
-                   (atom_id, session_id, fact, timestamp, source_role, created_at)
-                   VALUES (?, ?, ?, ?, ?, ?)""",
-                (atom.atom_id, atom.session_id, atom.fact.strip(), atom.timestamp, atom.source_role, now),
+                   (atom_id, session_id, fact, timestamp, source_role, created_at, namespace_id)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (atom.atom_id, atom.session_id, atom.fact.strip(), atom.timestamp, atom.source_role, now, atom.namespace_id),
             )
     return len(atoms)
 

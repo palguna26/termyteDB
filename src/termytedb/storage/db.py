@@ -448,6 +448,10 @@ MIGRATIONS: tuple[str, ...] = (
     );
     CREATE INDEX procedures_lookup_idx ON procedures(namespace_id, environment, accessibility, confidence);
     """,
+    """
+    ALTER TABLE atoms ADD COLUMN namespace_id TEXT REFERENCES namespaces(id);
+    CREATE INDEX atoms_namespace_idx ON atoms(namespace_id, session_id);
+    """,
 )
 
 

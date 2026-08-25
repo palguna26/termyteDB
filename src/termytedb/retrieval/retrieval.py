@@ -40,27 +40,46 @@ def _fts_query(query: str) -> str:
 
 
 def search_atoms(db: Database, query: str, limit: int = 20,
-                 vector_search: Callable[[str, int], list[AtomHit]] | None = None) -> list[AtomHit]:
+                 vector_search: Callable[[str, int], list[AtomHit]] | None = None,
+                 namespace_id: str | None = None) -> list[AtomHit]:
     historical = bool(HISTORY_RE.search(query))
     match = _fts_query(query)
     lexical: list[AtomHit] = []
     if match:
-        rows = db.execute(
-            """SELECT a.atom_id, a.session_id, a.fact, a.timestamp, a.source_role,
-                      bm25(atoms_fts) AS rank
-               FROM atoms_fts JOIN atoms a ON a.atom_id=atoms_fts.atom_id
-               WHERE atoms_fts MATCH ? AND (? OR a.invalid_at IS NULL)
-               ORDER BY rank LIMIT ?""",
-            (match, historical, max(limit * 3, 20)),
-        ).fetchall()
+        if namespace_id is not None:
+            rows = db.execute(
+                """SELECT a.atom_id, a.session_id, a.fact, a.timestamp, a.source_role,
+                          bm25(atoms_fts) AS rank
+                   FROM atoms_fts JOIN atoms a ON a.atom_id=atoms_fts.atom_id
+                   WHERE atoms_fts MATCH ? AND (? OR a.invalid_at IS NULL)
+                     AND a.namespace_id = ?
+                   ORDER BY rank LIMIT ?""",
+                (match, historical, namespace_id, max(limit * 3, 20)),
+            ).fetchall()
+        else:
+            rows = db.execute(
+                """SELECT a.atom_id, a.session_id, a.fact, a.timestamp, a.source_role,
+                          bm25(atoms_fts) AS rank
+                   FROM atoms_fts JOIN atoms a ON a.atom_id=atoms_fts.atom_id
+                   WHERE atoms_fts MATCH ? AND (? OR a.invalid_at IS NULL)
+                   ORDER BY rank LIMIT ?""",
+                (match, historical, max(limit * 3, 20)),
+            ).fetchall()
         lexical = [AtomHit(r["atom_id"], r["session_id"], r["fact"], r["timestamp"], r["source_role"], float(r["rank"])) for r in rows]
-    semantic = vector_search(query, max(limit * 3, 20)) if vector_search else dense_search_atoms(db, query, max(limit * 3, 20))
+    if vector_search is not None:
+        semantic = vector_search(query, max(limit * 3, 20))
+    else:
+        semantic = dense_search_atoms(db, query, max(limit * 3, 20), namespace_id=namespace_id)
     if not historical:
         semantic = [item for item in semantic if db.execute("SELECT invalid_at FROM atoms WHERE atom_id=?", (item.atom_id,)).fetchone()[0] is None]
+    if namespace_id is not None:
+        lexical = [h for h in lexical if db.execute("SELECT namespace_id FROM atoms WHERE atom_id=?", (h.atom_id,)).fetchone()[0] == namespace_id]
+        semantic = [h for h in semantic if db.execute("SELECT namespace_id FROM atoms WHERE atom_id=?", (h.atom_id,)).fetchone()[0] == namespace_id]
     return rrf_merge([lexical, semantic])[:limit]
 
 
-def dense_search_atoms(db: Database, query: str, limit: int = 20, provider: EmbeddingProvider | None = None) -> list[AtomHit]:
+def dense_search_atoms(db: Database, query: str, limit: int = 20, provider: EmbeddingProvider | None = None,
+                       namespace_id: str | None = None) -> list[AtomHit]:
     if provider is None:
         try:
             provider = _cached_fastembed_provider()
@@ -70,11 +89,18 @@ def dense_search_atoms(db: Database, query: str, limit: int = 20, provider: Embe
     if available is None:
         return []
     query_vector = provider.embed(query)
-    rows = db.execute(
-        "SELECT a.atom_id, a.session_id, a.fact, a.timestamp, a.source_role, e.vector "
-        "FROM atoms a JOIN atom_embeddings e ON e.atom_id=a.atom_id WHERE e.provider=?",
-        (provider.name,),
-    ).fetchall()
+    if namespace_id is not None:
+        rows = db.execute(
+            "SELECT a.atom_id, a.session_id, a.fact, a.timestamp, a.source_role, e.vector "
+            "FROM atoms a JOIN atom_embeddings e ON e.atom_id=a.atom_id WHERE e.provider=? AND a.namespace_id = ?",
+            (provider.name, namespace_id),
+        ).fetchall()
+    else:
+        rows = db.execute(
+            "SELECT a.atom_id, a.session_id, a.fact, a.timestamp, a.source_role, e.vector "
+            "FROM atoms a JOIN atom_embeddings e ON e.atom_id=a.atom_id WHERE e.provider=?",
+            (provider.name,),
+        ).fetchall()
     hits: list[AtomHit] = []
     for row in rows:
         vector = list(array.array("f", row["vector"]))
