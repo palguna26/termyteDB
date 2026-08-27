@@ -1,6 +1,6 @@
 # Provider configuration
 
-Rule extraction is the default and needs no account or network. The deterministic fake provider is available to tests. For a real model, construct `HttpExtractionProvider` with an endpoint and model, or set:
+OpenRouter extraction is the intended product path and requires an API key. The deterministic fake provider is available to tests. For a non-OpenRouter HTTP provider, construct `HttpExtractionProvider` with an endpoint and model, or set:
 
 ```text
 TERMYTEDB_EXTRACTION_URL=https://your-provider.example/extract
@@ -17,16 +17,25 @@ every requested parameter, including the strict extraction JSON schema.
 The LongMemEval end-to-end benchmark automatically loads these values from a
 repository-root `.env` file.
 
-With the key configured, the complete paid benchmark uses the bundled dataset,
-`inclusionai/ling-2.6-flash`, four workers, and timestamped run artifacts:
+With the key configured, the benchmark uses the bundled dataset, the OpenRouter
+LLM extraction path, OpenRouter-compatible embeddings, and timestamped run
+artifacts:
 
 ```powershell
-python benchmarks/longmemeval/run_end_to_end.py --openrouter
+python benchmarks/longmemeval/run_benchmark.py --mode end-to-end --extraction openrouter --embedding-provider openrouter
 ```
 
 ## OpenAI-compatible embeddings
 
-The local FastEmbed provider remains the default. To use OpenRouter or another OpenAI-compatible embeddings endpoint, set `TERMYTEDB_EMBEDDING_PROVIDER=openrouter`, `OPENROUTER_API_KEY`, `TERMYTEDB_EMBEDDING_MODEL`, and `TERMYTEDB_EMBEDDING_DIMENSIONS`. The default endpoint is `https://openrouter.ai/api/v1`; set `TERMYTEDB_EMBEDDING_BASE_URL` for another endpoint. The provider sends batched `POST /embeddings` requests, retries transient failures, validates vector dimensions, and never logs the API key.
+OpenRouter-compatible embeddings are the intended runtime path. Set
+`TERMYTEDB_EMBEDDING_PROVIDER=openrouter`, `OPENROUTER_API_KEY`,
+`TERMYTEDB_EMBEDDING_MODEL`, and `TERMYTEDB_EMBEDDING_DIMENSIONS`. The default
+endpoint is `https://openrouter.ai/api/v1`; set
+`TERMYTEDB_EMBEDDING_BASE_URL` for another endpoint. The provider sends batched
+`POST /embeddings` requests, retries transient failures, validates vector
+dimensions, and never logs the API key.
+
+Local FastEmbed remains available only as a development fallback.
 
 Optional cost telemetry uses `TERMYTEDB_INPUT_COST_PER_1K_USD` and `TERMYTEDB_OUTPUT_COST_PER_1K_USD`. Both must be set for an estimated cost to be persisted; missing or invalid values produce no estimate.
 

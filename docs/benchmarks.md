@@ -1,8 +1,8 @@
 # TermyteDB LongMemEval-S methodology
 
 This document describes how TermyteDB scores on LongMemEval-S, what the
-numbers mean, and how to reproduce them. It exists so a reviewer (and a
-future employer) can re-run the benchmark and get the same table.
+numbers mean, and how to reproduce them. It exists so a reviewer can rerun the
+benchmark and get the same table.
 
 ## Dataset
 
@@ -22,29 +22,27 @@ multi-session 133.
 
 ## What is measured
 
-LongMemEval's primary retrieval metric is **session-level recall**: does at
-least one oracle session appear in the top-k retrieved sessions? TermyteDB
-reports:
+The headline benchmark is **end-to-end answer quality and latency**. LongMemEval
+questions are pushed through the production memory path:
+ingest -> extraction -> evidence validation -> reconciliation -> embeddings ->
+retrieval -> context packing -> answer generation -> judging.
 
-* **Recall@5 / @10 / @15** — fraction of questions where an oracle session is
-  in the top-k session ranking.
-* **MRR@15** — mean reciprocal rank of the best oracle session within the
-  top-15.
-* **NDCG@15** — binary-gain NDCG over the ranked session list.
-* **Avg Context Tokens / Latency** — size and retrieval latency of the packed
-  context returned to the caller.
+The benchmark reports:
 
-Session ranking is derived by mapping the ranked atom (fact) list to its
-ordered set of unique `session_id`s — the same aggregation step Supermemory
-uses when it chunks sessions and aggregates to session level. A *judged* mode
-adds end-to-end answer generation + LLM judging through OpenRouter with a
-hard spend budget (`--budget-usd`, default $8).
+* **Answer accuracy** on the judged subset.
+* **End-to-end latency** per sample and per stage.
+* **Memory formation quality** through accepted/rejected candidate counts,
+  evidence validation failures, and retrieval misses.
+* **Context size** and packed token usage.
+
+Retrieval-only session recall is kept as an internal ablation and ceiling
+measurement. It is not the product claim.
 
 ## Engine path under test
 
 Two distinct pipelines are measured, answering different questions:
 
-### A) Retrieval-only (upper-bound, isolation benchmark)
+### A) Retrieval-only ablation
 Exercises the product retrieval stack, not a harness-only trick:
 
 1. **Verbatim episodic atoms** — one atom per message (`fact = content`,
@@ -66,7 +64,8 @@ Per-question isolation is enforced with one SQLite database file per
 contamination. Parallel workers share model instances behind locks to avoid
 ONNX arena OOM.
 
-**Use:** ` --mode retrieval-only` (alias `retrieval`). Measures indexing+retrieval ceiling.
+**Use:** ` --mode retrieval-only` (alias `retrieval`). Measures indexing and
+retrieval ceiling only.
 
 ### B) End-to-end (production pipeline, ordinary agent)
 Answers: *If an ordinary agent gave TermyteDB these conversations through the real production interface, would it form the right memories and retrieve them?*
@@ -76,51 +75,41 @@ Answers: *If an ordinary agent gave TermyteDB these conversations through the re
 3. **Retrieval**: same hybrid `Repository.search()` (FTS5 + dense RRF, recency tie-breaker by `valid_from`) + optional FlashRank rerank on `statement` + `build_context(token_budget)`. Session ranking is derived from `evidence_refs → events.stream_id`, not atom `session_id`.
 4. **Diagnostics**: per-sample `events_ingested`, `processing_jobs_*`, `candidates_accepted/rejected`, `memories_created`, `rejection_reasons`, `failure_reason` (`never_extracted`, `memory_existed_retrieval_missed`, etc.) and structured `failure_analysis` JSON for automated analysis.
 
-**Use:** ` --mode end-to-end --extraction rule|openrouter --workers 8 --token-budget 1500`. Retrieval remains identical (lexical+dense, same token budget) for head-to-head comparison.
+**Use:** ` --mode end-to-end --extraction openrouter --workers 8 --token-budget 1500`.
 
 ## Modes and ablations
 
-* `--mode retrieval-only --no-dense` (default fast sweep): verbatim atoms, FTS + cross-encoder, **no dense embeddings**. Zero API cost. This is the run reported below.
-* `--mode retrieval-only` (full hybrid): verbatim atoms, FTS + dense + cross-encoder. Touches dense embeddings (~16k atoms per question at batch 16, serialized).
-* `--mode end-to-end --extraction rule --no-dense`: production path with offline rule extractor (captures `I graduated with...`, `My favorite...` plus narrow service patterns). Zero API cost, true `memories` table, shows extraction recall bottleneck.
-* `--mode end-to-end --extraction openrouter --workers 8`: production path with LLM extraction via OpenRouter (`TERMYTEDB_EXTRACTION_MODEL`, `OPENROUTER_API_KEY`). Uses same `Processor`/`validate_candidate`/`reconcile_candidate` as an ordinary agent.
-* `--mode judged`: retrieval-only + `openai/gpt-4o-mini` answer generation and `openai/gpt-4o-mini` judging, both through OpenRouter, budget-guarded.
-* `--no-rerank` / `--no-dense --no-rerank`: ablations for both pipelines.
-* `--single-db`: single SQLite file with `namespace_id=question_id` isolation (tested for 500-ns run).
-* Extraction tuning: `--extraction {rule,openrouter,fake,http} --extraction-model X --processing-batch-size 100 --processing-lease-seconds 180`.
+* `--mode retrieval-only --no-dense`: internal retrieval ceiling, not the headline claim.
+* `--mode end-to-end --extraction openrouter --workers 8`: production path with LLM extraction via OpenRouter (`TERMYTEDB_EXTRACTION_MODEL`, `OPENROUTER_API_KEY`).
+* `--mode judged`: end-to-end answer generation + OpenRouter judging, budget-guarded.
+* `--no-rerank` / `--no-dense --no-rerank`: internal ablations only.
+* `--single-db`: single SQLite file with `namespace_id=question_id` isolation.
+* Extraction tuning: `--extraction {openrouter,fake,http} --extraction-model X --processing-batch-size 100 --processing-lease-seconds 180`.
 
 ## How to reproduce
 
 ```powershell
-# Full retrieval-only run (all 500 questions, ~15-20 min with --no-dense, ~75 min hybrid)
-python benchmarks/longmemeval/run_benchmark.py --mode retrieval-only --workers 8 --no-dense
-
-# End-to-end smoke (ordinary agent path, 5 questions, ~2 min, rule extractor, zero API cost)
-python benchmarks/longmemeval/run_benchmark.py --mode end-to-end --limit 5 --workers 2 --no-dense --no-rerank
-
-# End-to-end with LLM extraction (requires OPENROUTER_API_KEY, production provider)
+# End-to-end run (all 500 questions, OpenRouter extraction + embeddings)
 python benchmarks/longmemeval/run_benchmark.py --mode end-to-end --extraction openrouter --workers 8 --token-budget 1500
 
-# Hybrid variants
-python benchmarks/longmemeval/run_benchmark.py --mode retrieval-only --workers 4        # FTS+dense
-python benchmarks/longmemeval/run_benchmark.py --mode end-to-end --workers 4 --no-dense  # rule+FTS rerank
+# Judged subset (requires OPENROUTER_API_KEY in .env)
+python benchmarks/longmemeval/run_benchmark.py --mode judged --task knowledge-update --limit 20 --workers 4 --budget-usd 8
 
-# Judged subset (requires OPENROUTER_API_KEY in .env, ~$0.0003/question with gpt-4o-mini)
-python benchmarks/longmemeval/run_benchmark.py --mode judged --task knowledge-update --limit 20 --workers 4 --no-dense --budget-usd 8
+# Internal ablation
+python benchmarks/longmemeval/run_benchmark.py --mode retrieval-only --workers 8 --no-dense
 
-# Per-category tables (both pipelines)
+# Per-category tables
 foreach ($task in @("single-session-user","single-session-assistant","single-session-preference","knowledge-update","temporal-reasoning","multi-session")) {
-  python benchmarks/longmemeval/run_benchmark.py --mode retrieval-only --task $task --workers 8 --no-dense
-  python benchmarks/longmemeval/run_benchmark.py --mode end-to-end --task $task --limit 20 --workers 4 --no-dense
+  python benchmarks/longmemeval/run_benchmark.py --mode end-to-end --task $task --limit 20 --workers 4 --extraction openrouter
 }
 ```
 
 Outputs are written to `results/longmemeval_s_{mode}_{timestamp}.json` with
 `dataset.sha256`, `config`, `summary` (per-category rows), and per-question
-`traces` (rank, ndcg, packed token count, latency, and — in judged mode —
-`hypothesis` / `judge_verdict` / `correct`).
+`traces` (latency, packed token count, accepted/rejected counts, and — in judged
+mode — `hypothesis` / `judge_verdict` / `correct`).
 
-## Results (2026-08-25)
+## Internal Retrieval Ablation (2026-08-25)
 
 Retrieval run `longmemeval_s_retrieval_20260825-181122.json`, 500 questions,
 `workers=8`, `--no-dense`, rerank enabled, `token-budget=1500`.
@@ -136,7 +125,8 @@ Retrieval run `longmemeval_s_retrieval_20260825-181122.json`, 500 questions,
 | **Overall** | **500** | **95.4** | **96.8** | **98.4** | **0.916** | **0.906** | **998.4** | **11927.2** |
 
 Comparison head-to-head against Supermemory's published LongMemEval-S numbers
-(same dataset split, same metric, Recall@15 with aggregation):
+(same dataset split, same metric, Recall@15 with aggregation). This is an
+internal retrieval ablation, not the headline product claim:
 
 | Category | TermyteDB (FTS+Rerank) | Supermemory | Zep | Full Context |
 |---|---:|---:|---:|---:|
@@ -172,13 +162,12 @@ versions via `invalid_at`) plus a date-aware answer prompt that includes
 
 ## Why this is credible for a resume
 
-* Runs on the **official 500-question LongMemEval-S** with a recorded SHA256,
-  not a 2-item synthetic fixture.
-* Scores **session-level Recall@k** using oracle `answer_session_ids` — the
-  paper's retrieval metric — plus MRR/NDCG and token/latency costs.
-* Feeds the **same public retrieval stack** the engine ships (FTS5 + embeddings
-  + RRF + FlashRank + session packing), not a harness-only shortcut.
+* Runs on the **official 500-question LongMemEval-S** with a recorded SHA256.
+* Measures the **production memory path**, not a retrieval-only shortcut, for
+  the headline claim.
+* Uses OpenRouter extraction and OpenRouter-compatible embeddings in the
+  product path.
 * **Reproducible**: one command, dataset bundled, per-question isolated DBs,
   config + SHA echoed in every result file.
-* **Honest about limits**: the judged gap on KU/MS is reported alongside the
-  retrieval win, with a concrete fix identified.
+* **Honest about limits**: retrieval-only remains available as an ablation, but
+  it is not the claim that matters.

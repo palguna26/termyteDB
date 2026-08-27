@@ -9,7 +9,7 @@
 - Namespace deletion storage scan confirms deleted secrets are absent from the live SQLite database/WAL files and remain absent after close.
 - Deterministic episodes, evidence-span validation, rule extraction, fake provider, generic HTTP provider boundary, failed-provider run audits, append-only versions, corrections, disputes, invalidation, and audit decisions.
 - Provider token counts, latency, configurable estimated extraction cost, and accurate per-job accepted/rejected counts are persisted and included in namespace metrics without assuming pricing.
-- Namespace-filtered FTS5 plus injectable embeddings (deterministic local default), explainable hybrid scores, context token budgets, abstention, selection diagnostics, feedback, export/import, deletion, backup, and integrity repair.
+- Namespace-filtered FTS5 plus injectable embeddings, explainable hybrid scores, context token budgets, abstention, selection diagnostics, feedback, export/import, deletion, backup, and integrity repair.
 - Versioned HTTP service with request IDs, optional request authentication and namespace authorization, health/readiness, paginated event and dedicated evidence/memory/job inspection, namespace metrics, and OpenAPI generation with a contract test.
 - Thin Python and TypeScript clients with optional bearer auth, bounded transient retries, request IDs, timeouts, quoted path identifiers, structured errors, full lifecycle operations, and paginated inspection; Python behavior is contract-tested and the TypeScript source compiles with TypeScript 7.0.2.
 - Deterministic extraction, retrieval, temporal, continuation, LongMemEval-shaped, reconciliation, and local performance harnesses, including concurrent namespace smoke coverage.
@@ -30,8 +30,10 @@ These are regression and smoke measurements, not broad product-quality, capacity
 
 ## Not verified or not implemented
 
-- PostgreSQL/pgvector storage behavior and hosted transactional migrations.
-- Real LongMemEval-s dataset execution and real coding-agent trajectories with executed verification commands.
+- PostgreSQL/pgvector storage behavior, hosted transactional migrations, and any hosted multi-tenant deployment claim.
+- OpenRouter-first extraction and embedding defaults as the required product path, including the failure mode when keys are missing.
+- sqlite-vec or similar ANN-backed vector indexing as the primary retrieval store.
+- Real LongMemEval-S end-to-end execution with production extraction, embeddings, and judge traces.
 - Real agent completion, tests-passed, tool-call, token, cost, and repeated-mistake measurements.
 - Large-scale concurrent load, disk-failure simulation, and representative storage-growth targets.
 - Pagination for any future collection endpoints beyond the current bounded inspection paths, and hosted authentication integration beyond the callback boundary.
@@ -39,4 +41,4 @@ These are regression and smoke measurements, not broad product-quality, capacity
 
 ## Release position
 
-The local deterministic engine is evidence-backed and suitable for continued alpha evaluation. It is not proven as a complete hosted V1 until the limitations above are resolved or explicitly moved to post-V1 with an agreed product decision.
+The product is moving to an OpenRouter-first, end-to-end memory engine with embeddings and vector retrieval as required runtime dependencies. It is still only partially proven here because the repository has not yet been updated to make that the default execution path and benchmark claim.
