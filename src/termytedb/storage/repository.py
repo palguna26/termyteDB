@@ -25,6 +25,10 @@ TRANSITION_MARKERS = (
     "switched", "moved", "migrated", "changed", "no longer", "now using",
     "updated", "prefer", "renamed", "deprecated", "stopped",
 )
+HISTORY_QUERY_RE = re.compile(
+    r"(\bused to\b|\bpreviously\b|\bformerly\b|\bhistorical\b|\bearlier\b|\bback then\b|\bwhat did\b.*\bbefore\b|\bwhen did\b.*\bfirst\b)",
+    re.I,
+)
 
 
 def iso(value: datetime | None = None) -> str:
@@ -403,7 +407,7 @@ class Repository:
         from the current input events.
         Keeps input tokens ~800 (5*~120) vs 20*120=2400 to avoid output>input.
         """
-        results = self.search(namespace_id, query, max(1, min(limit, 5)), historical=False)
+        results = self.search(namespace_id, query, max(1, min(limit, 5)), historical=False, internal=True)
         return [
             {
                 "ref": f"m{index}",
@@ -415,6 +419,65 @@ class Repository:
             }
             for index, item in enumerate(results)
         ]
+
+    def extraction_window(self, namespace_id: str, event_id: str, *, limit: int = 4) -> dict[str, str]:
+        """Return a small chronological same-session evidence window for extraction.
+
+        The current event is always included. If the event has a stream_id or session_id,
+        we also include the most recent earlier events from the same stream/session so
+        extraction can resolve pronouns, updates, and temporal qualifiers without
+        losing evidence grounding.
+        """
+        current = self.get_event(namespace_id, event_id)
+        if current is None:
+            return {}
+        scope_stream = current.get("stream_id")
+        scope_session = current.get("session_id")
+        current_sequence = current.get("sequence_number")
+        params: list[Any] = [namespace_id]
+        where = ["namespace_id = ?"]
+        if scope_stream is not None:
+            where.append("stream_id = ?")
+            params.append(scope_stream)
+        elif scope_session is not None:
+            where.append("session_id = ?")
+            params.append(scope_session)
+        else:
+            return {str(current["id"]): payload_text(current["payload_json"], current["type"])}
+        if current_sequence is None:
+            params.extend([current["occurred_at"], current["occurred_at"], current["id"], max(1, limit)])
+            rows = self.db.execute(
+                f"""SELECT id, type, payload_json
+                FROM events
+                WHERE {' AND '.join(where)}
+                  AND (occurred_at < ? OR (occurred_at = ? AND id <= ?))
+                ORDER BY occurred_at DESC, id DESC
+                LIMIT ?""",
+                tuple(params),
+            ).fetchall()
+        else:
+            params.extend([current["occurred_at"], current["occurred_at"], current_sequence, current_sequence, current["id"], max(1, limit)])
+            rows = self.db.execute(
+                f"""SELECT id, type, payload_json
+                FROM events
+                WHERE {' AND '.join(where)}
+                  AND (
+                    occurred_at < ?
+                    OR (occurred_at = ? AND (
+                      COALESCE(sequence_number, -1) < ?
+                      OR (COALESCE(sequence_number, -1) = ? AND id <= ?)
+                    ))
+                  )
+                ORDER BY occurred_at DESC, COALESCE(sequence_number, -1) DESC, id DESC
+                LIMIT ?""",
+                tuple(params),
+            ).fetchall()
+        window: dict[str, str] = {}
+        for row in reversed(rows):
+            window[str(row["id"])] = payload_text(json.loads(row["payload_json"]), row["type"])
+        if str(current["id"]) not in window:
+            window[str(current["id"])] = payload_text(current["payload_json"], current["type"])
+        return window
 
     def record_context_request(self, namespace_id: str, query: str, token_budget: int, response: Any) -> str:
         request_id = str(uuid.uuid4())
@@ -968,8 +1031,10 @@ class Repository:
             for row in rows
         ]
 
-    def search(self, namespace_id: str, query: str, limit: int, historical: bool = False) -> list[SearchResult]:
+    def search(self, namespace_id: str, query: str, limit: int, historical: bool = False, *, internal: bool = False) -> list[SearchResult]:
         terms = list(dict.fromkeys(term.casefold() for term in re.findall(r"[\w./:-]+", query) if len(term) > 1))
+        historical = historical or (not internal and bool(HISTORY_QUERY_RE.search(query)))
+        prefer_oldest = bool(re.search(r"\b(first|earliest|initial|original|before|used to|previous|previously|former|formerly)\b", query, re.I))
         lexical: dict[str, float] = {}
         lexical_rank: dict[str, int] = {}
         if terms:
@@ -1035,7 +1100,7 @@ class Repository:
             return []
         placeholders = ",".join("?" for _ in candidate_ids)
         rows = self.db.execute(
-            f"""SELECT m.id, m.kind, m.confidence, m.importance, v.id AS version_id, v.statement, v.status, v.valid_from, v.recorded_at
+            f"""SELECT m.id, m.kind, m.confidence, m.importance, v.id AS version_id, v.statement, v.status, v.valid_from, v.valid_to, v.recorded_at
             FROM memory_versions v JOIN memories m ON m.id=v.memory_id AND m.namespace_id=?
             WHERE v.namespace_id=? AND v.id IN ({placeholders}) AND (? OR (v.status='active' AND m.status='active'
               AND m.accessibility >= 0.05 AND v.valid_to IS NULL
@@ -1109,6 +1174,9 @@ class Repository:
             quality = 0.03 * float(row["confidence"]) + 0.02 * float(row["importance"])
             graph = graph_signal(version_id)
             summary = summary_signal(version_id)
+            history = 0.0
+            if historical and row["valid_to"] is not None:
+                history = 0.02 if prefer_oldest else 0.01
             # Small recency tie-breaker inspired by graphiti temporal handling:
             # when scores are close, prefer the more recent valid_from for ordinary
             # agent recency. Bounded to 0.02 to avoid overriding lexical/semantic.
@@ -1120,10 +1188,12 @@ class Repository:
                     recency = 0.01  # placeholder for future decay; kept small to avoid gaming
             except Exception:
                 recency = 0.0
-            return min(1.0, fused + exact + support + quality + graph + summary + recency)
+            return min(1.0, fused + exact + support + quality + graph + summary + history + recency)
 
-        # Primary sort by score, secondary by valid_from recency (newer first) - stable sort
-        rows_by_recency = sorted(rows, key=lambda row: row["valid_from"] or "", reverse=True)
+        # Primary sort by score, secondary by valid_from. Historical queries that
+        # ask for "first" or "before" should prefer older evidence instead of the
+        # default newest-first tie break.
+        rows_by_recency = sorted(rows, key=lambda row: row["valid_from"] or "", reverse=not prefer_oldest)
         ranked = sorted(rows_by_recency, key=lambda row: -score_row(row))[:limit]
         query_terms = set(terms)
         results: list[SearchResult] = []
@@ -1158,7 +1228,8 @@ class Repository:
                     citations=citations,
                 )
             )
-        self.record_retrieval(namespace_id, [str(item.memory_id) for item in results])
+        if not internal:
+            self.record_retrieval(namespace_id, [str(item.memory_id) for item in results], successful=bool(results))
         return results
 
     def _citations(self, namespace_id: str, version_id: str) -> list[EvidenceCitation]:
@@ -1635,6 +1706,9 @@ class Repository:
             self.db.execute("DELETE FROM extraction_runs WHERE namespace_id=?", (namespace_id,))
             self.db.execute("DELETE FROM episode_events WHERE namespace_id=?", (namespace_id,))
             self.db.execute("DELETE FROM episodes WHERE namespace_id=?", (namespace_id,))
+            self.db.execute("DELETE FROM relationships WHERE namespace_id=?", (namespace_id,))
+            self.db.execute("DELETE FROM entity_aliases WHERE namespace_id=?", (namespace_id,))
+            self.db.execute("DELETE FROM entities WHERE namespace_id=?", (namespace_id,))
             self.db.execute("DELETE FROM memory_embeddings WHERE namespace_id=?", (namespace_id,))
             self.vector_index.delete_namespace(namespace_id)
             self.db.execute("DELETE FROM feedback WHERE namespace_id=?", (namespace_id,))

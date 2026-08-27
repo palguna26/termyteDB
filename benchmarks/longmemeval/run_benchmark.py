@@ -73,6 +73,7 @@ _embedder: GuardedEmbedder | None = None
 _product_embedder: GuardedEmbedder | None = None
 _product_embedder_key: tuple[str, str | None, int | None] | None = None
 _product_embedder_lock = threading.Lock()
+_RUN_MANIFEST_NAME = "longmemeval_run_manifest.json"
 
 
 class GuardedEmbedder:
@@ -403,6 +404,30 @@ def _e2e_database_path(work_dir: Path, sample: Sample, single_db: bool) -> Path:
     return work_dir / f"e2e_{sample.question_id}.sqlite"
 
 
+def _run_manifest_path(work_dir: Path) -> Path:
+    return work_dir / _RUN_MANIFEST_NAME
+
+
+def _run_manifest(args: argparse.Namespace, data_path: Path, dataset_sha256: str, canonical_mode: str) -> dict[str, Any]:
+    return {
+        "mode": canonical_mode,
+        "dataset_path": str(data_path),
+        "dataset_sha256": dataset_sha256,
+        "extraction": getattr(args, "extraction", None),
+        "extraction_model": getattr(args, "extraction_model", None),
+        "embedding_provider": getattr(args, "embedding_provider", None),
+        "embedding_model": getattr(args, "embedding_model", None),
+        "embedding_dimensions": getattr(args, "embedding_dimensions", None),
+        "single_db": bool(getattr(args, "single_db", False)),
+        "no_dense": bool(getattr(args, "no_dense", False)),
+        "no_rerank": bool(getattr(args, "no_rerank", False)),
+        "recall_k": int(getattr(args, "recall_k", 15)),
+        "token_budget": int(getattr(args, "token_budget", 1500)),
+        "pack_atoms": int(getattr(args, "pack_atoms", 40)),
+        "abstain_threshold": float(getattr(args, "abstain_threshold", 0.25)),
+    }
+
+
 def ingest_and_process_e2e(
     work_dir: Path, sample: Sample, args: argparse.Namespace
 ) -> tuple[Path, dict[str, Any]]:
@@ -523,7 +548,7 @@ def retrieve_e2e_session_ranking(database_path: Path, sample: Sample, args: argp
     engine = TermyteDB(database_path, extraction_provider=provider, embedding_provider=shared_product_embedder(args))  # type: ignore[arg-type]
     started = time.perf_counter()
     try:
-        limit = max(args.recall_k * 4, 20)
+        limit = max(args.recall_k * 10, 50)
         # Repository.search hybrid retrieval
         search_results = engine.search(ns, sample.question, limit=limit)
         # Rerank if enabled
@@ -650,7 +675,7 @@ def retrieve_session_ranking(database_path: Path, sample: Sample, args: argparse
     db = Database(database_path)
     started = time.perf_counter()
     try:
-        limit = max(args.recall_k * 4, 20)
+        limit = max(args.recall_k * 10, 50)
         ns = sample.question_id if getattr(args, "single_db", False) else None
         if args.no_dense:
             hits = search_atoms(db, sample.question, limit, vector_search=lambda *_: [], namespace_id=ns)
@@ -1004,7 +1029,25 @@ def run(args: argparse.Namespace) -> int:
         canonical_mode = raw_mode
 
     is_e2e = canonical_mode == "end-to-end"
+    if is_e2e:
+        if getattr(args, "extraction", "openrouter") != "openrouter":
+            raise SystemExit("end-to-end benchmark requires --extraction openrouter")
+        if getattr(args, "embedding_provider", None) not in (None, "openrouter"):
+            raise SystemExit("end-to-end benchmark requires --embedding-provider openrouter")
+        if getattr(args, "embedding_provider", None) is None:
+            args.embedding_provider = "openrouter"
     budget = OpenRouterBudget(args.budget_usd) if canonical_mode == "judged" else None
+
+    manifest = _run_manifest(args, data_path, dataset_sha256, canonical_mode)
+    manifest_path = _run_manifest_path(work_dir)
+    if manifest_path.exists():
+        previous_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if previous_manifest != manifest:
+            raise SystemExit(
+                f"work dir {work_dir} already has a different LongMemEval run manifest; "
+                "use a fresh work dir or pass --resume-from for the same run"
+            )
+    manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8")
 
     traces: list[dict[str, Any]] = list(previous_traces)
     failures = 0

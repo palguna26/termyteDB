@@ -354,6 +354,62 @@ def test_question_unavailable_during_extraction(monkeypatch, tmp_path: Path):
         assert "sess-1" not in dump  # not relevant
 
 
+def test_extraction_window_includes_previous_same_session_turns(tmp_path: Path):
+    from termytedb.api.schemas import ExtractionResponse
+    from termytedb.memory.provider import ProviderResult
+    from termytedb import TermyteDB
+    import hashlib
+
+    captured_requests = []
+
+    class CapturingProvider:
+        name = "capture-window"
+        model = "capture-window-v1"
+
+        def extract(self, request, timeout_seconds=30.0, cancellation=None):
+            captured_requests.append(request)
+            resp = ExtractionResponse(schema_version="extraction-v1", prompt_version="v1", candidates=[])
+            raw = json.dumps(resp.model_dump(mode="json"), sort_keys=True).encode()
+            return ProviderResult(
+                response=resp,
+                provider_name=self.name,
+                model_name=self.model,
+                prompt_version=resp.prompt_version,
+                raw_response_hash=hashlib.sha256(raw).hexdigest(),
+                input_tokens=1,
+                output_tokens=1,
+                latency_ms=1,
+            )
+
+    db = TermyteDB(tmp_path / "window.sqlite", extraction_provider=CapturingProvider())
+    try:
+        shared_time = "2023-05-20T02:21:00+00:00"
+        db.ingest({
+            "namespace_id": "window",
+            "idempotency_key": "1",
+            "type": "conversation",
+            "stream_id": "s1",
+            "occurred_at": shared_time,
+            "payload": {"text": "My sister is Maya."},
+        })
+        db.ingest({
+            "namespace_id": "window",
+            "idempotency_key": "2",
+            "type": "conversation",
+            "stream_id": "s1",
+            "occurred_at": shared_time,
+            "payload": {"text": "Maya moved to Berlin."},
+        })
+        db.process("window")
+        assert len(captured_requests) == 2
+        assert len(captured_requests[0].events) == 1
+        assert len(captured_requests[1].events) == 2
+        assert len(captured_requests[1].evidence_text) == 2
+        assert any("Berlin" in text for text in captured_requests[1].evidence_text.values())
+    finally:
+        db.close()
+
+
 def test_duplicate_ingestion_idempotent(tmp_path: Path):
     db = TermyteDB(tmp_path / "dup.sqlite")
     try:

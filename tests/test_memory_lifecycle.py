@@ -69,6 +69,28 @@ def test_historical_search_can_request_superseded_truth(db):
     assert historical[0].status == "superseded"
 
 
+def test_history_query_terms_auto_enable_historical_search(db):
+    db.ingest(event("n1", "one", "I used to live in Bangalore."))
+    db.process("n1")
+    db.ingest(event("n1", "two", "I now live in Mumbai."))
+    db.process("n1")
+    results = db.search("n1", "used to live in Bangalore")
+    assert results
+    assert results[0].status == "superseded"
+    assert "Bangalore" in results[0].statement
+
+
+def test_first_name_query_does_not_force_historical_search(db):
+    db.ingest(event("n1", "one", "My first name is Alice."))
+    db.process("n1")
+    db.ingest(event("n1", "two", "My first name is Alicia."))
+    db.process("n1")
+    results = db.search("n1", "first name")
+    assert results
+    assert results[0].status == "active"
+    assert "Alicia" in results[0].statement
+
+
 def test_forget_tombstones_memory_and_restore_reindexes_it(db):
     db.ingest(event("n1", "forget", "Decision: storage uses SQLite."))
     db.process("n1")

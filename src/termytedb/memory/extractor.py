@@ -108,6 +108,12 @@ RULES = (
     ),
     (
         "fact",
+        re.compile(
+            r"(?im)\bI\s+(?:used to|used to live in|used to work as|now live in|now work as|moved to|moved from)\b[^.!?\n]{2,200}[.!?]"
+        ),
+    ),
+    (
+        "fact",
         re.compile(r"(?im)\bMy\s+[^.!?\n]{2,120}\s+is\s+[^.!?\n]{2,160}[.!?]"),
     ),
     (
@@ -130,6 +136,23 @@ RULES = (
 )
 
 
+def _subject_key(kind: str, statement: str, body: str) -> str:
+    text = f"{statement} {body}".casefold()
+    if kind == "fact":
+        if any(token in text for token in ("live in", "lived in", "moved to", "moved from", "move to", "move from")):
+            return "fact:user location"
+        if any(token in text for token in ("prefer", "favorite", "favoured", "favourite", "like ", "love ")):
+            return "fact:user preference"
+        if any(token in text for token in ("work as", "work in", "job", "role ", "employed")):
+            return "fact:user work"
+        if any(token in text for token in ("sister", "brother", "cousin", "mother", "father", "wife", "husband", "partner")):
+            return "fact:user relationship"
+    if kind == "decision":
+        return "decision:state change"
+    subject_words = body.casefold().split()[:2]
+    return f"{kind}:{' '.join(subject_words)}"
+
+
 def extract(payload: dict[str, Any], event_type: str | None = None) -> list[Candidate]:
     text = payload_text(payload, event_type)
     candidates: list[Candidate] = []
@@ -139,7 +162,6 @@ def extract(payload: dict[str, Any], event_type: str | None = None) -> list[Cand
             body = match.group(1).strip() if match.lastindex else statement
             if not body:
                 continue
-            subject_words = body.casefold().split()[:2]
-            subject_key = f"{kind}:{' '.join(subject_words)}"
+            subject_key = _subject_key(kind, statement, body)
             candidates.append(Candidate(kind, subject_key, statement, match.start(), match.end()))
     return sorted(candidates, key=lambda item: (item.start_offset, item.kind, item.statement))

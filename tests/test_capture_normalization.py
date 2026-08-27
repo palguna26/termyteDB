@@ -31,7 +31,7 @@ def test_simple_payloads_keep_existing_text_projection():
     assert payload_text({"text": "Decision: keep SQLite."}) == "Decision: keep SQLite."
 
 
-def test_tool_execution_preserves_structured_trace_and_recovery():
+def test_tool_execution_is_ignored_by_conversational_payload_projection():
     payload = {
         "tool_name": "shell",
         "command": "pytest -q",
@@ -44,19 +44,11 @@ def test_tool_execution_preserves_structured_trace_and_recovery():
 
     text = payload_text(payload, "tool_execution")
 
-    assert "Tool: shell" in text
-    assert "Command: pytest -q" in text
-    assert "Stdout: 12 passed" in text
-    assert "Stderr: Failure: one worker crashed." in text
-    assert "Exit code: 1" in text
-    assert "Error: WorkerError" in text
-    assert "Corrective action: Outcome: rerun with one worker." in text
+    assert text == ""
 
 
-def test_execution_fields_are_preserved_even_for_generic_event_type():
-    assert payload_text({"stderr": "connection refused", "exit_code": 2}) == (
-        "Stderr: connection refused\nExit code: 2"
-    )
+def test_execution_fields_are_ignored_even_for_generic_event_type():
+    assert payload_text({"stderr": "connection refused", "exit_code": 2}) == ""
 
 
 def test_tool_event_keeps_environment_context_when_it_contains_execution_output():
@@ -64,4 +56,4 @@ def test_tool_event_keeps_environment_context_when_it_contains_execution_output(
         {"text": "<environment_context>Failure: compiler exited with code 1.</environment_context>"},
         "bash_command",
     )
-    assert "compiler exited with code 1" in text
+    assert text == ""

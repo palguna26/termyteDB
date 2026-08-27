@@ -7,6 +7,7 @@ import os
 import time
 import uuid
 from typing import Any, cast
+from uuid import UUID
 
 from ..api.schemas import ExtractionRequest, ExtractionResponse
 from ..core.logging import log
@@ -50,23 +51,32 @@ class Processor:
                     episode_ids.add(str(event["episode_id"]))
                 if not self.repository.heartbeat_job(namespace_id, job["id"], lease_seconds, str(job["lease_token"])):
                     raise RuntimeError("job lease is no longer active")
-                payload = json.loads(event["payload_json"])
-                extraction_payload = {**payload, "__termytedb_event_type": event["type"]}
-                source = payload_text(extraction_payload)
                 event_id = uuid.UUID(event["id"])
-                included = {event_id: source}
                 if self.provider is None:
+                    payload = json.loads(event["payload_json"])
+                    extraction_payload = {**payload, "__termytedb_event_type": event["type"]}
+                    source = payload_text(extraction_payload)
+                    included = {event_id: source}
                     raw_candidates = [rule_candidate_to_contract(item, event_id, source) for item in extract(extraction_payload)]
                     response = ExtractionResponse(schema_version="extraction-v1", prompt_version="rule-v1", candidates=raw_candidates)
                     provider_name, model_name, input_tokens, output_tokens = "rule", "rule-v1", None, None
                     provider_latency = 0
                     rule_mode = True
                 else:
+                    evidence_window = self.repository.extraction_window(namespace_id, event["id"], limit=4)
+                    if not evidence_window:
+                        payload = json.loads(event["payload_json"])
+                        extraction_payload = {**payload, "__termytedb_event_type": event["type"]}
+                        source = payload_text(extraction_payload)
+                        evidence_window = {event_id: source}
+                    else:
+                        source = evidence_window.get(str(event_id)) or next(reversed(list(evidence_window.values())))
+                    included = {UUID(event_key): value for event_key, value in evidence_window.items()}
                     existing_memories = self.repository.related_memory_context(namespace_id, source)
                     existing_by_ref = {str(item["ref"]): str(item["memory_id"]) for item in existing_memories}
                     request = ExtractionRequest(
                         namespace_id=namespace_id,
-                        events=[event_id],
+                        events=list(included),
                         evidence_text=included,
                         existing_memories=existing_memories,
                     )
@@ -95,20 +105,21 @@ class Processor:
                     provider_name, model_name = provider_result.provider_name, provider_result.model_name
                     input_tokens, output_tokens, provider_latency = provider_result.input_tokens, provider_result.output_tokens, provider_result.latency_ms
                     rule_mode = False
+                input_snapshot = {str(key): value for key, value in included.items()}
                 self.repository.record_run(
                     namespace_id,
                     {
                         "id": run_id,
                         "namespace_id": namespace_id,
-                        "input_hash": hashlib.sha256(source.encode()).hexdigest(),
+                        "input_hash": hashlib.sha256(json.dumps(input_snapshot, sort_keys=True, separators=(",", ":")).encode()).hexdigest(),
                         "provider_name": provider_name,
                         "model_name": model_name,
                         "prompt_version": response.prompt_version,
                         "schema_version": response.schema_version,
                         "started_at": self._now(),
                         "completed_at": None,
-                        "input_events_json": json.dumps([str(event_id)]),
-                        "input_characters": len(source),
+                        "input_events_json": json.dumps(list(input_snapshot), separators=(",", ":")),
+                        "input_characters": sum(len(text) for text in input_snapshot.values()),
                         "input_tokens": input_tokens,
                         "output_tokens": output_tokens,
                         "latency_ms": provider_latency or int((time.perf_counter() - started) * 1000),
@@ -208,20 +219,21 @@ class Processor:
                 safe_error = redact_text(str(exc))
                 error_class = exc.error_class if isinstance(exc, ProviderError) else type(exc).__name__
                 if not self._run_exists(namespace_id, run_id) and event is not None and self.provider is not None:
+                    fallback_snapshot = input_snapshot if "input_snapshot" in locals() else {str(event_id): source}
                     self.repository.record_run(
                         namespace_id,
                         {
                             "id": run_id,
                             "namespace_id": namespace_id,
-                            "input_hash": hashlib.sha256(source.encode()).hexdigest(),
+                            "input_hash": hashlib.sha256(json.dumps(fallback_snapshot, sort_keys=True, separators=(",", ":")).encode()).hexdigest(),
                             "provider_name": self.provider.name,
                             "model_name": self.provider.model,
                             "prompt_version": "unknown",
                             "schema_version": "extraction-v1",
                             "started_at": self._now(),
                             "completed_at": None,
-                            "input_events_json": json.dumps([str(event["id"])]),
-                            "input_characters": len(source),
+                            "input_events_json": json.dumps(list(fallback_snapshot), separators=(",", ":")),
+                            "input_characters": sum(len(text) for text in fallback_snapshot.values()),
                             "input_tokens": None,
                             "output_tokens": None,
                             "latency_ms": int((time.perf_counter() - started) * 1000),
