@@ -107,7 +107,14 @@ def test_low_confidence_transition_without_marker_remains_disputed(tmp_path):
 
 
 def test_processing_writes_graph_edges_and_episode_summary(tmp_path):
-    db = TermyteDB(tmp_path / "graph.sqlite")
+    class SummaryProvider:
+        name = "summary-test"
+
+        def summarize(self, text: str, *, namespace_id: str, episode_id: str) -> str:
+            del namespace_id, episode_id
+            return f"SUMMARY::{text[:60]}"
+
+    db = TermyteDB(tmp_path / "graph.sqlite", summary_provider=SummaryProvider())
     text = "Decision: use SQLite with WAL."
     receipt = db.ingest(
         {"namespace_id": "pipeline", "idempotency_key": "graph", "type": "conversation", "payload": {"text": text}}
@@ -137,7 +144,9 @@ def test_processing_writes_graph_edges_and_episode_summary(tmp_path):
     assert "contains" in predicates
 
     episode = db.episodes("pipeline")[0]
-    assert episode["summary"]
+    assert episode["summary"].startswith("SUMMARY::")
+    rebuilt = db.repository.rebuild_graph_index("pipeline")
+    assert rebuilt["edges"] >= 1
     search = db.search("pipeline", "SQLite")
     assert search
     assert search[0].component_scores["graph_proximity"] > 0

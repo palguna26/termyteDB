@@ -15,6 +15,7 @@ from ..core.redaction import redact_text
 from ..memory.encoding import score_observation
 from ..memory.extraction import CandidateRejected, ValidatedCandidate
 from ..memory.extractor import Candidate, payload_text
+from ..memory.provider import SessionSummaryProvider
 from ..retrieval.embedding import EmbeddingProvider, FastEmbedProvider, batch_dot, pack_embedding
 from .db import Database
 from .vector_index import SQLiteVecIndex
@@ -261,7 +262,14 @@ class Repository:
             )
             return cursor.rowcount == 1
 
-    def refresh_episode_summary(self, namespace_id: str, episode_id: str, *, limit: int = 8) -> str | None:
+    def refresh_episode_summary(
+        self,
+        namespace_id: str,
+        episode_id: str,
+        *,
+        limit: int = 8,
+        summary_provider: SessionSummaryProvider | None = None,
+    ) -> str | None:
         rows = self.db.execute(
             """SELECT e.* FROM episode_events ee JOIN events e ON e.id=ee.event_id
             WHERE ee.namespace_id=? AND ee.episode_id=? ORDER BY ee.ordinal LIMIT ?""",
@@ -285,7 +293,15 @@ class Repository:
             snippets.append(f"{role}: {short}")
             if len(snippets) >= 4:
                 break
-        summary = " | ".join(snippets) if snippets else None
+        base_text = "\n".join(snippets)
+        summary: str | None = None
+        if summary_provider is not None:
+            try:
+                summary = summary_provider.summarize(base_text, namespace_id=namespace_id, episode_id=episode_id)
+            except Exception:
+                summary = None
+        if not summary:
+            summary = " | ".join(snippets) if snippets else None
         if summary:
             self.set_episode_summary(namespace_id, episode_id, summary)
         return summary
@@ -1411,6 +1427,40 @@ class Repository:
         if previous_version_id:
             previous_entity = self.upsert_entity(namespace_id, f"memory-version:{previous_version_id}", previous_version_id, "memory-version", 1.0)
             self.add_relationship(namespace_id, previous_entity, predicate, memory_entity, memory_version_id=memory_version_id, confidence=1.0)
+
+    def rebuild_graph_index(self, namespace_id: str) -> dict[str, int]:
+        with self.db.lock, self.db.connection:
+            self.db.execute("DELETE FROM relationships WHERE namespace_id=?", (namespace_id,))
+            self.db.execute("DELETE FROM entity_aliases WHERE namespace_id=?", (namespace_id,))
+            self.db.execute("DELETE FROM entities WHERE namespace_id=?", (namespace_id,))
+            rows = self.db.execute(
+                """SELECT v.id AS version_id, v.memory_id, v.statement, v.source_event_id, v.version, m.subject_key
+                FROM memory_versions v JOIN memories m ON m.id=v.memory_id AND m.namespace_id=v.namespace_id
+                WHERE v.namespace_id=? ORDER BY v.memory_id, v.version""",
+                (namespace_id,),
+            ).fetchall()
+            count = 0
+            previous_by_memory: dict[str, str] = {}
+            for row in rows:
+                version_id = str(row["version_id"])
+                previous_version_id = previous_by_memory.get(str(row["memory_id"]))
+                episode_row = self.db.execute(
+                    "SELECT episode_id FROM events WHERE id=? AND namespace_id=?",
+                    (row["source_event_id"], namespace_id),
+                ).fetchone()
+                self.record_graph_links(
+                    namespace_id,
+                    episode_id=str(episode_row["episode_id"]) if episode_row and episode_row["episode_id"] else None,
+                    memory_version_id=version_id,
+                    memory_id=str(row["memory_id"]),
+                    subject_key=str(row["subject_key"]),
+                    statement=str(row["statement"]),
+                    predicate="updates" if previous_version_id else "contains",
+                    previous_version_id=previous_version_id,
+                )
+                previous_by_memory[str(row["memory_id"])] = version_id
+                count += 1
+            return {"edges": count}
 
     def list_versions(self, namespace_id: str, memory_id: str) -> list[sqlite3.Row]:
         return self.db.execute(

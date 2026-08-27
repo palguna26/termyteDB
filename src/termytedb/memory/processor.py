@@ -15,14 +15,21 @@ from ..storage.repository import Repository
 from .extraction import CandidateRejected, rule_candidate_to_contract, validate_candidate
 from .extractor import Candidate as RuleCandidate
 from .extractor import extract, payload_text
-from .provider import ExtractionProvider, ProviderError
+from .provider import ExtractionProvider, ProviderError, SessionSummaryProvider
 
 
 class Processor:
-    def __init__(self, repository: Repository, logger: logging.Logger, provider: ExtractionProvider | None = None):
+    def __init__(
+        self,
+        repository: Repository,
+        logger: logging.Logger,
+        provider: ExtractionProvider | None = None,
+        summary_provider: SessionSummaryProvider | None = None,
+    ):
         self.repository = repository
         self.logger = logger
         self.provider = provider
+        self.summary_provider = summary_provider
 
     def process_namespace(self, namespace_id: str, limit: int = 100, lease_seconds: int = 180, timeout_seconds: float = 30.0) -> tuple[int, int, int, int, int]:
         deadline = time.perf_counter() + timeout_seconds
@@ -239,7 +246,7 @@ class Processor:
                 log(self.logger, logging.ERROR, "processing.failed", namespace_id=namespace_id, job_id=job["id"], status=status, error=safe_error)
         for episode_id in sorted(episode_ids):
             try:
-                self.repository.refresh_episode_summary(namespace_id, episode_id)
+                self.repository.refresh_episode_summary(namespace_id, episode_id, summary_provider=self.summary_provider)
             except Exception:
                 log(self.logger, logging.WARNING, "processing.summary_refresh_failed", namespace_id=namespace_id, episode_id=episode_id)
         return processed, failed, dead, accepted, rejected

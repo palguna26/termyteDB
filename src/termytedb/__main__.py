@@ -4,7 +4,7 @@ import os
 import uvicorn
 
 from .api.service import create_app
-from .memory.provider import HttpExtractionProvider, OpenRouterExtractionProvider
+from .memory.provider import HttpExtractionProvider, OpenRouterExtractionProvider, OpenRouterSessionSummaryProvider
 from .retrieval.embedding import OpenAICompatibleEmbeddingProvider
 
 if __name__ == "__main__":
@@ -24,12 +24,24 @@ if __name__ == "__main__":
         provider = HttpExtractionProvider(endpoint, args.extraction_model)
     else:
         provider = OpenRouterExtractionProvider(args.extraction_model)
+    summary_provider = None
+    if os.environ.get("OPENROUTER_API_KEY") or os.environ.get("TERMYTEDB_SUMMARY_API_KEY") or os.environ.get("TERMYTEDB_SUMMARY_MODEL"):
+        try:
+            summary_provider = OpenRouterSessionSummaryProvider()
+        except ValueError:
+            summary_provider = None
     embedding = None
     embedding_provider = args.embedding_provider or os.environ.get("TERMYTEDB_EMBEDDING_PROVIDER", "openrouter")
     if embedding_provider == "openrouter":
         embedding = OpenAICompatibleEmbeddingProvider(args.embedding_model, dimensions=args.embedding_dimensions)
     uvicorn.run(
-        create_app(args.database, extraction_provider=provider, embedding_provider=embedding, rate_limit_per_minute=args.rate_limit_per_minute),
+        create_app(
+            args.database,
+            extraction_provider=provider,
+            embedding_provider=embedding,
+            summary_provider=summary_provider,
+            rate_limit_per_minute=args.rate_limit_per_minute,
+        ),
         host=args.host,
         port=args.port,
     )

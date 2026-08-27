@@ -31,6 +31,7 @@ from ..api.schemas import (
 )
 from ..core.errors import IdempotencyConflict
 from ..memory.provider import ExtractionProvider
+from ..memory.provider import SessionSummaryProvider
 from ..retrieval.embedding import EmbeddingProvider
 from ..runtime.engine import TermyteDB
 from ..storage.db import Database
@@ -43,13 +44,20 @@ def create_app(
     database: Database | None = None,
     extraction_provider: ExtractionProvider | None = None,
     embedding_provider: EmbeddingProvider | None = None,
+    summary_provider: SessionSummaryProvider | None = None,
     request_authorizer: Callable[[Request], bool] | None = None,
     namespace_authorizer: Callable[[str], bool] | None = None,
     rate_limit_per_minute: int | None = None,
 ) -> FastAPI:
     if database is None and database_path is None:
         raise ValueError("create_app requires an explicit database path or database instance")
-    engine = TermyteDB(database_path, database=database, extraction_provider=extraction_provider, embedding_provider=embedding_provider)
+    engine = TermyteDB(
+        database_path,
+        database=database,
+        extraction_provider=extraction_provider,
+        embedding_provider=embedding_provider,
+        summary_provider=summary_provider,
+    )
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:

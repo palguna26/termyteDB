@@ -107,6 +107,12 @@ class ExtractionProvider(Protocol):
     ) -> ProviderResult: ...
 
 
+class SessionSummaryProvider(Protocol):
+    name: str
+
+    def summarize(self, text: str, *, namespace_id: str, episode_id: str) -> str: ...
+
+
 class FakeExtractionProvider:
     """Deterministic, offline provider used by tests and local evaluation."""
 
@@ -137,6 +143,17 @@ class FakeExtractionProvider:
             output_tokens=len(raw.split()),
             latency_ms=int((time.perf_counter() - started) * 1000),
         )
+
+
+class FakeSessionSummaryProvider:
+    """Deterministic session summary provider for tests and offline recovery."""
+
+    name = "fake-summary"
+
+    def summarize(self, text: str, *, namespace_id: str, episode_id: str) -> str:
+        del namespace_id, episode_id
+        cleaned = " ".join(str(text or "").split())
+        return cleaned[:240]
 
 
 class HttpExtractionProvider:
@@ -192,6 +209,26 @@ class HttpExtractionProvider:
             output_tokens=len(raw.split()),
             latency_ms=int((time.perf_counter() - started) * 1000),
         )
+
+
+def build_session_summary_prompt(text: str, *, namespace_id: str, episode_id: str) -> list[dict[str, str]]:
+    return [
+        {
+            "role": "system",
+            "content": "Write a concise conversational session summary. Return plain text only.",
+        },
+        {
+            "role": "user",
+            "content": (
+                "Summarize this conversation session for downstream memory retrieval.\n"
+                f"namespace_id: {namespace_id}\n"
+                f"episode_id: {episode_id}\n"
+                "Keep the summary short, factual, and conversational. Mention stable facts, decisions, preferences, and changes.\n"
+                "Do not mention that you are summarizing. Do not add labels or bullet points.\n\n"
+                f"{text}"
+            ),
+        },
+    ]
 
 
 class OpenRouterExtractionProvider:
@@ -270,3 +307,43 @@ class OpenRouterExtractionProvider:
             output_tokens=usage.get("completion_tokens") if isinstance(usage.get("completion_tokens"), int) else None,
             latency_ms=int((time.perf_counter() - started) * 1000),
         )
+
+
+class OpenRouterSessionSummaryProvider:
+    """OpenRouter chat completions provider for session summaries."""
+
+    name = "openrouter-summary"
+
+    def __init__(self, model: str | None = None, api_key: str | None = None, base_url: str | None = None):
+        self.model = model or os.environ.get("TERMYTEDB_SUMMARY_MODEL") or os.environ.get("TERMYTEDB_EXTRACTION_MODEL") or "openrouter/free"
+        self.api_key = api_key or os.environ.get("TERMYTEDB_SUMMARY_API_KEY") or os.environ.get("TERMYTEDB_EXTRACTION_API_KEY") or os.environ.get("OPENROUTER_API_KEY")
+        self.base_url = (
+            base_url or os.environ.get("TERMYTEDB_SUMMARY_BASE_URL") or os.environ.get("TERMYTEDB_EXTRACTION_BASE_URL") or os.environ.get("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
+        ).rstrip("/")
+        if not self.api_key:
+            raise ValueError("OPENROUTER_API_KEY is required")
+
+    def summarize(self, text: str, *, namespace_id: str, episode_id: str) -> str:
+        prompt = build_session_summary_prompt(text, namespace_id=namespace_id, episode_id=episode_id)
+        body = json.dumps(
+            {
+                "model": self.model,
+                "messages": prompt,
+                "temperature": 0,
+                "max_tokens": 220,
+            }
+        ).encode("utf-8")
+        headers = {
+            "authorization": f"Bearer {self.api_key}",
+            "content-type": "application/json",
+            "http-referer": "https://termyte.dev",
+            "x-title": "TermyteDB Session Summary",
+        }
+        with urlopen(Request(f"{self.base_url}/chat/completions", data=body, headers=headers, method="POST"), timeout=45.0) as response:
+            raw = response.read().decode("utf-8", errors="replace")
+        payload = json.loads(raw)
+        choice = payload["choices"][0]["message"]["content"]
+        if isinstance(choice, list):
+            choice = "".join(str(part.get("text") or "") for part in choice if isinstance(part, dict))
+        summary = " ".join(str(choice or "").split())
+        return summary[:400]

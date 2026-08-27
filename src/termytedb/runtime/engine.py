@@ -19,7 +19,7 @@ from ..core.logging import get_logger, log
 from ..core.redaction import redact
 from ..memory.consolidator import consolidate
 from ..memory.processor import Processor
-from ..memory.provider import ExtractionProvider
+from ..memory.provider import ExtractionProvider, SessionSummaryProvider
 from ..retrieval.context import build_context
 from ..retrieval.embedding import EmbeddingProvider
 from ..storage.db import Database
@@ -36,6 +36,7 @@ class TermyteDB:
         logger: logging.Logger | None = None,
         extraction_provider: ExtractionProvider | None = None,
         embedding_provider: EmbeddingProvider | None = None,
+        summary_provider: SessionSummaryProvider | None = None,
     ):
         if database is None and path is None:
             raise ValueError("an explicit database path or database instance is required")
@@ -44,7 +45,7 @@ class TermyteDB:
         self.database = database or Database(path)  # type: ignore[arg-type]
         self.repository = Repository(self.database, embedding_provider)
         self.logger = logger or get_logger()
-        self.processor = Processor(self.repository, self.logger, extraction_provider)
+        self.processor = Processor(self.repository, self.logger, extraction_provider, summary_provider)
         self._closed = False
 
     def ingest(self, event: EventInput | dict[str, Any]) -> EventReceipt:
