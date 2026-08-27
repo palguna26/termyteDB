@@ -401,11 +401,11 @@ def test_extraction_window_includes_previous_same_session_turns(tmp_path: Path):
             "payload": {"text": "Maya moved to Berlin."},
         })
         db.process("window")
-        assert len(captured_requests) == 2
-        assert len(captured_requests[0].events) == 1
-        assert len(captured_requests[1].events) == 2
-        assert len(captured_requests[1].evidence_text) == 2
-        assert any("Berlin" in text for text in captured_requests[1].evidence_text.values())
+        assert len(captured_requests) == 1
+        assert len(captured_requests[0].events) == 2
+        assert len(captured_requests[0].evidence_text) == 2
+        assert any("Berlin" in text for text in captured_requests[0].evidence_text.values())
+        assert db.metrics("window")["jobs_completed"] == 2
     finally:
         db.close()
 

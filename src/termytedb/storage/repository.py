@@ -29,6 +29,13 @@ HISTORY_QUERY_RE = re.compile(
     r"(\bused to\b|\bpreviously\b|\bformerly\b|\bhistorical\b|\bearlier\b|\bback then\b|\bwhat did\b.*\bbefore\b|\bwhen did\b.*\bfirst\b)",
     re.I,
 )
+TEMPORAL_QUERY_RE = re.compile(
+    r"(\b(?:before|after|during|between|since|until|earliest|latest|first|last)\b|\b(?:19|20)\d{2}\b)",
+    re.I,
+)
+SEARCH_STOP_WORDS = {
+    "a", "an", "and", "are", "as", "at", "be", "by", "for", "from", "how", "i", "in", "is", "it", "of", "on", "or", "the", "to", "was", "what", "when", "where", "who", "with",
+}
 
 
 def iso(value: datetime | None = None) -> str:
@@ -1038,8 +1045,14 @@ class Repository:
         ]
 
     def search(self, namespace_id: str, query: str, limit: int, historical: bool = False, *, internal: bool = False) -> list[SearchResult]:
-        terms = list(dict.fromkeys(term.casefold() for term in re.findall(r"[\w./:-]+", query) if len(term) > 1))
-        historical = historical or (not internal and bool(HISTORY_QUERY_RE.search(query)))
+        terms = list(
+            dict.fromkeys(
+                term.casefold()
+                for term in re.findall(r"[\w./:-]+", query)
+                if len(term) > 1 and term.casefold() not in SEARCH_STOP_WORDS
+            )
+        )
+        historical = historical or (not internal and bool(HISTORY_QUERY_RE.search(query) or TEMPORAL_QUERY_RE.search(query)))
         prefer_oldest = bool(re.search(r"\b(first|earliest|initial|original|before|used to|previous|previously|former|formerly)\b", query, re.I))
         lexical: dict[str, float] = {}
         lexical_rank: dict[str, int] = {}
@@ -1101,7 +1114,26 @@ class Repository:
                     vector = {}
                     vector_rank = {}
 
-        candidate_ids = set(lexical) | {memory_id for memory_id, score in vector.items() if score >= 0.7}
+        # Keep semantic hits above the search floor in the candidate pool. The
+        # reranker and evidence scores decide the final order; dropping 0.60-
+        # 0.70 matches here loses paraphrased temporal and preference answers.
+        candidate_ids = set(lexical) | {memory_id for memory_id, score in vector.items() if score >= 0.6}
+        alias_rank: dict[str, int] = {}
+        alias_terms = [term for term in terms if len(term) > 2]
+        if alias_terms:
+            alias_match = " OR ".join("lower(ea.alias) LIKE ?" for _ in alias_terms)
+            alias_rows = self.db.execute(
+                f"""SELECT DISTINCT r.memory_version_id, MIN(ea.alias) AS alias
+                FROM relationships r
+                JOIN entity_aliases ea ON ea.entity_id IN (r.subject_entity_id, r.object_entity_id)
+                WHERE r.namespace_id=? AND ea.namespace_id=? AND r.memory_version_id IS NOT NULL
+                  AND ({alias_match})
+                GROUP BY r.memory_version_id
+                ORDER BY r.memory_version_id""",
+                (namespace_id, namespace_id, *(f"%{term}%" for term in alias_terms)),
+            ).fetchall()
+            alias_rank = {str(row["memory_version_id"]): index for index, row in enumerate(alias_rows, start=1)}
+            candidate_ids |= set(alias_rank)
         if not candidate_ids:
             return []
         placeholders = ",".join("?" for _ in candidate_ids)
@@ -1169,12 +1201,15 @@ class Repository:
             return score
 
         lowered_terms = [term.casefold() for term in terms]
+        query_years = [int(value) for value in re.findall(r"\b(?:19|20)\d{2}\b", query)]
 
         def score_row(row: sqlite3.Row) -> float:
             version_id = str(row["version_id"])
             lexical_rrf = 1.0 / (60 + lexical_rank[version_id]) if version_id in lexical_rank else 0.0
             vector_rrf = 1.0 / (60 + vector_rank[version_id]) if version_id in vector_rank else 0.0
-            fused = 60 * (lexical_rrf + vector_rrf) / 2
+            alias_rrf = 1.0 / (60 + alias_rank[version_id]) if version_id in alias_rank else 0.0
+            channel_count = sum((version_id in lexical_rank, version_id in vector_rank, version_id in alias_rank))
+            fused = 60 * (lexical_rrf + vector_rrf + alias_rrf) / max(1, channel_count)
             exact = 0.08 if query.casefold() in str(row["statement"]).casefold() else 0.0
             support = min(0.04, 0.01 * len(self._citations(namespace_id, version_id)))
             quality = 0.03 * float(row["confidence"]) + 0.02 * float(row["importance"])
@@ -1183,6 +1218,12 @@ class Repository:
             history = 0.0
             if historical and row["valid_to"] is not None:
                 history = 0.02 if prefer_oldest else 0.01
+            temporal = 0.0
+            if query_years:
+                valid_from = str(row["valid_from"] or "")
+                valid_to = str(row["valid_to"] or "")
+                if any(str(year) in valid_from or str(year) in valid_to for year in query_years):
+                    temporal = 0.05
             # Small recency tie-breaker inspired by graphiti temporal handling:
             # when scores are close, prefer the more recent valid_from for ordinary
             # agent recency. Bounded to 0.02 to avoid overriding lexical/semantic.
@@ -1194,7 +1235,7 @@ class Repository:
                     recency = 0.01  # placeholder for future decay; kept small to avoid gaming
             except Exception:
                 recency = 0.0
-            return min(1.0, fused + exact + support + quality + graph + summary + history + recency)
+            return min(1.0, fused + exact + support + quality + graph + summary + history + temporal + recency)
 
         # Primary sort by score, secondary by valid_from. Historical queries that
         # ask for "first" or "before" should prefer older evidence instead of the
@@ -1226,6 +1267,7 @@ class Repository:
                         "staleness_penalty": float(row["status"] != "active"),
                         "lexical_rank": float(lexical_rank.get(str(row["version_id"]), 0)),
                         "vector_rank": float(vector_rank.get(str(row["version_id"]), 0)),
+                        "alias_rank": float(alias_rank.get(str(row["version_id"]), 0)),
                         "exact_match": float(query.casefold() in str(row["statement"]).casefold()),
                         "graph_proximity": round(graph_signal(str(row["version_id"])), 6),
                         "session_summary": round(summary_signal(str(row["version_id"])), 6),

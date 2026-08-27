@@ -14,6 +14,7 @@ from ..core.logging import log
 from ..core.redaction import redact_text
 from ..storage.repository import Repository
 from .extraction import CandidateRejected, validate_candidate
+from .extractor import payload_text
 from .provider import ExtractionProvider, ProviderError, SessionSummaryProvider, default_extraction_provider
 
 
@@ -32,35 +33,56 @@ class Processor:
 
     def process_namespace(self, namespace_id: str, limit: int = 100, lease_seconds: int = 180, timeout_seconds: float = 30.0) -> tuple[int, int, int, int, int]:
         deadline = time.perf_counter() + timeout_seconds
-        jobs = self.repository.claim_jobs(namespace_id, limit, lease_seconds)
+        jobs = self.repository.claim_jobs(namespace_id, min(limit, 100), lease_seconds)
         provider = self.provider or default_extraction_provider()
         self.provider = provider
         processed = failed = dead = accepted = rejected = 0
         episode_ids: set[str] = set()
+        scoped_jobs: dict[str, list[tuple[Any, Any]]] = {}
         for job in jobs:
+            event = self.repository.event_for_job(namespace_id, job["id"])
+            # Events without an explicit conversation scope must not be mixed
+            # with unrelated events just because they share a namespace.
+            scope = str(event["stream_id"] or event["session_id"] or event["id"])
+            scoped_jobs.setdefault(scope, []).append((job, event))
+
+        # Extract a bounded session batch in one provider call. This keeps the
+        # evidence window coherent and avoids one LLM request per event.
+        batches: list[list[tuple[Any, Any]]] = []
+        for scoped in scoped_jobs.values():
+            for start in range(0, len(scoped), 20):
+                batches.append(scoped[start : start + 20])
+
+        for batch in batches:
             if time.perf_counter() >= deadline:
                 break
             run_id = str(uuid.uuid4())
             started = time.perf_counter()
-            job_accepted = job_rejected = 0
-            event = None
-            source = ""
+            batch_accepted = batch_rejected = 0
+            included: dict[UUID, str] = {}
+            current_jobs: dict[str, tuple[Any, Any]] = {}
+            input_snapshot: dict[str, str] = {}
             try:
-                event = self.repository.event_for_job(namespace_id, job["id"])
-                if event["episode_id"]:
-                    episode_ids.add(str(event["episode_id"]))
-                if not self.repository.heartbeat_job(namespace_id, job["id"], lease_seconds, str(job["lease_token"])):
-                    raise RuntimeError("job lease is no longer active")
-                event_id = uuid.UUID(event["id"])
-                evidence_window = self.repository.extraction_window(namespace_id, event["id"], limit=4)
-                if not evidence_window:
-                    payload = json.loads(event["payload_json"])
-                    source = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
-                    evidence_window = {event_id: source}
-                else:
-                    source = evidence_window.get(str(event_id)) or next(reversed(list(evidence_window.values())))
-                included = {UUID(event_key): value for event_key, value in evidence_window.items()}
-                existing_memories = self.repository.related_memory_context(namespace_id, source)
+                for job, event in batch:
+                    if event["episode_id"]:
+                        episode_ids.add(str(event["episode_id"]))
+                    if not self.repository.heartbeat_job(namespace_id, job["id"], lease_seconds, str(job["lease_token"])):
+                        raise RuntimeError("job lease is no longer active")
+                    event_id = UUID(event["id"])
+                    current_jobs[str(event_id)] = (job, event)
+                    source = payload_text(json.loads(event["payload_json"]), event["type"])
+                    included[event_id] = source
+
+                # Add prior same-session turns after current events. Every
+                # current event stays addressable for exact evidence offsets.
+                for _job, event in batch:
+                    for event_key, source in self.repository.extraction_window(namespace_id, event["id"], limit=4).items():
+                        if len(included) >= 20:
+                            break
+                        included.setdefault(UUID(event_key), source)
+
+                input_snapshot = {str(key): value for key, value in included.items()}
+                existing_memories = self.repository.related_memory_context(namespace_id, "\n".join(input_snapshot.values()))
                 existing_by_ref = {str(item["ref"]): str(item["memory_id"]) for item in existing_memories}
                 request = ExtractionRequest(
                     namespace_id=namespace_id,
@@ -69,15 +91,17 @@ class Processor:
                     existing_memories=existing_memories,
                 )
                 remaining = max(0.001, deadline - time.perf_counter())
-                if not self.repository.heartbeat_job(namespace_id, job["id"], lease_seconds, str(job["lease_token"])):
-                    raise RuntimeError("job lease is no longer active")
+                for job, _event in batch:
+                    if not self.repository.heartbeat_job(namespace_id, job["id"], lease_seconds, str(job["lease_token"])):
+                        raise RuntimeError("job lease is no longer active")
                 provider_result = provider.extract(
                     request,
                     timeout_seconds=remaining,
                     cancellation=lambda: time.perf_counter() >= deadline,
                 )
-                if not self.repository.heartbeat_job(namespace_id, job["id"], lease_seconds, str(job["lease_token"])):
-                    raise RuntimeError("job lease is no longer active")
+                for job, _event in batch:
+                    if not self.repository.heartbeat_job(namespace_id, job["id"], lease_seconds, str(job["lease_token"])):
+                        raise RuntimeError("job lease is no longer active")
                 response = provider_result.response
                 resolved_candidates = []
                 for candidate in response.candidates:
@@ -92,7 +116,6 @@ class Processor:
                 response = response.model_copy(update={"candidates": resolved_candidates})
                 provider_name, model_name = provider_result.provider_name, provider_result.model_name
                 input_tokens, output_tokens, provider_latency = provider_result.input_tokens, provider_result.output_tokens, provider_result.latency_ms
-                input_snapshot = {str(key): value for key, value in included.items()}
                 self.repository.record_run(
                     namespace_id,
                     {
@@ -118,7 +141,7 @@ class Processor:
                     },
                 )
                 fingerprints: set[str] = set()
-                validated_candidates: list[tuple[Any, Any]] = []
+                validated_candidates: list[tuple[Any, Any, Any, Any]] = []
                 for candidate in response.candidates:
                     try:
                         if candidate.existing_memory_ref is not None and candidate.existing_memory_id is None:
@@ -127,67 +150,63 @@ class Processor:
                         if validated.fingerprint in fingerprints:
                             raise CandidateRejected("duplicate_candidate")
                         fingerprints.add(validated.fingerprint)
-                        validated_candidates.append((candidate, validated))
+                        source_job, source_event = current_jobs.get(
+                            str(candidate.evidence[0].event_id), batch[0]
+                        )
+                        validated_candidates.append((candidate, validated, source_job, source_event))
                     except CandidateRejected as exc:
                         rejected += 1
-                        job_rejected += 1
+                        batch_rejected += 1
                         self.repository.record_decision(namespace_id, run_id, candidate, self._safe_fingerprint(candidate), "rejected", exc.reason, "REJECT")
 
-                embedding_values = [validated.candidate.statement for _, validated in validated_candidates]
+                embedding_values = [validated.candidate.statement for _, validated, _job, _event in validated_candidates]
                 embedding_vectors = self.repository.embed_many(embedding_values) if embedding_values else []
-                for (candidate, validated), embedding in zip(validated_candidates, embedding_vectors, strict=True):
+                for (candidate, validated, source_job, source_event), embedding in zip(validated_candidates, embedding_vectors, strict=True):
                     try:
                         reconciled_memory_id, action, reconciled_version_id = self.repository.reconcile_candidate(
                             namespace_id,
-                            event,
+                            source_event,
                             validated,
                             run_id,
                             embedding,
-                            job_id=str(job["id"]),
-                            lease_token=str(job["lease_token"]),
+                            job_id=str(source_job["id"]),
+                            lease_token=str(source_job["lease_token"]),
                         )
                         memory_id = reconciled_memory_id
                         version_id = reconciled_version_id
                         self.repository.record_decision(namespace_id, run_id, candidate, validated.fingerprint, "accepted", None, action, memory_id, version_id)
                         accepted += 1
-                        job_accepted += 1
+                        batch_accepted += 1
                     except CandidateRejected as exc:
                         rejected += 1
-                        job_rejected += 1
+                        batch_rejected += 1
                         self.repository.record_decision(namespace_id, run_id, candidate, self._safe_fingerprint(candidate), "rejected", exc.reason, "REJECT")
-                self.repository.finish_run(namespace_id, run_id, job_accepted, job_rejected, "completed")
-                if self.repository.complete_job(namespace_id, job["id"]) is False:
-                    raise RuntimeError("job lease is no longer active")
-                processed += 1
-                log(
-                    self.logger,
-                    logging.INFO,
-                    "processing.completed",
-                    namespace_id=namespace_id,
-                    job_id=job["id"],
-                    candidates=len(response.candidates),
-                    accepted=job_accepted,
-                    rejected=job_rejected,
-                )
+                self.repository.finish_run(namespace_id, run_id, batch_accepted, batch_rejected, "completed")
+                for job, _event in batch:
+                    if self.repository.complete_job(namespace_id, job["id"], str(job["lease_token"])) is False:
+                        raise RuntimeError("job lease is no longer active")
+                processed += len(batch)
+                log(self.logger, logging.INFO, "processing.completed", namespace_id=namespace_id,
+                    job_id=str(batch[0][0]["id"]), batch_jobs=len(batch), candidates=len(response.candidates),
+                    accepted=batch_accepted, rejected=batch_rejected)
             except Exception as exc:
                 safe_error = redact_text(str(exc))
                 error_class = exc.error_class if isinstance(exc, ProviderError) else type(exc).__name__
-                if not self._run_exists(namespace_id, run_id) and event is not None and self.provider is not None:
-                    fallback_snapshot = input_snapshot if "input_snapshot" in locals() else {str(event_id): source}
+                if not self._run_exists(namespace_id, run_id) and input_snapshot and self.provider is not None:
                     self.repository.record_run(
                         namespace_id,
                         {
                             "id": run_id,
                             "namespace_id": namespace_id,
-                            "input_hash": hashlib.sha256(json.dumps(fallback_snapshot, sort_keys=True, separators=(",", ":")).encode()).hexdigest(),
+                            "input_hash": hashlib.sha256(json.dumps(input_snapshot, sort_keys=True, separators=(",", ":")).encode()).hexdigest(),
                             "provider_name": self.provider.name,
                             "model_name": self.provider.model,
                             "prompt_version": "unknown",
                             "schema_version": "extraction-v1",
                             "started_at": self._now(),
                             "completed_at": None,
-                            "input_events_json": json.dumps(list(fallback_snapshot), separators=(",", ":")),
-                            "input_characters": sum(len(text) for text in fallback_snapshot.values()),
+                            "input_events_json": json.dumps(list(input_snapshot), separators=(",", ":")),
+                            "input_characters": sum(len(text) for text in input_snapshot.values()),
                             "input_tokens": None,
                             "output_tokens": None,
                             "latency_ms": int((time.perf_counter() - started) * 1000),
@@ -199,17 +218,18 @@ class Processor:
                         },
                     )
                 if self._run_exists(namespace_id, run_id):
-                    self.repository.finish_run(namespace_id, run_id, job_accepted, job_rejected, "failed", error_class)
-                status = self.repository.fail_job(
-                    namespace_id,
-                    job["id"],
-                    safe_error,
-                    retryable=not isinstance(exc, ProviderError) or exc.retryable,
-                    lease_token=str(job["lease_token"]),
-                )
-                failed += 1
-                dead += status == "dead"
-                log(self.logger, logging.ERROR, "processing.failed", namespace_id=namespace_id, job_id=job["id"], status=status, error=safe_error)
+                    self.repository.finish_run(namespace_id, run_id, batch_accepted, batch_rejected, "failed", error_class)
+                for job, _event in batch:
+                    status = self.repository.fail_job(
+                        namespace_id,
+                        job["id"],
+                        safe_error,
+                        retryable=not isinstance(exc, ProviderError) or exc.retryable,
+                        lease_token=str(job["lease_token"]),
+                    )
+                    failed += 1
+                    dead += status == "dead"
+                    log(self.logger, logging.ERROR, "processing.failed", namespace_id=namespace_id, job_id=job["id"], status=status, error=safe_error)
         for episode_id in sorted(episode_ids):
             try:
                 self.repository.refresh_episode_summary(namespace_id, episode_id, summary_provider=self.summary_provider)

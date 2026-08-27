@@ -69,3 +69,37 @@ def test_http_provider_rejects_malformed_output_without_leaking_response(monkeyp
     with pytest.raises(ProviderError, match="invalid extraction-v1 JSON") as error:
         HttpExtractionProvider("http://provider").extract(request())
     assert "should-not-appear" not in str(error.value)
+
+
+def test_openrouter_provider_requests_strict_extraction_schema(monkeypatch):
+    from termytedb.provider import OpenRouterExtractionProvider
+
+    captured = {}
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def read(self):
+            return json.dumps(
+                {
+                    "model": "mistralai/mistral-nemo",
+                    "choices": [{"message": {"content": '{"schema_version":"extraction-v1","prompt_version":"v1","candidates":[]}'}}],
+                }
+            ).encode()
+
+    def fake_urlopen(request, **_kwargs):
+        captured["body"] = json.loads(request.data)
+        return Response()
+
+    monkeypatch.setattr("termytedb.provider.urlopen", fake_urlopen)
+    result = OpenRouterExtractionProvider("mistralai/mistral-nemo", api_key="test-key").extract(request())
+
+    response_format = captured["body"]["response_format"]
+    assert response_format["type"] == "json_schema"
+    assert response_format["json_schema"]["strict"] is True
+    assert response_format["json_schema"]["schema"]["title"] == "ExtractionResponse"
+    assert result.response.schema_version == "extraction-v1"

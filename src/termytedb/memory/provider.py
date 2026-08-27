@@ -26,6 +26,18 @@ def clean_json_response(value: str) -> str:
     return cleaned
 
 
+def extraction_response_format() -> dict[str, object]:
+    """Build the strict provider schema from the canonical Pydantic contract."""
+    return {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "extraction_v1",
+            "strict": True,
+            "schema": ExtractionResponse.model_json_schema(),
+        },
+    }
+
+
 def build_extraction_prompt(request: ExtractionRequest) -> str:
     """Build a clearly delimited prompt for a future provider; delimiters are not a security boundary.
 
@@ -330,9 +342,6 @@ class OpenRouterExtractionProvider:
         if cancellation and cancellation():
             raise ProviderError("extraction cancelled", retryable=True, error_class="cancelled")
         prompt = build_extraction_prompt(request)
-        # Ling 3.0 and Granite do not support strict json_schema via OpenRouter;
-        # use json_object where available, otherwise rely on prompt alone.
-        # Keep require_parameters off so routing can fall back to a provider that supports it.
         body = json.dumps(
             {
                 "model": self.model,
@@ -341,8 +350,9 @@ class OpenRouterExtractionProvider:
                     {"role": "user", "content": prompt},
                 ],
                 "temperature": 0,
-                "max_tokens": 1500,
-                "response_format": {"type": "json_object"},
+                "max_tokens": 2500,
+                "response_format": extraction_response_format(),
+                "plugins": [{"id": "response-healing"}],
             }
         ).encode("utf-8")
         headers = {
@@ -363,9 +373,16 @@ class OpenRouterExtractionProvider:
             raise ProviderError("extraction cancelled", retryable=True, error_class="cancelled")
         try:
             payload = json.loads(raw_bytes.decode("utf-8"))
-            choice = payload["choices"][0]["message"]["content"]
+            message = payload["choices"][0]["message"]
+            choice = message.get("content")
             if isinstance(choice, list):
-                choice = "".join(str(part.get("text") or "") for part in choice if isinstance(part, dict))
+                choice = "".join(
+                    str(part.get("text") or "")
+                    for part in choice
+                    if isinstance(part, dict) and part.get("type", "text") == "text"
+                )
+            if isinstance(choice, dict):
+                choice = json.dumps(choice)
             if not isinstance(choice, str) or not choice.strip():
                 raise ProviderError("OpenRouter returned empty extraction content", retryable=True, error_class="empty_output")
             parsed = ExtractionResponse.model_validate(json.loads(clean_json_response(choice)))
