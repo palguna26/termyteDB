@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "termytedb"
 version = "0.1.0"
-description = "Evidence-first memory engine for AI agents"
+description = "Memory engine for AI agents"
 requires-python = ">=3.11"
 dependencies = [
   "fastembed>=0.7,<1",
