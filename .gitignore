@@ -17,3 +17,4 @@ benchmarks/longmemeval/*.sqlite*
 benchmarks/longmemeval/*.log
 benchmarks/longmemeval/*.err
 benchmarks/runs/*
+results/

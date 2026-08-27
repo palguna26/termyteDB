@@ -17,6 +17,7 @@ import argparse
 import json
 import os
 import statistics
+import threading
 import time
 import uuid
 from collections import defaultdict
@@ -41,7 +42,7 @@ DEFAULT_JUDGE_MODEL = "openai/gpt-4o-mini"
 class PacedExtractionProvider:
     """Wraps OpenRouterExtractionProvider with global pacing to avoid 429 dead-letters.
     Optimized: Ling via Novita tolerates 0.76s P50, so 0.7s global pacing + 8 workers
-    cuts 19k sessions from 10.6h → ~3.7h (was 2.0s → 10.6h)."""
+    cuts 19k sessions from 10.6h -> ~3.7h (was 2.0s -> 10.6h)."""
 
     name = "openrouter-paced"
 
@@ -176,7 +177,7 @@ def run(
     if not api_key:
         raise ValueError("OPENROUTER_API_KEY missing in .env")
     extraction_provider = PacedExtractionProvider(model=extraction_model, api_key=api_key, min_delay=0.7)
-    log(f"Extraction: {extraction_model} (paced 0.7s, 8 workers → ~3.7h for 19k sessions)")
+    log(f"Extraction: {extraction_model} (paced 0.7s, 8 workers -> ~3.7h for 19k sessions)")
     log(f"Answer: {answer_model}")
     log(f"Judge: {judge_model} (only judge)")
     if budget_usd is not None:
@@ -232,25 +233,33 @@ def run(
             if i == 1 or i % 500 == 0:
                 log(f"Ingested {i}/{len(session_payloads)}")
 
-        log(f"Processing with {workers} workers (Mistral Nemo extraction, ~248 pairs/q avg)")
+        log(f"Processing with {workers} workers (Ling extraction, ~248 pairs/q avg)")
         processed = 0
         worker_dbs = [TermyteDB(database, logger=logger, extraction_provider=extraction_provider, embedding_provider=embedding) for _ in range(workers)]
         try:
             with ThreadPoolExecutor(max_workers=workers) as ex:
                 while True:
-                    resps = list(ex.map(lambda w: w.process_with_timeout("longmemeval-e2e", limit=100, timeout_seconds=180.0), worker_dbs))
+                    resps = list(ex.map(lambda w: w.process_with_timeout("longmemeval-e2e", limit=20, timeout_seconds=300.0), worker_dbs))
                     batch = sum(r.processed for r in resps)
                     processed += batch
                     failed = sum(r.failed for r in resps)
                     dead = sum(r.dead_lettered for r in resps)
-                    pending = int(db.metrics("longmemeval-e2e")["jobs_pending"])
-                    jobs_dead = int(db.metrics("longmemeval-e2e").get("jobs_dead", 0))
-                    log(f"Processed {processed} | failed={failed} dead={dead} pending={pending} dead_total={jobs_dead}")
-                    if dead and jobs_dead > 10:
+                    metrics = db.metrics("longmemeval-e2e")
+                    pending = int(metrics.get("jobs_pending", 0))
+                    processing = int(metrics.get("jobs_processing", 0))
+                    # Fallback: count directly if metrics missing
+                    if "jobs_processing" not in metrics:
+                        processing = int(db.database.execute("SELECT COUNT(*) FROM processing_jobs WHERE namespace_id=? AND status='processing'", ("longmemeval-e2e",)).fetchone()[0])
+                    jobs_dead = int(metrics.get("jobs_dead", 0))
+                    log(f"Processed {processed} | failed={failed} dead={dead} pending={pending} processing={processing} dead_total={jobs_dead}")
+                    if dead and jobs_dead > 20:
                         log(f"WARNING: {jobs_dead} dead-lettered jobs — continuing, recall will be lower")
-                    if pending == 0:
+                    if pending == 0 and processing == 0:
                         break
-                    if batch == 0 and failed:
+                    if batch == 0 and failed == 0 and pending == 0 and processing > 0:
+                        log(f"Waiting for {processing} leased jobs to complete or expire...")
+                        time.sleep(5)
+                    elif batch == 0 and failed:
                         time.sleep(3)
         finally:
             for w in worker_dbs:
@@ -317,7 +326,7 @@ def run(
         recall = sum(int(r["hit"]) for r in rows) / len(rows) if rows else 0.0
         mrr_avg = sum(float(r["mrr"]) for r in rows) / len(rows) if rows else 0.0
         result: dict[str, Any] = {
-            "pipeline": f"TermyteDB ingest → {extraction_model} extraction + {answer_model} answer → {judge_model} judge",
+            "pipeline": f"TermyteDB ingest -> {extraction_model} extraction + {answer_model} answer -> {judge_model} judge",
             "dataset": dataset.name,
             "extraction_model": extraction_model,
             "answer_model": answer_model,
