@@ -14,34 +14,28 @@ class Candidate:
     end_offset: int
 
 
-EXECUTION_EVENT_TYPES = {"tool_execution", "bash_command"}
-EXECUTION_FIELDS = (
-    ("tool_name", "Tool"),
-    ("command", "Command"),
-    ("cmd", "Command"),
-    ("stdout", "Stdout"),
-    ("stderr", "Stderr"),
-    ("exit_code", "Exit code"),
-    ("error", "Error"),
-    ("corrective_action", "Corrective action"),
-    ("recovery", "Recovery"),
-    ("resolution", "Resolution"),
-)
+IGNORED_KEYS = {
+    "__termytedb_event_type",
+    "tool_name",
+    "command",
+    "cmd",
+    "stdout",
+    "stderr",
+    "exit_code",
+    "error",
+    "corrective_action",
+    "recovery",
+    "resolution",
+}
 
 
 def payload_text(payload: dict[str, Any], event_type: str | None = None) -> str:
-    """Project an event payload into stable extraction text.
+    """Project a conversational payload into stable extraction text.
 
-    Agent hooks often wrap the real request in volatile harness context. Keep
-    the stored redacted payload unchanged, but prefer explicit user/assistant
-    fields and remove known wrapper blocks before extraction. The processor and
-    rule extractor both use this function, so evidence offsets remain aligned
-    with the text supplied to the extraction contract.
+    The processor and rule extractor both use this function, so evidence
+    offsets remain aligned with the text supplied to the extraction contract.
     """
     parts: list[str] = []
-
-    event_type = event_type or (str(payload.get("__termytedb_event_type")) if payload.get("__termytedb_event_type") else None)
-    execution_event = (event_type or "").casefold() in EXECUTION_EVENT_TYPES
 
     def clean(value: str, *, strip_wrappers: bool = True) -> str:
         cleaned = value
@@ -49,27 +43,6 @@ def payload_text(payload: dict[str, Any], event_type: str | None = None) -> str:
             for tag in ("additional_data", "system_reminder", "environment_context"):
                 cleaned = re.sub(rf"<{tag}>.*?</{tag}>", "", cleaned, flags=re.IGNORECASE | re.DOTALL)
         return cleaned.strip()
-
-    execution_parts: list[str] = []
-    seen_execution_labels: set[str] = set()
-
-    def visit_execution(value: Any) -> None:
-        if isinstance(value, dict):
-            for key, label in EXECUTION_FIELDS:
-                item = value.get(key)
-                if item is None or label in seen_execution_labels:
-                    continue
-                rendered = clean(str(item), strip_wrappers=False)
-                if rendered:
-                    execution_parts.append(f"{label}: {rendered}")
-                    seen_execution_labels.add(label)
-            for item in value.values():
-                visit_execution(item)
-        elif isinstance(value, list):
-            for item in value:
-                visit_execution(item)
-
-    visit_execution(payload)
 
     def visit_message(value: Any) -> None:
         if not isinstance(value, dict):
@@ -80,7 +53,7 @@ def payload_text(payload: dict[str, Any], event_type: str | None = None) -> str:
             return
         content = value.get("content", value.get("text"))
         if isinstance(content, str):
-            text = clean(content, strip_wrappers=not execution_event)
+            text = clean(content)
             if text:
                 parts.append(text)
         elif content is not None:
@@ -88,12 +61,12 @@ def payload_text(payload: dict[str, Any], event_type: str | None = None) -> str:
 
     def visit(value: Any) -> None:
         if isinstance(value, str):
-            text = clean(value, strip_wrappers=not execution_event)
+            text = clean(value)
             if text:
                 parts.append(text)
         elif isinstance(value, dict):
             for key, item in value.items():
-                if key == "__termytedb_event_type":
+                if key in IGNORED_KEYS:
                     continue
                 visit(item)
         elif isinstance(value, list):
@@ -111,11 +84,8 @@ def payload_text(payload: dict[str, Any], event_type: str | None = None) -> str:
         for message in messages:
             visit_message(message)
         explicit = explicit or bool(parts)
-    if not explicit and not execution_parts:
+    if not explicit:
         visit(payload)
-    for item in execution_parts:
-        if item.casefold() not in {part.casefold() for part in parts}:
-            parts.append(item)
     return "\n".join(parts)
 
 
@@ -126,7 +96,7 @@ RULES = (
             r"(?im)^(?:the|this|service|repository|version|file|branch)\s+[^.!?\n]{1,160}\s+(?:is|runs on|uses|requires|contains)\s+[^.!?\n]{1,240}[.!?]"
         ),
     ),
-    # --- Generic personal-fact fallback (ordinary agent conversations) ---
+    # --- Generic personal-fact fallback (conversational memory) ---
     # Captures first-person and possessive facts that the original service-oriented
     # pattern misses, e.g. "I graduated with a degree in Business Administration."
     # or "My favorite color is blue." Keeps evidence offsets stable via payload_text.

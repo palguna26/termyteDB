@@ -1,6 +1,6 @@
 # TermyteDB
 
-TermyteDB is a framework-independent, evidence-first memory engine for AI agents. It stores redacted canonical events, extracts versioned memories with evidence spans, reconciles history, and returns bounded cited context.
+TermyteDB is a framework-independent, evidence-first memory engine for conversational AI. It stores redacted canonical conversation events, extracts versioned memories with evidence spans, reconciles history, and returns bounded cited context.
 
 ## Local setup
 

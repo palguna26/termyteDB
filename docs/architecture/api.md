@@ -39,7 +39,7 @@ Python:
 
 ```python
 db = TermyteDB("memory.sqlite")
-db.ingest({"namespace_id": "project:acme/api", "idempotency_key": "run-7-tool-3", "type": "tool.result", "payload": result})
+db.ingest({"namespace_id": "project:acme/api", "idempotency_key": "run-7", "type": "decision", "payload": {"text": "Decision: use refresh tokens."}})
 db.process("project:acme/api")
 answer = db.context("project:acme/api", "Why is auth using refresh tokens?", token_budget=1200)
 ```
