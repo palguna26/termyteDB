@@ -104,3 +104,42 @@ def test_low_confidence_transition_without_marker_remains_disputed(tmp_path):
     assert db.database.execute("SELECT action FROM extraction_decisions ORDER BY rowid DESC LIMIT 1").fetchone()[0] == "DISPUTE"
     assert db.database.execute("SELECT status FROM memories").fetchone()[0] == "disputed"
     db.close()
+
+
+def test_processing_writes_graph_edges_and_episode_summary(tmp_path):
+    db = TermyteDB(tmp_path / "graph.sqlite")
+    text = "Decision: use SQLite with WAL."
+    receipt = db.ingest(
+        {"namespace_id": "pipeline", "idempotency_key": "graph", "type": "conversation", "payload": {"text": text}}
+    )
+    db.processor.provider = FakeExtractionProvider(
+        ExtractionResponse(
+            schema_version="extraction-v1",
+            prompt_version="test-v1",
+            candidates=[
+                ExtractionCandidate(
+                    kind="decision",
+                    subject="sqlite",
+                    statement=text,
+                    evidence=[EvidenceSpan(event_id=receipt.event_id, start_offset=0, end_offset=len(text), excerpt=text)],
+                    confidence=0.95,
+                    durability="permanent",
+                )
+            ],
+        )
+    )
+
+    result = db.process("pipeline")
+    assert result.accepted == 1
+
+    predicates = [row[0] for row in db.database.execute("SELECT predicate FROM relationships ORDER BY rowid").fetchall()]
+    assert "expresses" in predicates
+    assert "contains" in predicates
+
+    episode = db.episodes("pipeline")[0]
+    assert episode["summary"]
+    search = db.search("pipeline", "SQLite")
+    assert search
+    assert search[0].component_scores["graph_proximity"] > 0
+    assert search[0].component_scores["session_summary"] > 0
+    db.close()

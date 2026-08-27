@@ -253,6 +253,43 @@ class Repository:
             )
             return cursor.rowcount == 1
 
+    def set_episode_summary(self, namespace_id: str, episode_id: str, summary: str | None) -> bool:
+        with self.db.lock, self.db.connection:
+            cursor = self.db.execute(
+                "UPDATE episodes SET summary=?, updated_at=? WHERE id=? AND namespace_id=?",
+                (redact_text(summary) if summary else None, iso(), episode_id, namespace_id),
+            )
+            return cursor.rowcount == 1
+
+    def refresh_episode_summary(self, namespace_id: str, episode_id: str, *, limit: int = 8) -> str | None:
+        rows = self.db.execute(
+            """SELECT e.* FROM episode_events ee JOIN events e ON e.id=ee.event_id
+            WHERE ee.namespace_id=? AND ee.episode_id=? ORDER BY ee.ordinal LIMIT ?""",
+            (namespace_id, episode_id, max(1, min(limit, 20))),
+        ).fetchall()
+        if not rows:
+            return None
+        snippets: list[str] = []
+        seen: set[str] = set()
+        for row in rows:
+            text = payload_text({**json.loads(row["payload_json"]), "__termytedb_event_type": row["type"]})
+            text = " ".join(text.split())
+            if not text:
+                continue
+            short = text[:180]
+            key = short.casefold()
+            if key in seen:
+                continue
+            seen.add(key)
+            role = str(row["actor_id"] or row["type"] or "event")
+            snippets.append(f"{role}: {short}")
+            if len(snippets) >= 4:
+                break
+        summary = " | ".join(snippets) if snippets else None
+        if summary:
+            self.set_episode_summary(namespace_id, episode_id, summary)
+        return summary
+
     def record_feedback(self, namespace_id: str, memory_id: str, label: str, note: str | None) -> str:
         feedback_id = str(uuid.uuid4())
         with self.db.lock, self.db.connection:
@@ -546,15 +583,15 @@ class Repository:
                 (namespace_id, candidate.kind, candidate.subject_key),
             ).fetchone()
             memory_id = memory["id"] if memory else str(uuid.uuid4())
+            previous_version_id = str(current["id"]) if (current := self.db.execute(
+                "SELECT * FROM memory_versions WHERE memory_id=? AND namespace_id=? ORDER BY version DESC LIMIT 1",
+                (memory_id, namespace_id),
+            ).fetchone()) else None
             if not memory:
                 self.db.execute(
                     "INSERT INTO memories(id, namespace_id, kind, subject_key, status, confidence, created_at) VALUES (?, ?, ?, ?, 'active', 1.0, ?)",
                     (memory_id, namespace_id, candidate.kind, candidate.subject_key, now),
                 )
-            current = self.db.execute(
-                "SELECT * FROM memory_versions WHERE memory_id=? AND namespace_id=? ORDER BY version DESC LIMIT 1",
-                (memory_id, namespace_id),
-            ).fetchone()
             if current and current["statement"] == candidate.statement and current["status"] == "active":
                 existing_ref = self.db.execute(
                     """SELECT 1 FROM evidence_refs
@@ -644,6 +681,16 @@ class Repository:
                 (version_id, namespace_id, candidate.statement, candidate.statement),
             )
             self._persist_embedding(version_id, namespace_id, embedding, candidate.statement)
+            self.record_graph_links(
+                namespace_id,
+                episode_id=str(event["episode_id"]) if event["episode_id"] else None,
+                memory_version_id=version_id,
+                memory_id=memory_id,
+                subject_key=candidate.subject_key,
+                statement=candidate.statement,
+                predicate="updates" if previous_version_id else "contains",
+                previous_version_id=previous_version_id,
+            )
             return memory_id
 
     def record_run(self, namespace_id: str, run: dict[str, Any]) -> None:
@@ -775,6 +822,7 @@ class Repository:
         current = self.db.execute(
             "SELECT * FROM memory_versions WHERE memory_id=? AND namespace_id=? ORDER BY version DESC LIMIT 1", (memory_id, namespace_id)
         ).fetchone()
+        previous_version_id = str(current["id"]) if current else None
         if current and current["statement"] == item.statement and current["status"] == "active":
             for span in item.evidence:
                 self.db.execute(
@@ -851,6 +899,16 @@ class Repository:
         elif status == "contradicted":
             self.db.execute("UPDATE memories SET status='disputed' WHERE id=? AND namespace_id=?", (memory_id, namespace_id))
         self._persist_embedding(version_id, namespace_id, embedding, item.statement)
+        self.record_graph_links(
+            namespace_id,
+            episode_id=str(event["episode_id"]) if event["episode_id"] else None,
+            memory_version_id=version_id,
+            memory_id=memory_id,
+            subject_key=item.subject,
+            statement=item.statement,
+            predicate="updates" if previous_version_id else "contains",
+            previous_version_id=previous_version_id,
+        )
         return memory_id, action, version_id
 
     def get_memory(self, namespace_id: str, memory_id: str) -> MemoryResponse | None:
@@ -969,6 +1027,62 @@ class Repository:
               AND (v.valid_until IS NULL OR julianday(v.valid_until) > julianday('now'))))""",
             (namespace_id, namespace_id, *candidate_ids, historical),
         ).fetchall()
+        graph_cache: dict[str, float] = {}
+        summary_cache: dict[str, float] = {}
+
+        def graph_signal(version_id: str) -> float:
+            cached = graph_cache.get(version_id)
+            if cached is not None:
+                return cached
+            score = 0.0
+            rels = self.db.execute(
+                """SELECT s.label AS subject_label, s_alias.alias AS subject_alias, o.label AS object_label, o_alias.alias AS object_alias, r.predicate
+                FROM relationships r
+                JOIN entities s ON s.id=r.subject_entity_id
+                JOIN entities o ON o.id=r.object_entity_id
+                LEFT JOIN entity_aliases s_alias ON s_alias.entity_id=s.id
+                LEFT JOIN entity_aliases o_alias ON o_alias.entity_id=o.id
+                WHERE r.namespace_id=? AND r.memory_version_id=? AND r.status='active'""",
+                (namespace_id, version_id),
+            ).fetchall()
+            lowered_terms = [term.casefold() for term in terms]
+            for rel in rels:
+                labels = [
+                    str(rel["subject_label"] or ""),
+                    str(rel["object_label"] or ""),
+                    str(rel["subject_alias"] or ""),
+                    str(rel["object_alias"] or ""),
+                ]
+                if any(term and any(term in label.casefold() for label in labels) for term in lowered_terms):
+                    score = 0.015
+                    break
+                if rel["predicate"] in {"updates", "supersedes", "contradicts", "contains"}:
+                    score = max(score, 0.01)
+            graph_cache[version_id] = score
+            return score
+
+        def summary_signal(version_id: str) -> float:
+            cached = summary_cache.get(version_id)
+            if cached is not None:
+                return cached
+            row = self.db.execute(
+                """SELECT ep.summary
+                FROM memory_versions v
+                JOIN events e ON e.id=v.source_event_id AND e.namespace_id=v.namespace_id
+                JOIN episodes ep ON ep.id=e.episode_id AND ep.namespace_id=v.namespace_id
+                WHERE v.id=? AND v.namespace_id=?""",
+                (version_id, namespace_id),
+            ).fetchone()
+            if not row or not row["summary"]:
+                summary_cache[version_id] = 0.0
+                return 0.0
+            summary_text = str(row["summary"]).casefold()
+            score = 0.012 if any(term in summary_text for term in lowered_terms) else 0.0
+            summary_cache[version_id] = score
+            return score
+
+        lowered_terms = [term.casefold() for term in terms]
+
         def score_row(row: sqlite3.Row) -> float:
             version_id = str(row["version_id"])
             lexical_rrf = 1.0 / (60 + lexical_rank[version_id]) if version_id in lexical_rank else 0.0
@@ -977,6 +1091,8 @@ class Repository:
             exact = 0.08 if query.casefold() in str(row["statement"]).casefold() else 0.0
             support = min(0.04, 0.01 * len(self._citations(namespace_id, version_id)))
             quality = 0.03 * float(row["confidence"]) + 0.02 * float(row["importance"])
+            graph = graph_signal(version_id)
+            summary = summary_signal(version_id)
             # Small recency tie-breaker inspired by graphiti temporal handling:
             # when scores are close, prefer the more recent valid_from for ordinary
             # agent recency. Bounded to 0.02 to avoid overriding lexical/semantic.
@@ -988,7 +1104,7 @@ class Repository:
                     recency = 0.01  # placeholder for future decay; kept small to avoid gaming
             except Exception:
                 recency = 0.0
-            return min(1.0, fused + exact + support + quality + recency)
+            return min(1.0, fused + exact + support + quality + graph + summary + recency)
 
         # Primary sort by score, secondary by valid_from recency (newer first) - stable sort
         rows_by_recency = sorted(rows, key=lambda row: row["valid_from"] or "", reverse=True)
@@ -1019,6 +1135,8 @@ class Repository:
                         "lexical_rank": float(lexical_rank.get(str(row["version_id"]), 0)),
                         "vector_rank": float(vector_rank.get(str(row["version_id"]), 0)),
                         "exact_match": float(query.casefold() in str(row["statement"]).casefold()),
+                        "graph_proximity": round(graph_signal(str(row["version_id"])), 6),
+                        "session_summary": round(summary_signal(str(row["version_id"])), 6),
                     },
                     status=row["status"],
                     citations=citations,
@@ -1269,6 +1387,30 @@ class Repository:
                     seen.add(other)
                     frontier.append(other)
         return result
+
+    def record_graph_links(
+        self,
+        namespace_id: str,
+        *,
+        episode_id: str | None,
+        memory_version_id: str,
+        memory_id: str,
+        subject_key: str,
+        statement: str,
+        predicate: str,
+        previous_version_id: str | None = None,
+    ) -> None:
+        subject_entity = self.upsert_entity(namespace_id, f"subject:{subject_key}", subject_key, "memory-subject", 1.0)
+        memory_entity = self.upsert_entity(namespace_id, f"memory-version:{memory_version_id}", statement[:120], "memory-version", 1.0)
+        self.add_entity_alias(namespace_id, subject_entity, subject_key)
+        self.add_entity_alias(namespace_id, memory_entity, memory_id)
+        self.add_relationship(namespace_id, subject_entity, "expresses", memory_entity, memory_version_id=memory_version_id, confidence=1.0)
+        if episode_id:
+            episode_entity = self.upsert_entity(namespace_id, f"episode:{episode_id}", episode_id, "session", 1.0)
+            self.add_relationship(namespace_id, episode_entity, "contains", memory_entity, memory_version_id=memory_version_id, confidence=1.0)
+        if previous_version_id:
+            previous_entity = self.upsert_entity(namespace_id, f"memory-version:{previous_version_id}", previous_version_id, "memory-version", 1.0)
+            self.add_relationship(namespace_id, previous_entity, predicate, memory_entity, memory_version_id=memory_version_id, confidence=1.0)
 
     def list_versions(self, namespace_id: str, memory_id: str) -> list[sqlite3.Row]:
         return self.db.execute(

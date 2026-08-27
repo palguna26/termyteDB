@@ -28,6 +28,7 @@ class Processor:
         deadline = time.perf_counter() + timeout_seconds
         jobs = self.repository.claim_jobs(namespace_id, limit, lease_seconds)
         processed = failed = dead = accepted = rejected = 0
+        episode_ids: set[str] = set()
         for job in jobs:
             if time.perf_counter() >= deadline:
                 break
@@ -38,6 +39,8 @@ class Processor:
             source = ""
             try:
                 event = self.repository.event_for_job(namespace_id, job["id"])
+                if event["episode_id"]:
+                    episode_ids.add(str(event["episode_id"]))
                 if not self.repository.heartbeat_job(namespace_id, job["id"], lease_seconds, str(job["lease_token"])):
                     raise RuntimeError("job lease is no longer active")
                 payload = json.loads(event["payload_json"])
@@ -234,6 +237,11 @@ class Processor:
                 failed += 1
                 dead += status == "dead"
                 log(self.logger, logging.ERROR, "processing.failed", namespace_id=namespace_id, job_id=job["id"], status=status, error=safe_error)
+        for episode_id in sorted(episode_ids):
+            try:
+                self.repository.refresh_episode_summary(namespace_id, episode_id)
+            except Exception:
+                log(self.logger, logging.WARNING, "processing.summary_refresh_failed", namespace_id=namespace_id, episode_id=episode_id)
         return processed, failed, dead, accepted, rejected
 
     @staticmethod
