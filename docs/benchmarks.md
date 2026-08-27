@@ -42,7 +42,10 @@ hard spend budget (`--budget-usd`, default $8).
 
 ## Engine path under test
 
-The benchmark exercises the product retrieval stack, not a harness-only trick:
+Two distinct pipelines are measured, answering different questions:
+
+### A) Retrieval-only (upper-bound, isolation benchmark)
+Exercises the product retrieval stack, not a harness-only trick:
 
 1. **Verbatim episodic atoms** — one atom per message (`fact = content`,
    `source_role = role`, `timestamp = haystack_date`). Zero API cost, lossless,
@@ -63,31 +66,52 @@ Per-question isolation is enforced with one SQLite database file per
 contamination. Parallel workers share model instances behind locks to avoid
 ONNX arena OOM.
 
+**Use:** ` --mode retrieval-only` (alias `retrieval`). Measures indexing+retrieval ceiling.
+
+### B) End-to-end (production pipeline, ordinary agent)
+Answers: *If an ordinary agent gave TermyteDB these conversations through the real production interface, would it form the right memories and retrieve them?*
+
+1. **Conversation → EventInput**: `benchmarks/longmemeval/run_benchmark.py:311` `build_event_inputs()` converts `haystack_sessions` into `EventInput` via public `TermyteDB.ingest()` (stream_id=session, actor_id=role, occurred_at from `haystack_dates`, deterministic idempotency `longmemeval:{qid}:{session_index}:{session_id}:{turn}:{hash}`). No `question`/`answer`/`answer_session_ids` leak into this stage.
+2. **Processing job → Processor**: `Processor.process_namespace()` claims jobs, runs `payload_text()` → `ExtractionRequest` → `ExtractionProvider` (rule/openrouter/fake) → `validate_candidate()` (evidence offsets + semantic_support) → `reconcile_candidate()` (insert/update/supersede/dispute) → `memory_fts` + `memory_embeddings`.
+3. **Retrieval**: same hybrid `Repository.search()` (FTS5 + dense RRF, recency tie-breaker by `valid_from`) + optional FlashRank rerank on `statement` + `build_context(token_budget)`. Session ranking is derived from `evidence_refs → events.stream_id`, not atom `session_id`.
+4. **Diagnostics**: per-sample `events_ingested`, `processing_jobs_*`, `candidates_accepted/rejected`, `memories_created`, `rejection_reasons`, `failure_reason` (`never_extracted`, `memory_existed_retrieval_missed`, etc.) and structured `failure_analysis` JSON for automated analysis.
+
+**Use:** ` --mode end-to-end --extraction rule|openrouter --workers 8 --token-budget 1500`. Retrieval remains identical (lexical+dense, same token budget) for head-to-head comparison.
+
 ## Modes and ablations
 
-* `--mode retrieval --no-dense` (default fast sweep): FTS + cross-encoder,
-  **no dense embeddings**. Zero API cost. This is the run reported below.
-* `--mode retrieval` (full hybrid): FTS + dense + cross-encoder. Touches
-  dense embeddings (~16k atoms per question at batch 16, serialized).
-* `--mode judged`: retrieval + `openai/gpt-4o-mini` answer generation and
-  `openai/gpt-4o-mini` judging, both through OpenRouter, budget-guarded.
-* `--no-rerank` / `--no-dense --no-rerank`: ablations.
+* `--mode retrieval-only --no-dense` (default fast sweep): verbatim atoms, FTS + cross-encoder, **no dense embeddings**. Zero API cost. This is the run reported below.
+* `--mode retrieval-only` (full hybrid): verbatim atoms, FTS + dense + cross-encoder. Touches dense embeddings (~16k atoms per question at batch 16, serialized).
+* `--mode end-to-end --extraction rule --no-dense`: production path with offline rule extractor (captures `I graduated with...`, `My favorite...` plus narrow service patterns). Zero API cost, true `memories` table, shows extraction recall bottleneck.
+* `--mode end-to-end --extraction openrouter --workers 8`: production path with LLM extraction via OpenRouter (`TERMYTEDB_EXTRACTION_MODEL`, `OPENROUTER_API_KEY`). Uses same `Processor`/`validate_candidate`/`reconcile_candidate` as an ordinary agent.
+* `--mode judged`: retrieval-only + `openai/gpt-4o-mini` answer generation and `openai/gpt-4o-mini` judging, both through OpenRouter, budget-guarded.
+* `--no-rerank` / `--no-dense --no-rerank`: ablations for both pipelines.
+* `--single-db`: single SQLite file with `namespace_id=question_id` isolation (tested for 500-ns run).
+* Extraction tuning: `--extraction {rule,openrouter,fake,http} --extraction-model X --processing-batch-size 100 --processing-lease-seconds 180`.
 
 ## How to reproduce
 
 ```powershell
-# Full retrieval run (all 500 questions, ~15-20 min with --no-dense, ~75 min hybrid)
-python benchmarks/longmemeval/run_benchmark.py --mode retrieval --workers 8 --no-dense
+# Full retrieval-only run (all 500 questions, ~15-20 min with --no-dense, ~75 min hybrid)
+python benchmarks/longmemeval/run_benchmark.py --mode retrieval-only --workers 8 --no-dense
 
-# Hybrid variant (adds dense embeddings)
-python benchmarks/longmemeval/run_benchmark.py --mode retrieval --workers 4
+# End-to-end smoke (ordinary agent path, 5 questions, ~2 min, rule extractor, zero API cost)
+python benchmarks/longmemeval/run_benchmark.py --mode end-to-end --limit 5 --workers 2 --no-dense --no-rerank
+
+# End-to-end with LLM extraction (requires OPENROUTER_API_KEY, production provider)
+python benchmarks/longmemeval/run_benchmark.py --mode end-to-end --extraction openrouter --workers 8 --token-budget 1500
+
+# Hybrid variants
+python benchmarks/longmemeval/run_benchmark.py --mode retrieval-only --workers 4        # FTS+dense
+python benchmarks/longmemeval/run_benchmark.py --mode end-to-end --workers 4 --no-dense  # rule+FTS rerank
 
 # Judged subset (requires OPENROUTER_API_KEY in .env, ~$0.0003/question with gpt-4o-mini)
 python benchmarks/longmemeval/run_benchmark.py --mode judged --task knowledge-update --limit 20 --workers 4 --no-dense --budget-usd 8
 
-# Per-category retrieval table
+# Per-category tables (both pipelines)
 foreach ($task in @("single-session-user","single-session-assistant","single-session-preference","knowledge-update","temporal-reasoning","multi-session")) {
-  python benchmarks/longmemeval/run_benchmark.py --mode retrieval --task $task --workers 8 --no-dense
+  python benchmarks/longmemeval/run_benchmark.py --mode retrieval-only --task $task --workers 8 --no-dense
+  python benchmarks/longmemeval/run_benchmark.py --mode end-to-end --task $task --limit 20 --workers 4 --no-dense
 }
 ```
 
