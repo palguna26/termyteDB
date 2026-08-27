@@ -70,12 +70,15 @@ CATEGORY_ORDER = [
 _ranker = None
 _ranker_lock = threading.Lock()
 _embedder: GuardedEmbedder | None = None
+_product_embedder: GuardedEmbedder | None = None
+_product_embedder_key: tuple[str, str | None, int | None] | None = None
+_product_embedder_lock = threading.Lock()
 
 
 class GuardedEmbedder:
     """Serializes ONNX inference so concurrent workers cannot grow competing arenas."""
 
-    def __init__(self, inner: FastEmbedProvider) -> None:
+    def __init__(self, inner: Any) -> None:
         self._inner = inner
         self._lock = threading.Lock()
 
@@ -112,6 +115,29 @@ def shared_embedder() -> GuardedEmbedder:
     if _embedder is None:
         _embedder = GuardedEmbedder(FastEmbedProvider(batch_size=16, threads=1))
     return _embedder
+
+
+def shared_product_embedder(args: argparse.Namespace) -> GuardedEmbedder:
+    global _product_embedder, _product_embedder_key
+    provider_name = getattr(args, "embedding_provider", None) or os.environ.get("TERMYTEDB_EMBEDDING_PROVIDER", "local")
+    model_name = getattr(args, "embedding_model", None) or os.environ.get("TERMYTEDB_EMBEDDING_MODEL")
+    dimensions = getattr(args, "embedding_dimensions", None)
+    if dimensions is None and provider_name == "openrouter":
+        dimensions = int(os.environ.get("TERMYTEDB_EMBEDDING_DIMENSIONS", "1536"))
+    key = (provider_name, model_name, dimensions)
+    if _product_embedder is None or _product_embedder_key != key:
+        with _product_embedder_lock:
+            if _product_embedder is None or _product_embedder_key != key:
+                if provider_name == "openrouter":
+                    from termytedb.retrieval.embedding import OpenAICompatibleEmbeddingProvider  # noqa: E402
+
+                    _product_embedder = GuardedEmbedder(
+                        OpenAICompatibleEmbeddingProvider(model_name, dimensions=dimensions)
+                    )
+                else:
+                    _product_embedder = shared_embedder()
+                _product_embedder_key = key
+    return _product_embedder
 
 
 _rerank_mutex = threading.Lock()
@@ -351,7 +377,12 @@ def build_event_inputs(sample: Sample) -> list[dict[str, Any]]:
 
 def build_provider(args: argparse.Namespace):
     """Factory for extraction providers."""
-    name = getattr(args, "extraction", "rule")
+    name = getattr(args, "extraction", "openrouter")
+    if name == "openrouter":
+        from termytedb.memory.provider import OpenRouterExtractionProvider  # noqa: E402
+
+        model = getattr(args, "extraction_model", None) or os.environ.get("TERMYTEDB_EXTRACTION_MODEL") or "openrouter/free"
+        return OpenRouterExtractionProvider(model=model)
     if name == "rule":
         return None
     if name == "fake":
@@ -359,11 +390,6 @@ def build_provider(args: argparse.Namespace):
 
         # For unit tests a deterministic fake provider; for benchmark treat as rule-mode
         return FakeExtractionProvider()
-    if name == "openrouter":
-        from termytedb.memory.provider import OpenRouterExtractionProvider  # noqa: E402
-
-        model = getattr(args, "extraction_model", None) or os.environ.get("TERMYTEDB_EXTRACTION_MODEL") or "openrouter/free"
-        return OpenRouterExtractionProvider(model=model)
     if name == "http":
         from termytedb.memory.provider import HttpExtractionProvider  # noqa: E402
 
@@ -397,7 +423,7 @@ def ingest_and_process_e2e(
     namespace_id = sample.question_id
     provider = build_provider(args)
     # Build embedding provider: shared guarded provider for reuse
-    embedding_provider = shared_embedder()
+    embedding_provider = shared_product_embedder(args)
 
     # Use file lock for single-db concurrent access
     lock = _single_db_lock if single_db else threading.Lock()
@@ -494,7 +520,7 @@ def retrieve_e2e_session_ranking(database_path: Path, sample: Sample, args: argp
 
     ns = sample.question_id
     provider = build_provider(args)
-    engine = TermyteDB(database_path, extraction_provider=provider, embedding_provider=shared_embedder())  # type: ignore[arg-type]
+    engine = TermyteDB(database_path, extraction_provider=provider, embedding_provider=shared_product_embedder(args))  # type: ignore[arg-type]
     started = time.perf_counter()
     try:
         limit = max(args.recall_k * 4, 20)
@@ -1018,7 +1044,7 @@ def run(args: argparse.Namespace) -> int:
     table = render_table(rows)
     git_commit = _git_commit()
     # Embedding provider info
-    embed_name = shared_embedder().name if not is_e2e else shared_embedder().name
+    embed_name = shared_product_embedder(args).name if is_e2e else shared_embedder().name
     # Extraction provider info
     extraction_provider = getattr(args, "extraction", "rule") if is_e2e else "verbatim-atoms"
     extraction_model = getattr(args, "extraction_model", None)
@@ -1071,7 +1097,7 @@ def hashlib_sha256(payload: bytes) -> str:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="TermyteDB LongMemEval-S benchmark")
-    parser.add_argument("--mode", choices=("retrieval", "retrieval-only", "end-to-end", "judged", "end_to_end", "e2e"), default="retrieval", help="Benchmark pipeline: retrieval-only (verbatim atoms) or end-to-end (production events)")
+    parser.add_argument("--mode", choices=("retrieval", "retrieval-only", "end-to-end", "judged", "end_to_end", "e2e"), default="end-to-end", help="Benchmark pipeline: retrieval-only (verbatim atoms) or end-to-end (production events)")
     parser.add_argument("--data-path", type=Path, default=DEFAULT_DATA_PATH)
     parser.add_argument("--work-dir", default=str(ROOT / ".termytedb-work" / "longmemeval"))
     parser.add_argument("--results-dir", default=str(ROOT / "results"))
@@ -1089,8 +1115,11 @@ def main() -> int:
     parser.add_argument("--answer-model", default="openai/gpt-4o-mini")
     parser.add_argument("--judge-model", default="openai/gpt-4o-mini")
     parser.add_argument("--budget-usd", type=float, default=8.0)
+    parser.add_argument("--embedding-provider", choices=("local", "openrouter"), default=None, help="embedding provider for end-to-end runs")
+    parser.add_argument("--embedding-model", type=str, default=None, help="model for OpenRouter-compatible embeddings")
+    parser.add_argument("--embedding-dimensions", type=int, default=None, help="dimensions for OpenRouter-compatible embeddings")
     # End-to-end extraction config
-    parser.add_argument("--extraction", choices=("rule", "openrouter", "fake", "http"), default="rule", help="extraction provider for end-to-end mode (rule is offline fallback)")
+    parser.add_argument("--extraction", choices=("rule", "openrouter", "fake", "http"), default="openrouter", help="extraction provider for end-to-end mode (OpenRouter is the product default)")
     parser.add_argument("--extraction-model", type=str, default=None, help="model for openrouter/http extraction (or env TERMYTEDB_EXTRACTION_MODEL)")
     parser.add_argument("--processing-batch-size", type=int, default=100, help="processing jobs per batch")
     parser.add_argument("--processing-lease-seconds", type=int, default=180)
