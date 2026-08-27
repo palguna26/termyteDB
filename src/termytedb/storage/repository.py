@@ -414,6 +414,12 @@ class Repository:
                 "memory_id": str(item.memory_id),
                 "memory_version_id": str(item.memory_version_id),
                 "kind": item.kind,
+                "subject_key": str(
+                    self.db.execute(
+                        "SELECT subject_key FROM memories WHERE id=? AND namespace_id=?",
+                        (str(item.memory_id), namespace_id),
+                    ).fetchone()["subject_key"]
+                ),
                 "statement": item.statement,
                 "status": item.status,
             }

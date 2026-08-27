@@ -68,6 +68,7 @@ def build_extraction_prompt(request: ExtractionRequest) -> str:
         " - Prefer personal facts, preferences, decisions, outcomes that persist beyond the session.\n"
         " - If evidence contains no durable fact, return {\"candidates\":[]} - do not invent.\n"
         " - At most 3 candidates per event; each statement ONE sentence, 10-150 chars, standalone third-person.\n"
+        " - Split compound claims into separate candidates when they mention different facts, times, or entities.\n"
         " - Statement must be fully supported by the cited excerpt; excerpt VERBATIM with exact start_offset/end_offset.\n"
         " - Kind must be one of fact/decision/attempt/failure/outcome/constraint/procedure/task_state/correction/question.\n"
         " - Subject: short canonical key (2-4 words, e.g. 'user degree', 'sqlite wal') - lowercased, no sentences.\n"
@@ -75,6 +76,32 @@ def build_extraction_prompt(request: ExtractionRequest) -> str:
         " - Intent: insert (new fact), update/supersede (clear replacement of one existing memory), dispute (contradiction), ignore (trivial). Use insert unless you are certain.\n"
         " - Do NOT invent dates, do NOT paraphrase beyond evidence support, and do NOT mix multiple claims into one statement.\n"
         "<evidence>\n" + evidence + "\n</evidence>" + comparison
+    )
+
+
+def configured_extraction_provider() -> ExtractionProvider | None:
+    endpoint = os.environ.get("TERMYTEDB_EXTRACTION_URL")
+    model = os.environ.get("TERMYTEDB_EXTRACTION_MODEL")
+    api_key = os.environ.get("TERMYTEDB_EXTRACTION_API_KEY")
+    base_url = os.environ.get("TERMYTEDB_EXTRACTION_BASE_URL")
+    provider_name = os.environ.get("TERMYTEDB_EXTRACTION_PROVIDER")
+
+    if provider_name == "http" or endpoint:
+        return HttpExtractionProvider(endpoint, model, api_key)
+    if provider_name == "openrouter" or api_key or os.environ.get("OPENROUTER_API_KEY"):
+        return OpenRouterExtractionProvider(model, api_key=api_key, base_url=base_url)
+    return None
+
+
+def default_extraction_provider() -> ExtractionProvider:
+    provider = configured_extraction_provider()
+    if provider is not None:
+        return provider
+    if os.environ.get("PYTEST_CURRENT_TEST") or os.environ.get("TERMYTEDB_ALLOW_FAKE_EXTRACTION") == "1":
+        return FakeExtractionProvider()
+    raise ValueError(
+        "no extraction provider configured; set TERMYTEDB_EXTRACTION_URL or OPENROUTER_API_KEY, "
+        "or pass extraction_provider explicitly"
     )
 
 
@@ -122,7 +149,7 @@ class FakeExtractionProvider:
     model = "fake-v1"
 
     def __init__(self, response: ExtractionResponse | None = None):
-        self.response = response or ExtractionResponse(schema_version="extraction-v1", prompt_version="prompt-v1", candidates=[])
+        self.response = response
 
     def extract(
         self,
@@ -134,17 +161,64 @@ class FakeExtractionProvider:
         if cancellation and cancellation():
             raise ProviderError("extraction cancelled", retryable=True, error_class="cancelled")
         started = time.perf_counter()
-        raw = json.dumps(self.response.model_dump(mode="json"), sort_keys=True, separators=(",", ":"))
+        response = self.response
+        if response is None:
+            from .extraction import rule_candidate_to_contract
+            from .extractor import extract as rule_extract
+
+            candidates = []
+            for event_id, text in request.evidence_text.items():
+                for item in rule_extract({"text": text}):
+                    candidates.append(rule_candidate_to_contract(item, event_id, text))
+            if request.existing_memories:
+                candidates = self._reconcile_candidates(candidates, request.existing_memories)
+            response = ExtractionResponse(schema_version="extraction-v1", prompt_version="fake-v1", candidates=candidates)
+        raw = json.dumps(response.model_dump(mode="json"), sort_keys=True, separators=(",", ":"))
         return ProviderResult(
-            response=self.response,
+            response=response,
             provider_name=self.name,
             model_name=self.model,
-            prompt_version=self.response.prompt_version,
+            prompt_version=response.prompt_version,
             raw_response_hash=hashlib.sha256(raw.encode()).hexdigest(),
             input_tokens=len(json.dumps(request.model_dump(mode="json"), sort_keys=True).split()),
             output_tokens=len(raw.split()),
             latency_ms=int((time.perf_counter() - started) * 1000),
         )
+
+    @staticmethod
+    def _reconcile_candidates(candidates: list[Any], existing_memories: list[dict[str, Any]]) -> list[Any]:
+        reconciled = []
+        for candidate in candidates:
+            best = None
+            for existing in existing_memories:
+                if str(existing.get("kind", "")).casefold() != str(candidate.kind).casefold():
+                    continue
+                if str(existing.get("subject_key", "")).casefold() != str(candidate.subject).casefold():
+                    continue
+                best = existing
+                break
+            if best is not None and (
+                candidate.statement.casefold() != str(best.get("statement", "")).casefold()
+                or FakeExtractionProvider._looks_like_update(candidate.statement)
+            ):
+                ref = str(best.get("ref") or "")
+                if ref:
+                    reconciled.append(
+                        candidate.model_copy(
+                            update={
+                                "existing_memory_ref": ref,
+                                "intent": "supersede" if candidate.statement.casefold() != str(best.get("statement", "")).casefold() else "reinforce",
+                            }
+                        )
+                    )
+                    continue
+            reconciled.append(candidate)
+        return reconciled
+
+    @staticmethod
+    def _looks_like_update(statement: str) -> bool:
+        text = statement.casefold()
+        return any(marker in text for marker in (" now ", " used to ", " moved ", " changed ", " updated ", " prefer ", " no longer "))
 
 
 class FakeSessionSummaryProvider:

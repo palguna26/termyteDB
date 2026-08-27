@@ -93,7 +93,7 @@ RULES = (
     (
         "fact",
         re.compile(
-            r"(?im)^(?:the|this|service|repository|version|file|branch)\s+[^.!?\n]{1,160}\s+(?:is|runs on|uses|requires|contains)\s+[^.!?\n]{1,240}[.!?]"
+            r"(?im)^(?:the|this|service|repository|version|file|branch)\s+[^.!?\n,;]{1,160}\s+(?:is|runs on|uses|requires|contains)\s+[^.!?\n,;]{1,240}(?:[.!?]|[,;](?=\s|$)|$)"
         ),
     ),
     # --- Generic personal-fact fallback (conversational memory) ---
@@ -103,22 +103,28 @@ RULES = (
     (
         "fact",
         re.compile(
-            r"(?im)\bI\s+(?:graduated\s+with|have|has|had|am|was|were|live\s+in|lived\s+in|work\s+as|work\s+in|own|owns|like|liked|love|loved|prefer|preferred)\b[^.!?\n]{2,200}[.!?]"
+            r"(?im)\bI\s+(?:graduated\s+with|have|has|had|am|was|were|live\s+in|lived\s+in|work\s+as|work\s+in|own|owns|like|liked|love|loved|prefer|preferred)\b[^.!?\n,;]{2,200}(?:[.!?]|[,;](?=\s|$)|$)"
         ),
     ),
     (
         "fact",
         re.compile(
-            r"(?im)\bI\s+(?:used to|used to live in|used to work as|now live in|now work as|moved to|moved from)\b[^.!?\n]{2,200}[.!?]"
+            r"(?im)\bI\s+(?:used to live in|used to work as|now live in|now work as|moved to|moved from|used to|live in|work as|work in)\b[^.!?\n,;]{2,200}(?:[.!?]|[,;](?=\s|$)|$)"
         ),
     ),
     (
         "fact",
-        re.compile(r"(?im)\bMy\s+[^.!?\n]{2,120}\s+is\s+[^.!?\n]{2,160}[.!?]"),
+        re.compile(r"(?im)\bMy\s+[^.!?\n,;]{2,120}\s+is\s+[^.!?\n,;]{2,160}(?:[.!?]|[,;](?=\s|$)|$)"),
     ),
     (
         "fact",
-        re.compile(r"(?im)\bI\s+am\s+[^.!?\n]{2,120}[.!?]"),
+        re.compile(r"(?im)\bI\s+am\s+[^.!?\n,;]{2,120}(?:[.!?]|[,;](?=\s|$)|$)"),
+    ),
+    (
+        "fact",
+        re.compile(
+            r"(?im)\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)?\s+(?:moved to|moved from|lives in|lived in|works as|works in|joined|left|started|quit)\b[^.!?\n,;]{1,200}(?:[.!?]|[,;](?=\s|$)|$)"
+        ),
     ),
     (
         "decision",
@@ -147,7 +153,21 @@ def _subject_key(kind: str, statement: str, body: str) -> str:
             return "fact:user work"
         if any(token in text for token in ("sister", "brother", "cousin", "mother", "father", "wife", "husband", "partner")):
             return "fact:user relationship"
+        named = re.match(r"(?i)^([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)\s+(?:moved to|moved from|lives in|lived in|works as|works in|joined|left|started|quit)\b", statement)
+        if named:
+            return f"fact:{named.group(1).casefold()}"
     if kind == "decision":
+        decision_body = body.strip()
+        anchored = re.match(
+            r"(?i)^(.+?)\s+(?:is|are|was|were|uses|use|runs on|runs with|requires|needs|depends on|chooses|choose|selected|selects|prefers|prefer|moved to|moved from)\b",
+            decision_body,
+        )
+        if anchored:
+            subject = " ".join(anchored.group(1).casefold().split())
+            return f"decision:{subject}"
+        words = decision_body.casefold().split()
+        if words:
+            return f"decision:{' '.join(words[:3])}"
         return "decision:state change"
     subject_words = body.casefold().split()[:2]
     return f"{kind}:{' '.join(subject_words)}"
@@ -158,10 +178,14 @@ def extract(payload: dict[str, Any], event_type: str | None = None) -> list[Cand
     candidates: list[Candidate] = []
     for kind, pattern in RULES:
         for match in pattern.finditer(text):
-            statement = match.group(0).strip()
-            body = match.group(1).strip() if match.lastindex else statement
-            if not body:
+            start = match.start()
+            end = match.end()
+            while end > start and text[end - 1] in " ,;":
+                end -= 1
+            statement = text[start:end].strip()
+            if not statement:
                 continue
+            body = match.group(1).strip() if match.lastindex else statement
             subject_key = _subject_key(kind, statement, body)
-            candidates.append(Candidate(kind, subject_key, statement, match.start(), match.end()))
+            candidates.append(Candidate(kind, subject_key, statement, start, end))
     return sorted(candidates, key=lambda item: (item.start_offset, item.kind, item.statement))

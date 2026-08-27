@@ -28,3 +28,11 @@ def test_rule_extractor_accepts_conservative_declarative_facts():
 def test_rule_extractor_does_not_turn_unsupported_prose_into_a_fact():
     assert extract({"text": "Maybe the cache is faster."}) == []
     assert extract({"text": "The log says started."}) == []
+
+
+def test_rule_extractor_splits_compound_conversational_facts():
+    candidates = extract({"text": "I used to live in Bangalore, but I now live in Mumbai. Maya moved to Berlin."})
+    statements = [candidate.statement for candidate in candidates]
+    assert any("used to live in Bangalore" in statement for statement in statements)
+    assert any("now live in Mumbai" in statement for statement in statements)
+    assert any("Maya moved to Berlin" in statement for statement in statements)

@@ -10,7 +10,7 @@ Canonical harness supporting two distinct benchmark pipelines:
 
 * end-to-end (``end-to-end``) — true production memory pipeline:
   LongMemEval conversation/session history -> EventInput ingestion ->
-  processing job -> extraction (rule / OpenRouter / fake) -> evidence validation
+  processing job -> extraction (OpenRouter / fake / HTTP) -> evidence validation
   -> reconciliation/versioning -> embeddings/indexing -> hybrid retrieval ->
   context packing -> retrieval metrics.
 
@@ -385,11 +385,12 @@ def build_provider(args: argparse.Namespace):
         model = getattr(args, "extraction_model", None) or os.environ.get("TERMYTEDB_EXTRACTION_MODEL") or "openrouter/free"
         return OpenRouterExtractionProvider(model=model)
     if name == "rule":
-        return None
+        from termytedb.memory.provider import FakeExtractionProvider  # noqa: E402
+
+        return FakeExtractionProvider()
     if name == "fake":
         from termytedb.memory.provider import FakeExtractionProvider  # noqa: E402
 
-        # For unit tests a deterministic fake provider; for benchmark treat as rule-mode
         return FakeExtractionProvider()
     if name == "http":
         from termytedb.memory.provider import HttpExtractionProvider  # noqa: E402
@@ -1093,7 +1094,7 @@ def run(args: argparse.Namespace) -> int:
     # Embedding provider info
     embed_name = shared_product_embedder(args).name if is_e2e else shared_embedder().name
     # Extraction provider info
-    extraction_provider = getattr(args, "extraction", "rule") if is_e2e else "verbatim-atoms"
+    extraction_provider = getattr(args, "extraction", "openrouter") if is_e2e else "verbatim-atoms"
     extraction_model = getattr(args, "extraction_model", None)
     result = {
         "mode": canonical_mode,
@@ -1169,7 +1170,7 @@ def main() -> int:
     parser.add_argument("--embedding-model", type=str, default=None, help="model for OpenRouter-compatible embeddings")
     parser.add_argument("--embedding-dimensions", type=int, default=None, help="dimensions for OpenRouter-compatible embeddings")
     # End-to-end extraction config
-    parser.add_argument("--extraction", choices=("rule", "openrouter", "fake", "http"), default="openrouter", help="extraction provider for end-to-end mode (OpenRouter is the product default)")
+    parser.add_argument("--extraction", choices=("openrouter", "fake", "http"), default="openrouter", help="extraction provider for end-to-end mode (OpenRouter is the product default)")
     parser.add_argument("--extraction-model", type=str, default=None, help="model for openrouter/http extraction (or env TERMYTEDB_EXTRACTION_MODEL)")
     parser.add_argument("--processing-batch-size", type=int, default=100, help="processing jobs per batch")
     parser.add_argument("--processing-lease-seconds", type=int, default=180)

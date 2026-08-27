@@ -1,22 +1,28 @@
 from __future__ import annotations
 
+from termytedb.memory.provider import FakeExtractionProvider, ProviderError
+
 from .conftest import event
 
 
-def test_failed_jobs_retry_without_duplicate_memories(db, monkeypatch):
+def test_failed_jobs_retry_without_duplicate_memories(db):
     db.ingest(event("n1", "one", "Decision: Use SQLite."))
-    import termytedb.processor as processor_module
-
-    original = processor_module.extract
     calls = {"count": 0}
 
-    def fail_once(payload):
-        calls["count"] += 1
-        if calls["count"] == 1:
-            raise RuntimeError("temporary")
-        return original(payload)
+    class FlakyProvider:
+        name = "flaky"
+        model = "flaky-v1"
 
-    monkeypatch.setattr(processor_module, "extract", fail_once)
+        def __init__(self, delegate):
+            self.delegate = delegate
+
+        def extract(self, request, timeout_seconds=30.0, cancellation=None):
+            calls["count"] += 1
+            if calls["count"] == 1:
+                raise RuntimeError("temporary")
+            return self.delegate.extract(request, timeout_seconds=timeout_seconds, cancellation=cancellation)
+
+    db.processor.provider = FlakyProvider(FakeExtractionProvider())
     assert db.process("n1").failed == 1
     assert db.process("n1").processed == 0
     with db.database.connection:
@@ -62,15 +68,17 @@ def test_stale_lease_owner_cannot_complete_or_fail_reclaimed_job(db):
     assert tuple(row) == ("processing", second["lease_token"])
 
 
-def test_permanently_failed_jobs_enter_dead_letter(db, monkeypatch):
+def test_permanently_failed_jobs_enter_dead_letter(db):
     db.ingest(event("n1", "one", "Decision: Use SQLite."))
-    import termytedb.processor as processor_module
 
-    monkeypatch.setattr(
-        processor_module,
-        "extract",
-        lambda payload: (_ for _ in ()).throw(RuntimeError("permanent")),
-    )
+    class PermanentFailureProvider:
+        name = "permanent"
+        model = "permanent-v1"
+
+        def extract(self, request, timeout_seconds=30.0, cancellation=None):
+            raise ProviderError("permanent", retryable=True, error_class="permanent")
+
+    db.processor.provider = PermanentFailureProvider()
     assert db.process("n1").dead_lettered == 0
     with db.database.connection:
         db.database.execute("UPDATE processing_jobs SET next_attempt_at='2000-01-01T00:00:00+00:00' WHERE namespace_id='n1'")
