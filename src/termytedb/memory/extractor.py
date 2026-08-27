@@ -126,6 +126,24 @@ RULES = (
             r"(?im)^(?:the|this|service|repository|version|file|branch)\s+[^.!?\n]{1,160}\s+(?:is|runs on|uses|requires|contains)\s+[^.!?\n]{1,240}[.!?]"
         ),
     ),
+    # --- Generic personal-fact fallback (ordinary agent conversations) ---
+    # Captures first-person and possessive facts that the original service-oriented
+    # pattern misses, e.g. "I graduated with a degree in Business Administration."
+    # or "My favorite color is blue." Keeps evidence offsets stable via payload_text.
+    (
+        "fact",
+        re.compile(
+            r"(?im)\bI\s+(?:graduated\s+with|have|has|had|am|was|were|live\s+in|lived\s+in|work\s+as|work\s+in|own|owns|like|liked|love|loved|prefer|preferred)\b[^.!?\n]{2,200}[.!?]"
+        ),
+    ),
+    (
+        "fact",
+        re.compile(r"(?im)\bMy\s+[^.!?\n]{2,120}\s+is\s+[^.!?\n]{2,160}[.!?]"),
+    ),
+    (
+        "fact",
+        re.compile(r"(?im)\bI\s+am\s+[^.!?\n]{2,120}[.!?]"),
+    ),
     (
         "decision",
         re.compile(r"(?i)\b(?:decision|decided|choose|chosen)\s*[:\-]\s*(.+?)(?:[.!?]|$)"),
