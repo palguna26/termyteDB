@@ -1,15 +1,13 @@
 from concurrent.futures import ThreadPoolExecutor
 from threading import Barrier
 
-from termytedb import TermyteDB
+from src import TermyteDB
 
 
 def test_concurrent_workers_claim_each_job_once(tmp_path):
     db = TermyteDB(tmp_path / "workers.sqlite")
     for index in range(20):
-        db.ingest(
-            {"namespace_id": "workers", "idempotency_key": str(index), "type": "note", "payload": {"text": f"Decision: item {index}."}}
-        )
+        db.ingest({"namespace_id": "workers", "idempotency_key": str(index), "type": "note", "payload": {"text": f"Decision: item {index}."}})
 
     barrier = Barrier(2)
 
@@ -34,9 +32,7 @@ def test_separate_database_connections_do_not_claim_the_same_job(tmp_path):
     path = tmp_path / "separate-workers.sqlite"
     owner = TermyteDB(path)
     for index in range(4):
-        owner.ingest(
-            {"namespace_id": "workers", "idempotency_key": str(index), "type": "note", "payload": {"text": f"Item {index}."}}
-        )
+        owner.ingest({"namespace_id": "workers", "idempotency_key": str(index), "type": "note", "payload": {"text": f"Item {index}."}})
 
     workers = [TermyteDB(path) for _ in range(4)]
     barrier = Barrier(4)
@@ -49,9 +45,7 @@ def test_separate_database_connections_do_not_claim_the_same_job(tmp_path):
         with ThreadPoolExecutor(max_workers=4) as executor:
             claimed = list(executor.map(claim, workers))
         assert len(set(claimed)) == 4
-        attempts = owner.database.execute(
-            "SELECT attempts FROM processing_jobs WHERE namespace_id='workers' ORDER BY id"
-        ).fetchall()
+        attempts = owner.database.execute("SELECT attempts FROM processing_jobs WHERE namespace_id='workers' ORDER BY id").fetchall()
         assert [row[0] for row in attempts] == [1, 1, 1, 1]
     finally:
         for worker in workers:

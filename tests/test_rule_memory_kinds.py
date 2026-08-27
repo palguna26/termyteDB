@@ -1,5 +1,6 @@
 import pytest
-from termytedb.extractor import extract
+
+from src.memory.extractor import extract
 
 
 @pytest.mark.parametrize(

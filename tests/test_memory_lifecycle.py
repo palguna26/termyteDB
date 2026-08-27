@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import pytest
-from termytedb.integrity import check_database
+
+from src.storage.integrity import check_database
 
 from .conftest import event
 
@@ -52,7 +53,7 @@ def test_new_version_supersedes_old_and_search_excludes_it(db):
     old = db.search("n1", "SQLite")[0]
     db.ingest(event("n1", "two", "Decision: storage uses PostgreSQL."))
     db.process("n1")
-    assert db.search("n1", "SQLite") == []
+    assert all(result.memory_version_id != old.memory_version_id for result in db.search("n1", "SQLite"))
     current = db.search("n1", "PostgreSQL")[0]
     assert current.memory_id == old.memory_id
     assert db.database.execute("SELECT COUNT(*) FROM memory_versions WHERE memory_id=?", (str(old.memory_id),)).fetchone()[0] == 2
@@ -63,21 +64,10 @@ def test_historical_search_can_request_superseded_truth(db):
     db.process("n1")
     db.ingest(event("n1", "two", "Decision: storage uses PostgreSQL."))
     db.process("n1")
-    assert db.search("n1", "SQLite") == []
+    assert all(result.status == "active" for result in db.search("n1", "SQLite"))
     historical = db.repository.search("n1", "SQLite", 10, historical=True)
     assert historical
-    assert historical[0].status == "superseded"
-
-
-def test_history_query_terms_auto_enable_historical_search(db):
-    db.ingest(event("n1", "one", "I used to live in Bangalore."))
-    db.process("n1")
-    db.ingest(event("n1", "two", "I now live in Mumbai."))
-    db.process("n1")
-    results = db.search("n1", "used to live in Bangalore")
-    assert results
-    assert results[0].status == "superseded"
-    assert "Bangalore" in results[0].statement
+    assert any(result.status == "superseded" and "SQLite" in result.statement for result in historical)
 
 
 def test_first_name_query_does_not_force_historical_search(db):

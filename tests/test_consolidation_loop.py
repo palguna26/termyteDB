@@ -1,17 +1,27 @@
 from __future__ import annotations
 
-from termytedb.memory.consolidator import consolidate
+from src.memory.consolidator import consolidate
 
 
 def test_observation_encoding_is_explainable_and_episode_ordered(db):
-    first = db.ingest({
-        "namespace_id": "memory-loop", "idempotency_key": "one", "type": "conversation", "stream_id": "task",
-        "payload": {"text": "Decision: use SQLite. Remember this important constraint."},
-    })
-    duplicate = db.ingest({
-        "namespace_id": "memory-loop", "idempotency_key": "one", "type": "conversation", "stream_id": "task",
-        "payload": {"text": "Decision: use SQLite. Remember this important constraint."},
-    })
+    first = db.ingest(
+        {
+            "namespace_id": "memory-loop",
+            "idempotency_key": "one",
+            "type": "conversation",
+            "stream_id": "task",
+            "payload": {"text": "Decision: use SQLite. Remember this important constraint."},
+        }
+    )
+    duplicate = db.ingest(
+        {
+            "namespace_id": "memory-loop",
+            "idempotency_key": "one",
+            "type": "conversation",
+            "stream_id": "task",
+            "payload": {"text": "Decision: use SQLite. Remember this important constraint."},
+        }
+    )
     assert duplicate.duplicate is True
     decisions = db.encoding_decisions("memory-loop")
     assert len(decisions) == 1
@@ -23,10 +33,15 @@ def test_observation_encoding_is_explainable_and_episode_ordered(db):
 
 
 def test_replay_dry_run_and_apply_keep_lineage(db):
-    db.ingest({
-        "namespace_id": "replay", "idempotency_key": "one", "type": "conversation", "stream_id": "task",
-        "payload": {"text": "Decision: use SQLite."},
-    })
+    db.ingest(
+        {
+            "namespace_id": "replay",
+            "idempotency_key": "one",
+            "type": "conversation",
+            "stream_id": "task",
+            "payload": {"text": "Decision: use SQLite."},
+        }
+    )
     preview = consolidate(db.repository, "replay", mode="dry-run")
     assert preview["proposal_count"] >= 1
     assert db.repository.list_consolidation_runs("replay")[0]["status"] == "completed"

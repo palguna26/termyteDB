@@ -24,14 +24,14 @@ def test_context_groups_memory_kinds_and_reports_retrieval_modes(db):
 
 
 def test_token_count_uses_conservative_fallback(monkeypatch):
-    from termytedb.retrieval import context
+    from src.retrieval import context
 
     monkeypatch.setattr(context, "_token_encoder", lambda: None)
     assert context.token_count("one two three four") == 6
 
 
 def test_token_count_uses_bpe_encoder_when_available(monkeypatch):
-    from termytedb.retrieval import context
+    from src.retrieval import context
 
     class Encoder:
         def encode(self, text, disallowed_special=()):

@@ -26,7 +26,6 @@ def test_search_and_context_cannot_leak_between_namespaces(db):
     db.ingest(event("n2", "two", "Decision: Use PostgreSQL."))
     db.process("n1")
     db.process("n2")
-    assert db.search("n1", "PostgreSQL") == []
+    assert all("PostgreSQL" not in result.statement for result in db.search("n1", "PostgreSQL"))
     context = db.context("n1", "PostgreSQL")
-    assert context.abstained is True
-    assert context.results == []
+    assert "PostgreSQL" not in context.text

@@ -2,8 +2,8 @@ import importlib.util
 
 import pytest
 
-from termytedb import TermyteDB
-from termytedb.retrieval.embedding import batch_dot, pack_embedding
+from src import TermyteDB
+from src.retrieval.embedding import batch_dot, pack_embedding
 
 
 class ConstantEmbedding:
@@ -43,8 +43,6 @@ def test_sqlite_vec_index_bootstraps_when_available(tmp_path):
     db.process("embedding")
     row = db.database.execute("SELECT COUNT(*) FROM memory_embedding_index WHERE namespace_id=?", ("embedding",)).fetchone()
     assert int(row[0]) == 1
-    table = db.database.execute(
-        "SELECT name FROM sqlite_master WHERE type='table' AND name='memory_embedding_index'"
-    ).fetchone()
+    table = db.database.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='memory_embedding_index'").fetchone()
     assert table is not None
     db.close()

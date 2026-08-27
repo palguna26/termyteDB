@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from termytedb import TermyteDB
+from src import TermyteDB
 
 
 @pytest.fixture

@@ -1,4 +1,0 @@
-{"query":"SQLite","evidence":"Decision: use SQLite for local persistence.","expected_statement":"use SQLite for local persistence"}
-{"query":"migration","evidence":"Failure: the migration failed.","expected_statement":"the migration failed"}
-{"query":"cache","evidence":"Failure: the cache broke.","expected_statement":"the cache broke"}
-{"query":"PostgreSQL","evidence":"Correction: use PostgreSQL.","expected_statement":"use PostgreSQL"}

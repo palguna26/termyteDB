@@ -31,6 +31,7 @@ Modes:
 from __future__ import annotations
 
 import argparse
+import array
 import hashlib
 import json
 import math
@@ -50,12 +51,11 @@ from urllib.request import Request, urlopen
 from uuid import uuid4
 
 ROOT = Path(__file__).resolve().parents[2]
-sys.path.insert(0, str(ROOT / "src"))
+sys.path.insert(0, str(ROOT))
 
-from termytedb.evaluation.longmemeval_extraction import L1Atom, index_atom_embeddings, insert_atoms  # noqa: E402
-from termytedb.retrieval.embedding import FastEmbedProvider  # noqa: E402
-from termytedb.retrieval.retrieval import AtomHit, dense_search_atoms, pack_context, search_atoms  # noqa: E402
-from termytedb.storage.db import Database  # noqa: E402
+from src.retrieval.embedding import FastEmbedProvider  # noqa: E402
+from src.retrieval.retrieval import AtomHit, dense_search_atoms, pack_context, search_atoms  # noqa: E402
+from src.storage.db import Database  # noqa: E402
 
 DEFAULT_DATA_PATH = ROOT / "benchmarks" / "longmemeval" / "longmemeval_s_cleaned.json"
 CATEGORY_ORDER = [
@@ -66,6 +66,45 @@ CATEGORY_ORDER = [
     "temporal-reasoning",
     "multi-session",
 ]
+
+
+@dataclass(frozen=True)
+class L1Atom:
+    atom_id: str
+    session_id: str
+    fact: str
+    timestamp: str | None
+    source_role: str
+    namespace_id: str | None = None
+
+
+def insert_atoms(db: Database, atoms: list[L1Atom]) -> None:
+    now = datetime.now(UTC).isoformat()
+    with db.connection:
+        db.connection.executemany(
+            """INSERT OR IGNORE INTO atoms
+               (atom_id, session_id, fact, timestamp, source_role, created_at, namespace_id)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            [(a.atom_id, a.session_id, a.fact.strip(), a.timestamp, a.source_role, now, a.namespace_id) for a in atoms],
+        )
+
+
+def index_atom_embeddings(db: Database, provider: Any, *, batch_size: int = 64) -> None:
+    rows = db.execute(
+        """SELECT a.atom_id, a.fact FROM atoms a
+           LEFT JOIN atom_embeddings e ON e.atom_id=a.atom_id AND e.provider=?
+           WHERE e.atom_id IS NULL ORDER BY a.rowid""",
+        (provider.name,),
+    ).fetchall()
+    for start in range(0, len(rows), batch_size):
+        batch = rows[start : start + batch_size]
+        vectors = provider.embed_many([str(row["fact"]) for row in batch])
+        with db.connection:
+            db.connection.executemany(
+                "INSERT OR REPLACE INTO atom_embeddings(atom_id, provider, dimensions, vector) VALUES (?, ?, ?, ?)",
+                [(row["atom_id"], provider.name, len(vector), array.array("f", vector).tobytes()) for row, vector in zip(batch, vectors, strict=True)],
+            )
+
 
 _ranker = None
 _ranker_lock = threading.Lock()
@@ -130,11 +169,9 @@ def shared_product_embedder(args: argparse.Namespace) -> GuardedEmbedder:
         with _product_embedder_lock:
             if _product_embedder is None or _product_embedder_key != key:
                 if provider_name == "openrouter":
-                    from termytedb.retrieval.embedding import OpenAICompatibleEmbeddingProvider  # noqa: E402
+                    from src.retrieval.embedding import OpenAICompatibleEmbeddingProvider  # noqa: E402
 
-                    _product_embedder = GuardedEmbedder(
-                        OpenAICompatibleEmbeddingProvider(model_name, dimensions=dimensions)
-                    )
+                    _product_embedder = GuardedEmbedder(OpenAICompatibleEmbeddingProvider(model_name, dimensions=dimensions))
                 else:
                     _product_embedder = shared_embedder()
                 _product_embedder_key = key
@@ -144,40 +181,39 @@ def shared_product_embedder(args: argparse.Namespace) -> GuardedEmbedder:
 _rerank_mutex = threading.Lock()
 
 
-def rerank_hits(query: str, hits: list[AtomHit], threshold: float, *, max_candidates: int = 30, max_chars: int = 600) -> list[AtomHit] | None:
-    """Shared-instance FlashRank rerank with hard abstention."""
+def _rerank(query: str, hits: list[Any], threshold: float, *, item_id: Any, item_text: Any, max_candidates: int = 30, max_chars: int = 600) -> list[Any] | None:
     from flashrank import RerankRequest  # type: ignore[import-untyped]
 
     ranker = shared_ranker()
     candidates = hits[:max_candidates]
     tail = hits[max_candidates:]
-    passages = [{"id": hit.atom_id, "text": hit.fact[:max_chars]} for hit in candidates]
+    passages = [{"id": item_id(hit), "text": item_text(hit)[:max_chars]} for hit in candidates]
     with _rerank_mutex:
         results = ranker.rerank(RerankRequest(query=query, passages=passages))
     scored = [(entry["id"], float(entry.get("score", 0.0))) for entry in results]
-    by_id = {hit.atom_id: hit for hit in candidates}
-    ordered = [by_id[atom_id] for atom_id, _ in scored if atom_id in by_id]
+    by_id = {item_id(hit): hit for hit in candidates}
+    ordered = [by_id[result_id] for result_id, _ in scored if result_id in by_id]
     if not ordered or scored[0][1] < threshold:
         return None
     return ordered + tail
+
+
+def rerank_hits(query: str, hits: list[AtomHit], threshold: float, *, max_candidates: int = 30, max_chars: int = 600) -> list[AtomHit] | None:
+    """Shared-instance FlashRank rerank with hard abstention."""
+    return _rerank(query, hits, threshold, item_id=lambda hit: hit.atom_id, item_text=lambda hit: hit.fact, max_candidates=max_candidates, max_chars=max_chars)
 
 
 def rerank_memory_hits(query: str, hits: list[Any], threshold: float, *, max_candidates: int = 30, max_chars: int = 600) -> list[Any] | None:
     """FlashRank rerank for TermyteDB SearchResult objects."""
-    from flashrank import RerankRequest  # type: ignore[import-untyped]
-
-    ranker = shared_ranker()
-    candidates = hits[:max_candidates]
-    tail = hits[max_candidates:]
-    passages = [{"id": str(h.memory_version_id), "text": h.statement[:max_chars]} for h in candidates]
-    with _rerank_mutex:
-        results = ranker.rerank(RerankRequest(query=query, passages=passages))
-    scored = [(entry["id"], float(entry.get("score", 0.0))) for entry in results]
-    by_id = {str(h.memory_version_id): h for h in candidates}
-    ordered = [by_id[mid] for mid, _ in scored if mid in by_id]
-    if not ordered or scored[0][1] < threshold:
-        return None
-    return ordered + tail
+    return _rerank(
+        query,
+        hits,
+        threshold,
+        item_id=lambda hit: str(hit.memory_version_id),
+        item_text=lambda hit: hit.statement,
+        max_candidates=max_candidates,
+        max_chars=max_chars,
+    )
 
 
 @dataclass(frozen=True)
@@ -204,9 +240,7 @@ def normalize_samples(raw: Any) -> list[Sample]:
             session_id = str(ids[index]) if index < len(ids) else f"session-{index}"
             date = str(dates[index]) if index < len(dates) else ""
             turns = tuple(
-                {"role": str(message.get("role", "user")), "content": str(message.get("content", ""))}
-                for message in messages
-                if isinstance(message, dict)
+                {"role": str(message.get("role", "user")), "content": str(message.get("content", ""))} for message in messages if isinstance(message, dict)
             )
             raw_words += sum(len(turn["content"].split()) for turn in turns)
             sessions.append((session_id, date, turns))
@@ -258,9 +292,7 @@ def _ensure_namespace(db: Database, namespace_id: str) -> None:
         )
 
 
-def ingest_sample(
-    work_dir: Path, sample: Sample, *, skip_embeddings: bool = False, single_db: bool = False
-) -> Path:
+def ingest_sample(work_dir: Path, sample: Sample, *, skip_embeddings: bool = False, single_db: bool = False) -> Path:
     if single_db:
         database_path = work_dir / "single.sqlite"
         # Serialize writes to the single file to avoid WAL contention
@@ -268,9 +300,7 @@ def ingest_sample(
             db = Database(database_path)
             try:
                 _ensure_namespace(db, sample.question_id)
-                existing = db.execute(
-                    "SELECT COUNT(*) FROM atoms WHERE namespace_id = ?", (sample.question_id,)
-                ).fetchone()[0]
+                existing = db.execute("SELECT COUNT(*) FROM atoms WHERE namespace_id = ?", (sample.question_id,)).fetchone()[0]
                 if existing == 0:
                     insert_atoms(db, verbatim_atoms(sample, namespace_id=sample.question_id))
                     if not skip_embeddings:
@@ -380,20 +410,20 @@ def build_provider(args: argparse.Namespace):
     """Factory for extraction providers."""
     name = getattr(args, "extraction", "openrouter")
     if name == "openrouter":
-        from termytedb.memory.provider import OpenRouterExtractionProvider  # noqa: E402
+        from src.memory.provider import OpenRouterExtractionProvider  # noqa: E402
 
         model = getattr(args, "extraction_model", None) or os.environ.get("TERMYTEDB_EXTRACTION_MODEL") or "openrouter/free"
         return OpenRouterExtractionProvider(model=model)
     if name == "rule":
-        from termytedb.memory.provider import FakeExtractionProvider  # noqa: E402
+        from src.memory.provider import FakeExtractionProvider  # noqa: E402
 
         return FakeExtractionProvider()
     if name == "fake":
-        from termytedb.memory.provider import FakeExtractionProvider  # noqa: E402
+        from src.memory.provider import FakeExtractionProvider  # noqa: E402
 
         return FakeExtractionProvider()
     if name == "http":
-        from termytedb.memory.provider import HttpExtractionProvider  # noqa: E402
+        from src.memory.provider import HttpExtractionProvider  # noqa: E402
 
         return HttpExtractionProvider()
     raise ValueError(f"unknown extraction provider: {name}")
@@ -429,23 +459,15 @@ def _run_manifest(args: argparse.Namespace, data_path: Path, dataset_sha256: str
     }
 
 
-def ingest_and_process_e2e(
-    work_dir: Path, sample: Sample, args: argparse.Namespace
-) -> tuple[Path, dict[str, Any]]:
+def ingest_and_process_e2e(work_dir: Path, sample: Sample, args: argparse.Namespace) -> tuple[Path, dict[str, Any]]:
     """Ingest LongMemEval history through production pipeline and process.
 
     Returns (database_path, diagnostics).
     """
-    # Lazy imports to avoid heavy deps at module import time
-    from termytedb.api.schemas import EventInput  # noqa: E402
-    from termytedb.runtime.engine import TermyteDB  # noqa: E402
+    from src import EventInput, TermyteDB  # noqa: E402
 
     single_db = bool(getattr(args, "single_db", False))
     database_path = _e2e_database_path(work_dir, sample, single_db)
-    skip_process = False
-
-    # Check existing state for resume/idempotency in single-db mode
-    # Per-question isolation: namespace = question_id
     namespace_id = sample.question_id
     provider = build_provider(args)
     # Build embedding provider: shared guarded provider for reuse
@@ -479,11 +501,8 @@ def ingest_and_process_e2e(
             total_processed = total_failed = total_dead = total_accepted = total_rejected = 0
             batch_size = int(getattr(args, "processing_batch_size", 100) or 100)
             lease_seconds = int(getattr(args, "processing_lease_seconds", 180) or 180)
-            timeout_seconds = float(getattr(args, "processing_timeout", 30.0) or 30.0)
-            # Loop until no pending jobs remain (or timeout per call)
             for _ in range(50):  # safety cap: 50 batches per sample
                 resp = engine.process(namespace_id, limit=batch_size, lease_seconds=lease_seconds)
-                # Also try process_with_timeout? Use process
                 total_processed += resp.processed
                 total_failed += resp.failed
                 total_dead += resp.dead_lettered
@@ -507,9 +526,7 @@ def ingest_and_process_e2e(
             # If dense disabled, optionally clear embeddings so retrieval becomes lexical-only
             if getattr(args, "no_dense", False):
                 try:
-                    engine.database.execute(
-                        "DELETE FROM memory_embeddings WHERE namespace_id=?", (namespace_id,)
-                    )
+                    engine.database.execute("DELETE FROM memory_embeddings WHERE namespace_id=?", (namespace_id,))
                     engine.database.connection.commit()
                 except Exception:
                     pass
@@ -542,7 +559,7 @@ def ingest_and_process_e2e(
 
 def retrieve_e2e_session_ranking(database_path: Path, sample: Sample, args: argparse.Namespace) -> dict[str, Any]:
     """Retrieve after end-to-end processing using production memories."""
-    from termytedb.runtime.engine import TermyteDB  # noqa: E402
+    from src import TermyteDB  # noqa: E402
 
     ns = sample.question_id
     provider = build_provider(args)
@@ -572,9 +589,7 @@ def retrieve_e2e_session_ranking(database_path: Path, sample: Sample, args: argp
         def _session_for_event(event_id: str) -> str | None:
             if event_id in event_session_cache:
                 return event_session_cache[event_id]
-            row = engine.database.execute(
-                "SELECT stream_id, session_id FROM events WHERE id=? AND namespace_id=?", (event_id, ns)
-            ).fetchone()
+            row = engine.database.execute("SELECT stream_id, session_id FROM events WHERE id=? AND namespace_id=?", (event_id, ns)).fetchone()
             if row:
                 sid = row["stream_id"] or row["session_id"] or ""
                 event_session_cache[event_id] = sid
@@ -649,7 +664,13 @@ def retrieve_e2e_session_ranking(database_path: Path, sample: Sample, args: argp
 
         # Collect all memories statements for failure analysis
         all_memories_summary = [
-            {"memory_id": str(m.memory_id), "statement": m.statement, "kind": m.kind, "status": m.status, "citations": [{"event_id": str(c.event_id)} for c in m.citations]}
+            {
+                "memory_id": str(m.memory_id),
+                "statement": m.statement,
+                "kind": m.kind,
+                "status": m.status,
+                "citations": [{"event_id": str(c.event_id)} for c in m.citations],
+            }
             for m in all_mems
         ]
 
@@ -681,9 +702,7 @@ def retrieve_session_ranking(database_path: Path, sample: Sample, args: argparse
         if args.no_dense:
             hits = search_atoms(db, sample.question, limit, vector_search=lambda *_: [], namespace_id=ns)
         else:
-            hits = search_atoms(
-                db, sample.question, limit, vector_search=lambda query, lim: shared_dense(db, query, lim, namespace_id=ns), namespace_id=ns
-            )
+            hits = search_atoms(db, sample.question, limit, vector_search=lambda query, lim: shared_dense(db, query, lim, namespace_id=ns), namespace_id=ns)
         ranked = hits
         abstained = False
         if not args.no_rerank:
@@ -813,9 +832,7 @@ def judge_question(question_model: str, judge_model: str, sample: Sample, contex
 
 
 def evaluate_sample(args: argparse.Namespace, sample: Sample, budget: OpenRouterBudget | None) -> dict[str, Any]:
-    database_path = ingest_sample(
-        Path(args.work_dir), sample, skip_embeddings=args.no_dense, single_db=getattr(args, "single_db", False)
-    )
+    database_path = ingest_sample(Path(args.work_dir), sample, skip_embeddings=args.no_dense, single_db=getattr(args, "single_db", False))
     outcome = retrieve_session_ranking(database_path, sample, args)
     trace: dict[str, Any] = {
         "question_id": sample.question_id,
@@ -824,10 +841,7 @@ def evaluate_sample(args: argparse.Namespace, sample: Sample, budget: OpenRouter
         "best_rank": outcome["best_rank"],
         "ndcg_at_k": round(outcome["ndcg"], 4),
         "abstained": outcome["abstained"],
-        "recall": {
-            str(k): int(outcome["best_rank"] is not None and outcome["best_rank"] <= k)
-            for k in (5, 10, args.recall_k)
-        },
+        "recall": {str(k): int(outcome["best_rank"] is not None and outcome["best_rank"] <= k) for k in (5, 10, args.recall_k)},
         "packed_words": outcome["packed_words"],
         "raw_words": sample.raw_words,
         "retrieval_latency_ms": outcome["latency_ms"],
@@ -891,10 +905,7 @@ def evaluate_sample_e2e(args: argparse.Namespace, sample: Sample, budget: OpenRo
         "best_rank": best_rank,
         "ndcg_at_k": round(retrieval_outcome["ndcg"], 4),
         "abstained": retrieval_outcome["abstained"],
-        "recall": {
-            str(k): int(best_rank is not None and best_rank <= k)
-            for k in (5, 10, args.recall_k)
-        },
+        "recall": {str(k): int(best_rank is not None and best_rank <= k) for k in (5, 10, args.recall_k)},
         "packed_words": retrieval_outcome["packed_words"],
         "raw_words": sample.raw_words,
         "retrieval_latency_ms": retrieval_outcome["latency_ms"],
@@ -1045,8 +1056,7 @@ def run(args: argparse.Namespace) -> int:
         previous_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         if previous_manifest != manifest:
             raise SystemExit(
-                f"work dir {work_dir} already has a different LongMemEval run manifest; "
-                "use a fresh work dir or pass --resume-from for the same run"
+                f"work dir {work_dir} already has a different LongMemEval run manifest; use a fresh work dir or pass --resume-from for the same run"
             )
     manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8")
 
@@ -1075,7 +1085,7 @@ def run(args: argparse.Namespace) -> int:
                 # Add e2e extra info
                 if is_e2e:
                     diag = trace.get("e2e_diagnostics", {})
-                    status += f"; mems={diag.get('memories_created',0)} acc={diag.get('candidates_accepted',0)} rej={diag.get('candidates_rejected',0)}"
+                    status += f"; mems={diag.get('memories_created', 0)} acc={diag.get('candidates_accepted', 0)} rej={diag.get('candidates_rejected', 0)}"
                 print(f"[{number}/{len(pending)}] {sample.question_id} ({sample.question_type}): {status}; {trace['retrieval_latency_ms']:.0f}ms", flush=True)
             except BudgetExceeded as exc:
                 failures += 1
@@ -1086,6 +1096,7 @@ def run(args: argparse.Namespace) -> int:
                 failures += 1
                 print(f"[{number}/{len(pending)}] {sample.question_id}: FAILED {type(exc).__name__}: {exc}", flush=True)
                 import traceback as _tb
+
                 _tb.print_exc()
 
     rows = summarize(traces, args.recall_k, judged=canonical_mode == "judged")
@@ -1145,7 +1156,12 @@ def hashlib_sha256(payload: bytes) -> str:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="TermyteDB LongMemEval-S benchmark")
-    parser.add_argument("--mode", choices=("retrieval", "retrieval-only", "end-to-end", "judged", "end_to_end", "e2e"), default="end-to-end", help="Benchmark pipeline: retrieval-only (verbatim atoms) or end-to-end (production events)")
+    parser.add_argument(
+        "--mode",
+        choices=("retrieval", "retrieval-only", "end-to-end", "judged", "end_to_end", "e2e"),
+        default="end-to-end",
+        help="Benchmark pipeline: retrieval-only (verbatim atoms) or end-to-end (production events)",
+    )
     parser.add_argument("--data-path", type=Path, default=DEFAULT_DATA_PATH)
     parser.add_argument("--work-dir", default=str(ROOT / ".termytedb-work" / "longmemeval"))
     parser.add_argument("--results-dir", default=str(ROOT / "results"))
@@ -1170,7 +1186,12 @@ def main() -> int:
     parser.add_argument("--embedding-model", type=str, default=None, help="model for OpenRouter-compatible embeddings")
     parser.add_argument("--embedding-dimensions", type=int, default=None, help="dimensions for OpenRouter-compatible embeddings")
     # End-to-end extraction config
-    parser.add_argument("--extraction", choices=("openrouter", "fake", "http"), default="openrouter", help="extraction provider for end-to-end mode (OpenRouter is the product default)")
+    parser.add_argument(
+        "--extraction",
+        choices=("openrouter", "fake", "http"),
+        default="openrouter",
+        help="extraction provider for end-to-end mode (OpenRouter is the product default)",
+    )
     parser.add_argument("--extraction-model", type=str, default=None, help="model for openrouter/http extraction (or env TERMYTEDB_EXTRACTION_MODEL)")
     parser.add_argument("--processing-batch-size", type=int, default=100, help="processing jobs per batch")
     parser.add_argument("--processing-lease-seconds", type=int, default=180)

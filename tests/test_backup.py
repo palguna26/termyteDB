@@ -1,13 +1,11 @@
-from termytedb import TermyteDB
+from src import TermyteDB
 
 
 def test_sqlite_backup_reopens_with_preserved_evidence(tmp_path):
     source = tmp_path / "source.sqlite"
     target = tmp_path / "backups" / "copy.sqlite"
     db = TermyteDB(source)
-    receipt = db.ingest(
-        {"namespace_id": "backup", "idempotency_key": "one", "type": "note", "payload": {"text": "Decision: use SQLite."}}
-    )
+    receipt = db.ingest({"namespace_id": "backup", "idempotency_key": "one", "type": "note", "payload": {"text": "Decision: use SQLite."}})
     db.process("backup")
     db.backup(target)
     db.close()

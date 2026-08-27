@@ -1,1 +1,0 @@
-{"query":"SQLite decision","owner_namespace":"isolation-left","owner_text":"Decision: isolation-left uses SQLite.","other_namespace":"isolation-right","other_text":"Decision: isolation-right uses PostgreSQL."}

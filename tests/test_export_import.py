@@ -1,4 +1,4 @@
-from termytedb import TermyteDB
+from src import TermyteDB
 
 
 def test_namespace_export_import_preserves_memory_history_and_search(tmp_path):
@@ -21,8 +21,14 @@ def test_namespace_export_import_preserves_memory_history_and_search(tmp_path):
 
 def test_import_rejects_mixed_namespace_rows(tmp_path):
     db = TermyteDB(tmp_path / "import.sqlite")
-    document = {"namespaces": [{"id": "safe", "org_id": "default", "created_at": "now", "deleted_at": None}],
-                "events": [{"namespace_id": "other"}], "memories": [], "memory_versions": [], "evidence_refs": [], "processing_jobs": []}
+    document = {
+        "namespaces": [{"id": "safe", "org_id": "default", "created_at": "now", "deleted_at": None}],
+        "events": [{"namespace_id": "other"}],
+        "memories": [],
+        "memory_versions": [],
+        "evidence_refs": [],
+        "processing_jobs": [],
+    }
     try:
         db.import_namespace(document, "safe")
     except ValueError as exc:

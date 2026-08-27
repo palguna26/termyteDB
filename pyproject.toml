@@ -8,37 +8,33 @@ version = "0.1.0"
 description = "Evidence-first memory engine for AI agents"
 requires-python = ">=3.11"
 dependencies = [
-  "fastapi>=0.115,<1",
   "fastembed>=0.7,<1",
-  "flashrank>=0.2,<1",
   "numpy>=1.26,<3",
   "pydantic>=2.7,<3",
-  "python-dotenv>=1,<2",
   "sqlite-vec>=0.1,<1",
-  "uvicorn>=0.30,<1",
 ]
-
-[project.scripts]
-termytedb = "termytedb.cli:main"
 
 [project.optional-dependencies]
 tokenizer = [
   "tiktoken>=0.7,<1",
 ]
+benchmark = [
+  "flashrank>=0.2,<1",
+  "python-dotenv>=1,<2",
+]
 dev = [
-  "httpx>=0.27,<1",
   "mypy>=1.11,<2",
   "pytest>=8,<9",
   "ruff>=0.6,<1",
 ]
 
 [tool.setuptools.packages.find]
-where = ["src"]
+include = ["src*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
-pythonpath = ["src"]
+pythonpath = ["."]
 
 [tool.ruff]
 line-length = 160
@@ -46,6 +42,7 @@ target-version = "py311"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP"]
+ignore = ["E501"]
 
 [tool.mypy]
 python_version = "3.11"

@@ -2,8 +2,9 @@ import json
 from uuid import uuid4
 
 import pytest
-from termytedb.provider import HttpExtractionProvider, ProviderError, build_extraction_prompt
-from termytedb.schemas import ExtractionRequest
+
+from src.memory.provider import HttpExtractionProvider, ProviderError, build_extraction_prompt
+from src.models import ExtractionRequest
 
 
 def request() -> ExtractionRequest:
@@ -48,7 +49,7 @@ def test_http_provider_validates_strict_output(monkeypatch):
         def read(self):
             return json.dumps({"schema_version": "extraction-v1", "prompt_version": "p1", "candidates": []}).encode()
 
-    monkeypatch.setattr("termytedb.provider.urlopen", lambda *_args, **_kwargs: Response())
+    monkeypatch.setattr("src.memory.provider.urlopen", lambda *_args, **_kwargs: Response())
     result = HttpExtractionProvider("http://provider", "model").extract(request())
     assert result.provider_name == "http"
     assert result.response.schema_version == "extraction-v1"
@@ -65,14 +66,14 @@ def test_http_provider_rejects_malformed_output_without_leaking_response(monkeyp
         def read(self):
             return b"not-json secret=should-not-appear"
 
-    monkeypatch.setattr("termytedb.provider.urlopen", lambda *_args, **_kwargs: Response())
+    monkeypatch.setattr("src.memory.provider.urlopen", lambda *_args, **_kwargs: Response())
     with pytest.raises(ProviderError, match="invalid extraction-v1 JSON") as error:
         HttpExtractionProvider("http://provider").extract(request())
     assert "should-not-appear" not in str(error.value)
 
 
 def test_openrouter_provider_requests_strict_extraction_schema(monkeypatch):
-    from termytedb.provider import OpenRouterExtractionProvider
+    from src.memory.provider import OpenRouterExtractionProvider
 
     captured = {}
 
@@ -95,7 +96,7 @@ def test_openrouter_provider_requests_strict_extraction_schema(monkeypatch):
         captured["body"] = json.loads(request.data)
         return Response()
 
-    monkeypatch.setattr("termytedb.provider.urlopen", fake_urlopen)
+    monkeypatch.setattr("src.memory.provider.urlopen", fake_urlopen)
     result = OpenRouterExtractionProvider("mistralai/mistral-nemo", api_key="test-key").extract(request())
 
     response_format = captured["body"]["response_format"]

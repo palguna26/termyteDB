@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from termytedb import TermyteDB
+from src import TermyteDB
 
 
 def test_redacted_secret_is_absent_from_sqlite_files(tmp_path: Path):

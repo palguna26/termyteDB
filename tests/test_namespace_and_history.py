@@ -1,23 +1,15 @@
 from __future__ import annotations
 
-from fastapi.testclient import TestClient
-from termytedb.service import create_app
-
 from .conftest import event
 
 
-def test_direct_id_access_and_fts_collision_are_namespace_scoped(db, tmp_path):
+def test_fts_results_are_namespace_scoped(db):
     db.ingest(event("n1", "one", "Decision: storage uses SQLite."))
     db.ingest(event("n2", "two", "Decision: storage uses SQLite."))
     db.process("n1")
     db.process("n2")
     memory = db.search("n1", "SQLite")[0]
     assert db.search("n2", "SQLite")[0].memory_id != memory.memory_id
-    client = TestClient(create_app(tmp_path / "api.sqlite"))
-    client.post("/v1/events", json=event("n1", "one", "Decision: storage uses SQLite."))
-    client.post("/v1/process", json={"namespace_id": "n1"})
-    api_memory = client.post("/v1/search", json={"namespace_id": "n1", "query": "SQLite"}).json()[0]["memory_id"]
-    assert client.get(f"/v1/memories/{api_memory}", params={"namespace_id": "n2"}).status_code == 404
 
 
 def test_job_claims_do_not_cross_namespaces(db):
