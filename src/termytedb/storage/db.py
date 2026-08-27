@@ -467,11 +467,30 @@ class Database:
         self.connection = sqlite3.connect(self.path, check_same_thread=False, timeout=30)
         self.connection.row_factory = sqlite3.Row
         self.connection.create_function("vector_json_to_blob", 1, _vector_json_to_blob, deterministic=True)
+        self.sqlite_vec_available = False
         self.connection.execute("PRAGMA foreign_keys = ON")
         self.connection.execute("PRAGMA secure_delete = ON")
         self.connection.execute("PRAGMA journal_mode = WAL")
         self.connection.execute("PRAGMA busy_timeout = 5000")
+        self._load_sqlite_vec()
         self.migrate()
+
+    def _load_sqlite_vec(self) -> None:
+        try:
+            import sqlite_vec
+        except Exception:
+            return
+        try:
+            self.connection.enable_load_extension(True)
+            sqlite_vec.load(self.connection)
+            self.sqlite_vec_available = True
+        except Exception:
+            self.sqlite_vec_available = False
+        finally:
+            try:
+                self.connection.enable_load_extension(False)
+            except Exception:
+                pass
 
     def migrate(self) -> None:
         with self.connection:

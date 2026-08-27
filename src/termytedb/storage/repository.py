@@ -17,6 +17,7 @@ from ..memory.extraction import CandidateRejected, ValidatedCandidate
 from ..memory.extractor import Candidate, payload_text
 from ..retrieval.embedding import EmbeddingProvider, FastEmbedProvider, batch_dot, pack_embedding
 from .db import Database
+from .vector_index import SQLiteVecIndex
 
 TRANSITION_MARKERS = (
     "correction", "corrected", "replace", "supersede", "instead",
@@ -75,7 +76,17 @@ class Repository:
     def __init__(self, database: Database, embedding: EmbeddingProvider | None = None):
         self.db = database
         self.embedding = embedding or FastEmbedProvider()
+        self.vector_index = SQLiteVecIndex(self.db, self.embedding)
+        self.vector_index.ensure()
         self._claimed_lease_tokens: dict[str, str] = {}
+
+    def _persist_embedding(self, memory_version_id: str, namespace_id: str, vector: list[float] | None, statement: str) -> None:
+        packed = pack_embedding(vector if vector is not None else self.embedding.embed(statement))
+        self.db.execute(
+            "INSERT INTO memory_embeddings(memory_version_id, namespace_id, provider, dimensions, vector) VALUES (?, ?, ?, ?, ?)",
+            (memory_version_id, namespace_id, self.embedding.name, self.embedding.dimensions, packed),
+        )
+        self.vector_index.upsert_row(memory_version_id, namespace_id, packed)
 
     def embed_many(self, values: list[str]) -> list[list[float]]:
         embed_many = getattr(self.embedding, "embed_many", None)
@@ -632,13 +643,7 @@ class Repository:
                 "INSERT INTO memory_fts(memory_version_id, namespace_id, statement, evidence_text) VALUES (?, ?, ?, ?)",
                 (version_id, namespace_id, candidate.statement, candidate.statement),
             )
-            self.db.execute(
-                "INSERT INTO memory_embeddings(memory_version_id, namespace_id, provider, dimensions, vector) VALUES (?, ?, ?, ?, ?)",
-                (
-                    version_id, namespace_id, self.embedding.name, self.embedding.dimensions,
-                    pack_embedding(embedding if embedding is not None else self.embedding.embed(candidate.statement)),
-                ),
-            )
+            self._persist_embedding(version_id, namespace_id, embedding, candidate.statement)
             return memory_id
 
     def record_run(self, namespace_id: str, run: dict[str, Any]) -> None:
@@ -845,16 +850,7 @@ class Repository:
             )
         elif status == "contradicted":
             self.db.execute("UPDATE memories SET status='disputed' WHERE id=? AND namespace_id=?", (memory_id, namespace_id))
-        self.db.execute(
-            "INSERT INTO memory_embeddings(memory_version_id, namespace_id, provider, dimensions, vector) VALUES (?, ?, ?, ?, ?)",
-            (
-                version_id,
-                namespace_id,
-                self.embedding.name,
-                self.embedding.dimensions,
-                pack_embedding(embedding if embedding is not None else self.embedding.embed(item.statement)),
-            ),
-        )
+        self._persist_embedding(version_id, namespace_id, embedding, item.statement)
         return memory_id, action, version_id
 
     def get_memory(self, namespace_id: str, memory_id: str) -> MemoryResponse | None:
@@ -923,32 +919,42 @@ class Repository:
 
         vector: dict[str, float] = {}
         vector_rank: dict[str, int] = {}
-        vector_rows = self.db.execute(
-            """SELECT e.memory_version_id, e.vector
-            FROM memory_embeddings e JOIN memory_versions v ON v.id=e.memory_version_id AND v.namespace_id=e.namespace_id
-            JOIN memories m ON m.id=v.memory_id AND m.namespace_id=v.namespace_id
-            WHERE e.namespace_id=? AND e.provider=? AND e.dimensions=? AND (? OR (v.status='active' AND m.status='active'
-              AND m.accessibility >= 0.05 AND v.valid_to IS NULL
-              AND (v.valid_from IS NULL OR julianday(v.valid_from) <= julianday('now'))
-              AND (v.valid_until IS NULL OR julianday(v.valid_until) > julianday('now'))))""",
-            (namespace_id, self.embedding.name, self.embedding.dimensions, historical),
-        ).fetchall()
-        if vector_rows:
-            try:
-                query_vector = self.embedding.embed(query)
-                scores = batch_dot(query_vector, [bytes(row["vector"]) for row in vector_rows], self.embedding.dimensions)
-                raw_vector = {
-                    str(row["memory_version_id"]): float(score)
-                    for row, score in zip(vector_rows, scores, strict=True)
-                }
-                ordered_vector = sorted(raw_vector.items(), key=lambda item: (-item[1], item[0]))
-                vector_rank = {memory_id: index for index, (memory_id, score) in enumerate(ordered_vector, start=1) if score >= 0.6}
-                vector = {memory_id: score for memory_id, score in raw_vector.items() if memory_id in vector_rank}
-            except Exception:
-                # Lexical retrieval is the complete local fallback. Embedding
-                # failures must not make already indexed evidence disappear.
-                vector = {}
-                vector_rank = {}
+        query_vector: list[float] | None = None
+        try:
+            query_vector = self.embedding.embed(query)
+            indexed_rows = self.vector_index.search(namespace_id, query_vector, max(limit * 5, 20))
+            if indexed_rows:
+                ordered_vector = [(memory_id, score) for memory_id, score in indexed_rows if score >= 0.6]
+                vector_rank = {memory_id: index for index, (memory_id, score) in enumerate(ordered_vector, start=1)}
+                vector = {memory_id: score for memory_id, score in ordered_vector}
+        except Exception:
+            query_vector = None
+        if not vector and query_vector is not None:
+            vector_rows = self.db.execute(
+                """SELECT e.memory_version_id, e.vector
+                FROM memory_embeddings e JOIN memory_versions v ON v.id=e.memory_version_id AND v.namespace_id=e.namespace_id
+                JOIN memories m ON m.id=v.memory_id AND m.namespace_id=v.namespace_id
+                WHERE e.namespace_id=? AND e.provider=? AND e.dimensions=? AND (? OR (v.status='active' AND m.status='active'
+                  AND m.accessibility >= 0.05 AND v.valid_to IS NULL
+                  AND (v.valid_from IS NULL OR julianday(v.valid_from) <= julianday('now'))
+                  AND (v.valid_until IS NULL OR julianday(v.valid_until) > julianday('now'))))""",
+                (namespace_id, self.embedding.name, self.embedding.dimensions, historical),
+            ).fetchall()
+            if vector_rows:
+                try:
+                    scores = batch_dot(query_vector, [bytes(row["vector"]) for row in vector_rows], self.embedding.dimensions)
+                    raw_vector = {
+                        str(row["memory_version_id"]): float(score)
+                        for row, score in zip(vector_rows, scores, strict=True)
+                    }
+                    ordered_vector = sorted(raw_vector.items(), key=lambda item: (-item[1], item[0]))
+                    vector_rank = {memory_id: index for index, (memory_id, score) in enumerate(ordered_vector, start=1) if score >= 0.6}
+                    vector = {memory_id: score for memory_id, score in raw_vector.items() if memory_id in vector_rank}
+                except Exception:
+                    # Lexical retrieval is the complete local fallback. Embedding
+                    # failures must not make already indexed evidence disappear.
+                    vector = {}
+                    vector_rank = {}
 
         candidate_ids = set(lexical) | {memory_id for memory_id, score in vector.items() if score >= 0.7}
         if not candidate_ids:
@@ -1425,6 +1431,7 @@ class Repository:
                     pack_embedding(vector),
                 ),
             )
+        self.vector_index.rebuild_all()
 
     def delete_namespace(self, namespace_id: str) -> bool:
         with self.db.lock, self.db.connection:
@@ -1437,6 +1444,7 @@ class Repository:
             self.db.execute("DELETE FROM episode_events WHERE namespace_id=?", (namespace_id,))
             self.db.execute("DELETE FROM episodes WHERE namespace_id=?", (namespace_id,))
             self.db.execute("DELETE FROM memory_embeddings WHERE namespace_id=?", (namespace_id,))
+            self.vector_index.delete_namespace(namespace_id)
             self.db.execute("DELETE FROM feedback WHERE namespace_id=?", (namespace_id,))
             self.db.execute("DELETE FROM context_requests WHERE namespace_id=?", (namespace_id,))
             self.db.execute("DELETE FROM artifacts WHERE namespace_id=?", (namespace_id,))
