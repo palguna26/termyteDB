@@ -64,8 +64,9 @@ def build_extraction_prompt(request: ExtractionRequest) -> str:
         f"Return ONLY valid JSON matching this exact schema, no preamble: {schema_example}\n"
         "TASK - extract durable, standalone facts that an ordinary agent would want to remember:\n"
         " - Prefer personal facts, preferences, decisions, outcomes that persist beyond the session.\n"
-        " - Statement must be standalone, third-person or neutral, and fully supported by the cited excerpt.\n"
-        " - Evidence excerpt must be a VERBATIM substring of the event text with exact start_offset/end_offset.\n"
+        " - If evidence contains no durable fact, return {\"candidates\":[]} - do not invent.\n"
+        " - At most 3 candidates per event; each statement ONE sentence, 10-150 chars, standalone third-person.\n"
+        " - Statement must be fully supported by the cited excerpt; excerpt VERBATIM with exact start_offset/end_offset.\n"
         " - Kind must be one of fact/decision/attempt/failure/outcome/constraint/procedure/task_state/correction/question.\n"
         " - Subject: short canonical key (2-4 words, e.g. 'user degree', 'sqlite wal') - lowercased, no sentences.\n"
         " - Confidence 0-1, importance 0-1, durability permanent/session/task, source_role user/assistant.\n"
@@ -227,6 +228,7 @@ class OpenRouterExtractionProvider:
                     {"role": "user", "content": prompt},
                 ],
                 "temperature": 0,
+                "max_tokens": 1500,
                 "response_format": {"type": "json_object"},
             }
         ).encode("utf-8")

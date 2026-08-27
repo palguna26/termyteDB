@@ -331,14 +331,15 @@ class Repository:
         ).fetchall()
         return [dict(row) for row in rows]
 
-    def related_memory_context(self, namespace_id: str, query: str, limit: int = 20) -> list[dict[str, Any]]:
+    def related_memory_context(self, namespace_id: str, query: str, limit: int = 5) -> list[dict[str, Any]]:
         """Return bounded current memory context for extraction reconciliation.
 
         This deliberately reuses the normal namespace-safe search path. The result is
         comparison context for the provider; evidence for new claims must still come
         from the current input events.
+        Keeps input tokens ~800 (5*~120) vs 20*120=2400 to avoid output>input.
         """
-        results = self.search(namespace_id, query, max(1, min(limit, 20)), historical=False)
+        results = self.search(namespace_id, query, max(1, min(limit, 5)), historical=False)
         return [
             {
                 "ref": f"m{index}",
