@@ -984,6 +984,10 @@ def run(args: argparse.Namespace) -> int:
     pending = [item for item in samples if item.question_id not in resume_ids]
     if args.limit:
         pending = pending[: args.limit]
+    if args.smoke:
+        if not args.confirm_benchmark:
+            raise SystemExit("smoke benchmark loops require --confirm-benchmark")
+        pending = pending[: args.smoke_samples]
 
     work_dir = Path(args.work_dir)
     work_dir.mkdir(parents=True, exist_ok=True)
@@ -1102,6 +1106,9 @@ def main() -> int:
     parser.add_argument("--work-dir", default=str(ROOT / ".termytedb-work" / "longmemeval"))
     parser.add_argument("--results-dir", default=str(ROOT / "results"))
     parser.add_argument("--limit", type=int, help="limit number of questions (for smoke tests)")
+    parser.add_argument("--smoke", action="store_true", help="run the manual 5-sample benchmark smoke subset")
+    parser.add_argument("--smoke-samples", type=int, default=5, help="number of questions to use for smoke runs")
+    parser.add_argument("--confirm-benchmark", action="store_true", help="required to start a benchmark smoke loop")
     parser.add_argument("--task", choices=CATEGORY_ORDER, help="filter to single question_type")
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--recall-k", type=int, default=15)

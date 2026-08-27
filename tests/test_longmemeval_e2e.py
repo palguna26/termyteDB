@@ -525,3 +525,144 @@ def test_old_retrieval_benchmark_still_functions(tmp_path: Path):
     out = retrieve_session_ranking(db_path, s, args)
     assert "best_rank" in out
     assert "session_order" in out
+
+
+def test_smoke_benchmark_requires_confirmation(tmp_path: Path):
+    from benchmarks.longmemeval.run_benchmark import run
+    import argparse, json, pytest
+
+    data_path = tmp_path / "dataset.json"
+    data_path.write_text(
+        json.dumps(
+            [
+                {
+                    "question_id": str(i),
+                    "question": f"Q{i}",
+                    "question_type": "single-session-user",
+                    "answer": "A",
+                    "answer_session_ids": [],
+                    "haystack_session_ids": [f"s{i}"],
+                    "haystack_dates": ["2026-01-01"],
+                    "haystack_sessions": [[{"role": "user", "content": f"hello {i}"}]],
+                }
+                for i in range(6)
+            ]
+        ),
+        encoding="utf-8",
+    )
+    args = argparse.Namespace(
+        mode="end-to-end",
+        data_path=data_path,
+        work_dir=str(tmp_path / "work"),
+        results_dir=str(tmp_path / "results"),
+        limit=None,
+        smoke=True,
+        smoke_samples=5,
+        confirm_benchmark=False,
+        task=None,
+        workers=1,
+        recall_k=15,
+        token_budget=1500,
+        pack_atoms=40,
+        abstain_threshold=0.25,
+        no_rerank=True,
+        no_dense=True,
+        single_db=False,
+        resume_from=None,
+        answer_model="openai/gpt-4o-mini",
+        judge_model="openai/gpt-4o-mini",
+        budget_usd=8.0,
+        embedding_provider=None,
+        embedding_model=None,
+        embedding_dimensions=None,
+        extraction="openrouter",
+        extraction_model=None,
+        processing_batch_size=100,
+        processing_lease_seconds=180,
+        processing_timeout=30.0,
+    )
+
+    with pytest.raises(SystemExit, match="smoke benchmark loops require --confirm-benchmark"):
+        run(args)
+
+
+def test_smoke_benchmark_caps_to_five_samples(tmp_path: Path, monkeypatch):
+    from benchmarks.longmemeval import run_benchmark as bench
+    import argparse, json
+
+    data_path = tmp_path / "dataset.json"
+    data_path.write_text(
+        json.dumps(
+            [
+                {
+                    "question_id": str(i),
+                    "question": f"Q{i}",
+                    "question_type": "single-session-user",
+                    "answer": "A",
+                    "answer_session_ids": [],
+                    "haystack_session_ids": [f"s{i}"],
+                    "haystack_dates": ["2026-01-01"],
+                    "haystack_sessions": [[{"role": "user", "content": f"hello {i}"}]],
+                }
+                for i in range(6)
+            ]
+        ),
+        encoding="utf-8",
+    )
+    calls: list[str] = []
+
+    def fake_eval(args, sample, budget):
+        calls.append(sample.question_id)
+        return {
+            "question_id": sample.question_id,
+            "question_type": sample.question_type,
+            "best_rank": 1,
+            "recall": {"5": 1, "10": 1, "15": 1},
+            "ndcg_at_k": 1.0,
+            "packed_words": 10,
+            "retrieval_latency_ms": 1.0,
+            "e2e_diagnostics": {"memories_created": 1, "candidates_extracted": 1},
+        }
+
+    monkeypatch.setattr(bench, "evaluate_sample_e2e", fake_eval)
+    monkeypatch.setattr(bench, "evaluate_sample", fake_eval)
+
+    args = argparse.Namespace(
+        mode="end-to-end",
+        data_path=data_path,
+        work_dir=str(tmp_path / "work"),
+        results_dir=str(tmp_path / "results"),
+        limit=None,
+        smoke=True,
+        smoke_samples=5,
+        confirm_benchmark=True,
+        task=None,
+        workers=1,
+        recall_k=15,
+        token_budget=1500,
+        pack_atoms=40,
+        abstain_threshold=0.25,
+        no_rerank=True,
+        no_dense=True,
+        single_db=False,
+        resume_from=None,
+        answer_model="openai/gpt-4o-mini",
+        judge_model="openai/gpt-4o-mini",
+        budget_usd=8.0,
+        embedding_provider=None,
+        embedding_model=None,
+        embedding_dimensions=None,
+        extraction="openrouter",
+        extraction_model=None,
+        processing_batch_size=100,
+        processing_lease_seconds=180,
+        processing_timeout=30.0,
+    )
+
+    exit_code = bench.run(args)
+    assert exit_code == 0
+    assert len(calls) == 5
+    result_files = list((tmp_path / "results").glob("longmemeval_s_end-to-end_*.json"))
+    assert len(result_files) == 1
+    output = json.loads(result_files[0].read_text(encoding="utf-8"))
+    assert len(output["traces"]) == 5

@@ -104,6 +104,9 @@ foreach ($task in @("single-session-user","single-session-assistant","single-ses
 }
 ```
 
+Smoke runs are manual only. Use `--smoke --confirm-benchmark` to cap the run at
+5 samples and make the intent explicit.
+
 Outputs are written to `results/longmemeval_s_{mode}_{timestamp}.json` with
 `dataset.sha256`, `config`, `summary` (per-category rows), and per-question
 `traces` (latency, packed token count, accepted/rejected counts, and — in judged
