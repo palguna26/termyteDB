@@ -143,7 +143,7 @@ class Repository:
                 (namespace_id, org_id, iso()),
             )
 
-    def ingest(self, namespace_id: str, event: EventInput, redacted_payload: dict[str, Any]) -> tuple[str, bool, str, str]:
+    def ingest(self, namespace_id: str, event: EventInput, redacted_payload: dict[str, Any]) -> tuple[str, bool, str]:
         if event.namespace_id != namespace_id:
             raise ValueError("event namespace does not match repository namespace")
         with self.db.lock:
@@ -165,7 +165,6 @@ class Repository:
                 else 0
             )
             encoding = score_observation(observation_text, repeated=min(1.0, prior_count / 3))
-            job_id = str(uuid.uuid4())
             with self.db.connection:
                 existing = self.db.execute(
                     "SELECT id, content_hash FROM events WHERE namespace_id = ? AND idempotency_hash = ?",
@@ -174,13 +173,7 @@ class Repository:
                 if existing:
                     if existing["content_hash"] != content_hash:
                         raise IdempotencyConflict("idempotency key is already used for different content")
-                    existing_job = self.db.execute(
-                        "SELECT id FROM processing_jobs WHERE namespace_id = ? AND event_id = ? ORDER BY created_at LIMIT 1",
-                        (namespace_id, existing["id"]),
-                    ).fetchone()
-                    if not existing_job:
-                        raise RuntimeError("event is missing its processing job")
-                    return existing["id"], True, existing["content_hash"], existing_job["id"]
+                    return existing["id"], True, existing["content_hash"]
                 self.db.execute(
                     """INSERT INTO events
                     (id, namespace_id, protocol_version, stream_id, actor_id, agent_id, session_id, source_id, idempotency_hash, type, occurred_at,
@@ -223,12 +216,6 @@ class Repository:
                             json.dumps(safe_metadata, sort_keys=True, separators=(",", ":")),
                         ),
                     )
-                self.db.execute(
-                    """INSERT INTO processing_jobs
-                    (id, namespace_id, event_id, input_hash, status, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, 'pending', ?, ?)""",
-                    (job_id, namespace_id, event_id, content_hash, iso(), iso()),
-                )
                 episode_id = self._assign_episode(namespace_id, event_id, event.stream_id, occurred)
                 ordinal = int(self.db.execute("SELECT ordinal FROM episode_events WHERE episode_id=? AND event_id=?", (episode_id, event_id)).fetchone()[0])
                 self.db.execute(
@@ -257,7 +244,18 @@ class Repository:
                         iso(),
                     ),
                 )
-            return event_id, False, content_hash, job_id
+            return event_id, False, content_hash
+
+    def events_by_id(self, namespace_id: str, event_ids: list[str]) -> list[sqlite3.Row]:
+        if not event_ids:
+            return []
+        placeholders = ",".join("?" for _ in event_ids)
+        rows = self.db.execute(
+            f"SELECT * FROM events WHERE namespace_id=? AND id IN ({placeholders}) ORDER BY created_at, sequence_number, id",
+            (namespace_id, *event_ids),
+        ).fetchall()
+        by_id = {str(row["id"]): row for row in rows}
+        return [by_id[event_id] for event_id in event_ids if event_id in by_id]
 
     def _assign_episode(self, namespace_id: str, event_id: str, stream_id: str | None, occurred: str) -> str:
         """Assign an event to the nearest deterministic stream episode."""

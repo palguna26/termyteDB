@@ -50,30 +50,58 @@ class TermyteDB:
         self._closed = False
 
     def ingest(self, event: EventInput | dict[str, Any]) -> EventReceipt:
+        result = self.ingest_batch([event])
+        return result.receipts[0].model_copy(update={"accepted": result.accepted, "rejected": result.rejected})
+
+    def _prepare_event(self, event: EventInput | dict[str, Any]) -> tuple[EventInput, dict[str, Any]]:
         parsed = event if isinstance(event, EventInput) else EventInput.model_validate(event)
         redacted_payload = redact(parsed.payload)
         payload_bytes = len(json.dumps(redacted_payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
         if payload_bytes > self.MAX_EVENT_BYTES or sum(item.size_bytes for item in parsed.artifacts) > 100_000_000:
             raise ValueError(f"event payload exceeds {self.MAX_EVENT_BYTES} bytes")
-        event_id, duplicate, content_hash, job_id = self.repository.ingest(parsed.namespace_id, parsed, redacted_payload)
-        log(
-            self.logger,
-            logging.INFO,
-            "ingestion.accepted",
-            namespace_id=parsed.namespace_id,
-            event_id=event_id,
-            duplicate=duplicate,
-        )
-        return EventReceipt(
-            event_id=UUID(event_id),
-            namespace_id=parsed.namespace_id,
-            content_hash=content_hash,
-            duplicate=duplicate,
-            job_id=UUID(job_id),
-        )
+        return parsed, redacted_payload
 
-    def ingest_batch(self, events: list[EventInput]) -> BatchEventResponse:
-        return BatchEventResponse(receipts=[self.ingest(event) for event in events])
+    def ingest_batch(self, events: list[EventInput | dict[str, Any]]) -> BatchEventResponse:
+        # One SQLite connection is shared by the embedded engine. Keep a direct
+        # ingestion call coherent while separate engine instances use WAL.
+        with self.database.lock:
+            return self._ingest_batch(events)
+
+    def _ingest_batch(self, events: list[EventInput | dict[str, Any]]) -> BatchEventResponse:
+        prepared = [self._prepare_event(event) for event in events]
+        if not prepared:
+            raise ValueError("at least one event is required")
+        namespace_id = prepared[0][0].namespace_id
+        if any(parsed.namespace_id != namespace_id for parsed, _ in prepared):
+            raise ValueError("all events in one ingestion call must share a namespace")
+
+        receipts: list[EventReceipt] = []
+        new_event_ids: list[str] = []
+        for parsed, redacted_payload in prepared:
+            event_id, duplicate, content_hash = self.repository.ingest(parsed.namespace_id, parsed, redacted_payload)
+            if not duplicate:
+                new_event_ids.append(event_id)
+            receipts.append(
+                EventReceipt(
+                    event_id=UUID(event_id),
+                    namespace_id=parsed.namespace_id,
+                    content_hash=content_hash,
+                    duplicate=duplicate,
+                )
+            )
+            log(
+                self.logger,
+                logging.INFO,
+                "ingestion.accepted",
+                namespace_id=parsed.namespace_id,
+                event_id=event_id,
+                duplicate=duplicate,
+            )
+
+        accepted = rejected = 0
+        if new_event_ids:
+            _, accepted, rejected = self.processor.process_events(namespace_id, new_event_ids)
+        return BatchEventResponse(receipts=receipts, accepted=accepted, rejected=rejected)
 
     def history(self, namespace_id: str, memory_id: str) -> list[dict[str, Any]] | None:
         return self.repository.history(namespace_id, memory_id)

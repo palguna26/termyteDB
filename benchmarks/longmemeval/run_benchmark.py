@@ -58,6 +58,7 @@ from src.retrieval.retrieval import AtomHit, dense_search_atoms, pack_context, s
 from src.storage.db import Database  # noqa: E402
 
 DEFAULT_DATA_PATH = ROOT / "benchmarks" / "longmemeval" / "longmemeval_s_cleaned.json"
+DEFAULT_MICRO_PATH = ROOT / "benchmarks" / "longmemeval" / "longmemeval_micro.json"
 CATEGORY_ORDER = [
     "single-session-user",
     "single-session-assistant",
@@ -460,7 +461,7 @@ def _run_manifest(args: argparse.Namespace, data_path: Path, dataset_sha256: str
 
 
 def ingest_and_process_e2e(work_dir: Path, sample: Sample, args: argparse.Namespace) -> tuple[Path, dict[str, Any]]:
-    """Ingest LongMemEval history through production pipeline and process.
+    """Ingest LongMemEval history through the direct production pipeline.
 
     Returns (database_path, diagnostics).
     """
@@ -486,35 +487,23 @@ def ingest_and_process_e2e(work_dir: Path, sample: Sample, args: argparse.Namesp
             ingest_started = time.perf_counter()
             events_ingested = 0
             events_duplicate = 0
+            total_accepted = total_rejected = 0
             receipts = []
+            session_batches: dict[str, list[EventInput]] = {}
             for ev in events_input:
-                receipt = engine.ingest(ev)
-                receipts.append(receipt)
-                if receipt.duplicate:
-                    events_duplicate += 1
-                else:
-                    events_ingested += 1
+                scope = str(ev.session_id or ev.stream_id or ev.idempotency_key)
+                session_batches.setdefault(scope, []).append(ev)
+            for batch in session_batches.values():
+                result = engine.ingest_batch(batch)
+                receipts.extend(result.receipts)
+                total_accepted += result.accepted
+                total_rejected += result.rejected
+                events_duplicate += sum(receipt.duplicate for receipt in result.receipts)
+                events_ingested += sum(not receipt.duplicate for receipt in result.receipts)
             ingest_latency_ms = (time.perf_counter() - ingest_started) * 1000
-
-            # Drain processing jobs
-            process_started = time.perf_counter()
-            total_processed = total_failed = total_dead = total_accepted = total_rejected = 0
-            batch_size = int(getattr(args, "processing_batch_size", 100) or 100)
-            lease_seconds = int(getattr(args, "processing_lease_seconds", 180) or 180)
-            for _ in range(50):  # safety cap: 50 batches per sample
-                resp = engine.process(namespace_id, limit=batch_size, lease_seconds=lease_seconds)
-                total_processed += resp.processed
-                total_failed += resp.failed
-                total_dead += resp.dead_lettered
-                total_accepted += resp.accepted
-                total_rejected += resp.rejected
-                if resp.processed == 0 and resp.failed == 0:
-                    break
-                # Check if jobs remain pending
-                metrics = engine.metrics(namespace_id)
-                if metrics.get("jobs_pending", 0) == 0 and metrics.get("jobs_processing", 0) == 0:
-                    break
-            process_latency_ms = (time.perf_counter() - process_started) * 1000
+            process_latency_ms = ingest_latency_ms
+            total_processed = events_ingested
+            total_failed = 0
 
             # Collect post-process diagnostics from repository
             metrics_final = engine.metrics(namespace_id)
@@ -536,9 +525,8 @@ def ingest_and_process_e2e(work_dir: Path, sample: Sample, args: argparse.Namesp
                 "events_duplicate": events_duplicate,
                 "events_total": len(events_input),
                 "ingest_latency_ms": round(ingest_latency_ms, 2),
-                "processing_jobs_completed": total_processed,
-                "processing_jobs_failed": total_failed,
-                "processing_jobs_dead": total_dead,
+                "events_processed": total_processed,
+                "processing_failures": total_failed,
                 "candidates_extracted": total_accepted + total_rejected,
                 "candidates_accepted": total_accepted,
                 "candidates_rejected": total_rejected,
@@ -913,9 +901,8 @@ def evaluate_sample_e2e(args: argparse.Namespace, sample: Sample, budget: OpenRo
         # Memory-formation diagnostics
         "e2e_diagnostics": e2e_diag,
         "events_ingested": e2e_diag.get("events_ingested", 0),
-        "processing_jobs_completed": e2e_diag.get("processing_jobs_completed", 0),
-        "processing_jobs_failed": e2e_diag.get("processing_jobs_failed", 0),
-        "processing_jobs_dead": e2e_diag.get("processing_jobs_dead", 0),
+        "events_processed": e2e_diag.get("events_processed", 0),
+        "processing_failures": e2e_diag.get("processing_failures", 0),
         "candidates_extracted": e2e_diag.get("candidates_extracted", 0),
         "candidates_accepted": e2e_diag.get("candidates_accepted", 0),
         "candidates_rejected": e2e_diag.get("candidates_rejected", 0),
@@ -1005,6 +992,15 @@ def run(args: argparse.Namespace) -> int:
     from dotenv import load_dotenv
 
     load_dotenv(ROOT / ".env")
+    # --micro convenience: use the 30-sample stratified subset (5 per category)
+    if getattr(args, "micro", False):
+        # allow --micro to override default data path unless user explicitly set --data-path
+        # Detect if data_path is still default; if so swap to micro path
+        if Path(args.data_path) == DEFAULT_DATA_PATH:
+            args.data_path = DEFAULT_MICRO_PATH
+            print(f"Using micro dataset: {args.data_path} (30 samples, 5 per category)", flush=True)
+        else:
+            print(f"--micro set but --data-path already overridden to {args.data_path}; keeping explicit path", flush=True)
     data_path = Path(args.data_path)
     dataset_bytes = data_path.read_bytes()
     dataset_sha256 = hashlib_sha256(dataset_bytes)
@@ -1163,6 +1159,11 @@ def main() -> int:
         help="Benchmark pipeline: retrieval-only (verbatim atoms) or end-to-end (production events)",
     )
     parser.add_argument("--data-path", type=Path, default=DEFAULT_DATA_PATH)
+    parser.add_argument(
+        "--micro",
+        action="store_true",
+        help="use longmemeval-micro (30 samples, 5 per category) instead of full 500; ~94%% cheaper/faster",
+    )
     parser.add_argument("--work-dir", default=str(ROOT / ".termytedb-work" / "longmemeval"))
     parser.add_argument("--results-dir", default=str(ROOT / "results"))
     parser.add_argument("--limit", type=int, help="limit number of questions (for smoke tests)")
@@ -1193,9 +1194,6 @@ def main() -> int:
         help="extraction provider for end-to-end mode (OpenRouter is the product default)",
     )
     parser.add_argument("--extraction-model", type=str, default=None, help="model for openrouter/http extraction (or env TERMYTEDB_EXTRACTION_MODEL)")
-    parser.add_argument("--processing-batch-size", type=int, default=100, help="processing jobs per batch")
-    parser.add_argument("--processing-lease-seconds", type=int, default=180)
-    parser.add_argument("--processing-timeout", type=float, default=30.0)
     args = parser.parse_args()
     return run(args)
 

@@ -12,12 +12,11 @@ def test_fts_results_are_namespace_scoped(db):
     assert db.search("n2", "SQLite")[0].memory_id != memory.memory_id
 
 
-def test_job_claims_do_not_cross_namespaces(db):
+def test_direct_ingestion_does_not_create_processing_jobs(db):
     db.ingest(event("n1", "one", "Decision: storage uses SQLite."))
     db.ingest(event("n2", "two", "Decision: storage uses PostgreSQL."))
-    claimed = db.repository.claim_jobs("n1", 10, 30)
-    assert claimed
-    assert all(row["namespace_id"] == "n1" for row in claimed)
+    assert db.repository.claim_jobs("n1", 10, 30) == []
+    assert db.database.execute("SELECT COUNT(*) FROM processing_jobs").fetchone()[0] == 0
 
 
 def test_history_remains_inspectable_after_supersession(db):

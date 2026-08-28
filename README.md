@@ -21,7 +21,6 @@ db.ingest({
     "type": "decision",
     "payload": {"text": "Decision: use SQLite."},
 })
-db.process("demo")
 print(db.context("demo", "database choice").text)
 db.close()
 ```
@@ -34,3 +33,25 @@ The dataset and single benchmark runner live in `benchmarks/longmemeval`.
 python -m pip install -e ".[benchmark]"
 python benchmarks/longmemeval/run_benchmark.py --mode end-to-end --confirm-benchmark
 ```
+
+### LongMemEval-Micro (30 samples, ~94% cheaper)
+
+Stratified subset of LongMemEval-S with 5 questions per category (30 total) across
+`single-session-user`, `single-session-assistant`, `single-session-preference`,
+`knowledge-update`, `temporal-reasoning`, `multi-session`.
+
+```powershell
+# Retrieval-only (zero LLM cost) on micro subset
+python benchmarks/longmemeval/run_benchmark.py --mode retrieval --micro --confirm-benchmark
+
+# End-to-end (OpenRouter extraction/embedding) on micro — ~16× cheaper than full 500
+python benchmarks/longmemeval/run_benchmark.py --mode end-to-end --micro --confirm-benchmark
+
+# Or point explicitly at the micro file
+python benchmarks/longmemeval/run_benchmark.py --mode retrieval --data-path benchmarks/longmemeval/longmemeval_micro.json --confirm-benchmark
+
+# Regenerate the subset (deterministic seed 42, excludes _abs abstentions)
+python benchmarks/longmemeval/create_micro.py
+```
+
+Files: `benchmarks/longmemeval/longmemeval_micro.json` and alias `longmemeval-micro.json`.

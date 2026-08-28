@@ -4,60 +4,41 @@ from threading import Barrier
 from src import TermyteDB
 
 
-def test_concurrent_workers_claim_each_job_once(tmp_path):
-    db = TermyteDB(tmp_path / "workers.sqlite")
-    for index in range(20):
-        db.ingest({"namespace_id": "workers", "idempotency_key": str(index), "type": "note", "payload": {"text": f"Decision: item {index}."}})
+def test_concurrent_direct_ingestion_on_one_engine_is_safe(tmp_path):
+    db = TermyteDB(tmp_path / "direct.sqlite")
+    namespaces = [f"worker-{index}" for index in range(4)]
 
-    barrier = Barrier(2)
+    def ingest(namespace_id: str) -> None:
+        db.ingest_batch(
+            [
+                {
+                    "namespace_id": namespace_id,
+                    "idempotency_key": str(index),
+                    "type": "decision",
+                    "payload": {"text": f"Decision: {namespace_id} item {index}."},
+                }
+                for index in range(5)
+            ]
+        )
 
-    def claim() -> list[str]:
-        barrier.wait()
-        return [job["id"] for job in db.repository.claim_jobs("workers", 10, 30)]
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        list(executor.map(ingest, namespaces))
 
-    with ThreadPoolExecutor(max_workers=2) as executor:
-        claimed = list(executor.map(lambda _: claim(), range(2)))
-    assert len(claimed[0]) == 10
-    assert len(claimed[1]) == 10
-    assert set(claimed[0]).isdisjoint(claimed[1])
-    with db.database.connection:
-        db.database.execute("UPDATE processing_jobs SET status='pending', lease_until=NULL WHERE namespace_id='workers'")
-    assert db.process("workers", limit=20).processed == 20
-    assert db.database.execute("SELECT COUNT(*) FROM processing_jobs WHERE namespace_id='workers' AND status='completed'").fetchone()[0] == 20
-    assert db.database.execute("SELECT COUNT(*) FROM memories WHERE namespace_id='workers'").fetchone()[0] == 20
+    for namespace_id in namespaces:
+        assert len(db.memories(namespace_id)) == 5
+    assert db.database.execute("SELECT COUNT(*) FROM processing_jobs").fetchone()[0] == 0
     db.close()
 
 
-def test_separate_database_connections_do_not_claim_the_same_job(tmp_path):
-    path = tmp_path / "separate-workers.sqlite"
-    owner = TermyteDB(path)
-    for index in range(4):
-        owner.ingest({"namespace_id": "workers", "idempotency_key": str(index), "type": "note", "payload": {"text": f"Item {index}."}})
-
-    workers = [TermyteDB(path) for _ in range(4)]
-    barrier = Barrier(4)
-
-    def claim(worker: TermyteDB) -> str:
-        barrier.wait()
-        return str(worker.repository.claim_jobs("workers", 1, 30)[0]["id"])
-
-    try:
-        with ThreadPoolExecutor(max_workers=4) as executor:
-            claimed = list(executor.map(claim, workers))
-        assert len(set(claimed)) == 4
-        attempts = owner.database.execute("SELECT attempts FROM processing_jobs WHERE namespace_id='workers' ORDER BY id").fetchall()
-        assert [row[0] for row in attempts] == [1, 1, 1, 1]
-    finally:
-        for worker in workers:
-            worker.close()
-        owner.close()
-
-
-def test_separate_workers_reinforce_one_memory_without_version_conflicts(tmp_path):
+def test_separate_connections_reinforce_memory_without_version_conflicts(tmp_path):
     path = tmp_path / "same-memory.sqlite"
     owner = TermyteDB(path)
-    for index in range(2):
-        owner.ingest(
+    workers = [TermyteDB(path) for _ in range(2)]
+    barrier = Barrier(2)
+
+    def ingest(index: int) -> None:
+        barrier.wait()
+        workers[index].ingest(
             {
                 "namespace_id": "workers",
                 "idempotency_key": str(index),
@@ -65,21 +46,14 @@ def test_separate_workers_reinforce_one_memory_without_version_conflicts(tmp_pat
                 "payload": {"text": "Decision: use SQLite."},
             }
         )
-    workers = [TermyteDB(path) for _ in range(2)]
-    barrier = Barrier(2)
-
-    def process(worker: TermyteDB):
-        barrier.wait()
-        return worker.process("workers", limit=1)
 
     try:
         with ThreadPoolExecutor(max_workers=2) as executor:
-            responses = list(executor.map(process, workers))
-        assert sum(response.processed for response in responses) == 2
-        assert sum(response.failed for response in responses) == 0
+            list(executor.map(ingest, range(2)))
         assert owner.database.execute("SELECT COUNT(*) FROM memories WHERE namespace_id='workers'").fetchone()[0] == 1
         assert owner.database.execute("SELECT COUNT(*) FROM memory_versions WHERE namespace_id='workers'").fetchone()[0] == 1
         assert owner.database.execute("SELECT COUNT(*) FROM evidence_refs WHERE namespace_id='workers'").fetchone()[0] == 2
+        assert owner.database.execute("SELECT COUNT(*) FROM processing_jobs").fetchone()[0] == 0
     finally:
         for worker in workers:
             worker.close()

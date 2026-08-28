@@ -96,7 +96,7 @@ class ExtractionRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     namespace_id: str = Field(min_length=1)
-    events: list[UUID] = Field(min_length=1, max_length=20)
+    events: list[UUID] = Field(min_length=1, max_length=1000)
     evidence_text: dict[UUID, str]
     existing_memories: list[dict[str, Any]] = Field(default_factory=list, max_length=20)
 
@@ -113,7 +113,9 @@ class EventReceipt(BaseModel):
     namespace_id: str
     content_hash: str
     duplicate: bool
-    job_id: UUID
+    job_id: UUID | None = None
+    accepted: int = 0
+    rejected: int = 0
 
 
 class BatchEventRequest(BaseModel):
@@ -124,6 +126,8 @@ class BatchEventRequest(BaseModel):
 
 class BatchEventResponse(BaseModel):
     receipts: list[EventReceipt]
+    accepted: int = 0
+    rejected: int = 0
 
 
 class MemoryHistoryResponse(BaseModel):
