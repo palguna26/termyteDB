@@ -9,17 +9,17 @@ Canonical harness supporting two distinct benchmark pipelines:
   indexing + retrieval only.
 
 * end-to-end (``end-to-end``) — true production memory pipeline:
-  LongMemEval conversation/session history -> EventInput ingestion ->
-  processing job -> extraction (OpenRouter / fake / HTTP) -> evidence validation
+  LongMemEval conversation/session history -> direct EventInput ingestion ->
+  extraction (OpenRouter / fake / HTTP) -> evidence validation
   -> reconciliation/versioning -> embeddings/indexing -> hybrid retrieval ->
   context packing -> retrieval metrics.
 
   No ground-truth question, answer, answer aliases, relevance annotations,
   evidence identifiers, or category hints leak into memory formation.
-  The question appears only after processing completes.
+  The question appears only after ingestion completes.
 
 General methodology notes are in docs/benchmarks.md; additional pipeline
-details for end-to-end are in the docstring of ``ingest_and_process_e2e``
+details for end-to-end are in the docstring of ``ingest_e2e``
 and ``evaluate_sample_e2e``.
 
 Modes:
@@ -36,6 +36,7 @@ import hashlib
 import json
 import math
 import os
+import random
 import re
 import subprocess
 import sys
@@ -116,12 +117,61 @@ _product_embedder_lock = threading.Lock()
 _RUN_MANIFEST_NAME = "longmemeval_run_manifest.json"
 
 
+class RequestPacer:
+    """Process-wide minimum spacing for remote provider requests."""
+
+    def __init__(self, min_interval_seconds: float = 2.0) -> None:
+        self.min_interval_seconds = max(0.0, min_interval_seconds)
+        self._lock = threading.Lock()
+        self._next_request_at = 0.0
+
+    def wait(self) -> float:
+        with self._lock:
+            now = time.monotonic()
+            delay = max(0.0, self._next_request_at - now)
+            if delay:
+                time.sleep(delay)
+            self._next_request_at = time.monotonic() + self.min_interval_seconds
+            return delay
+
+
+_openrouter_pacer = RequestPacer()
+
+
+class RateLimitedExtractionProvider:
+    def __init__(self, inner: Any, *, max_retries: int) -> None:
+        self.inner = inner
+        self.name = inner.name
+        self.model = inner.model
+        self.max_retries = max(1, max_retries)
+
+    def extract(self, request: Any, timeout_seconds: float = 30.0, cancellation: Any = None) -> Any:
+        from src.memory.provider import ProviderError  # noqa: E402
+
+        last_error: ProviderError | None = None
+        for attempt in range(self.max_retries):
+            waited = _openrouter_pacer.wait()
+            if waited:
+                print(f"OpenRouter pacing: waited {waited:.1f}s", flush=True)
+            try:
+                return self.inner.extract(request, timeout_seconds=timeout_seconds, cancellation=None)
+            except ProviderError as exc:
+                last_error = exc
+                if not exc.retryable or attempt == self.max_retries - 1:
+                    raise
+                delay = min(30.0, (2**attempt) + random.uniform(0.0, 1.0))
+                print(f"OpenRouter retry {attempt + 1}/{self.max_retries - 1} after {delay:.1f}s: {exc}", flush=True)
+                time.sleep(delay)
+        raise RuntimeError("OpenRouter extraction retry loop ended unexpectedly") from last_error
+
+
 class GuardedEmbedder:
     """Serializes ONNX inference so concurrent workers cannot grow competing arenas."""
 
-    def __init__(self, inner: Any) -> None:
+    def __init__(self, inner: Any, *, pace_remote: bool = False) -> None:
         self._inner = inner
         self._lock = threading.Lock()
+        self._pace_remote = pace_remote
 
     @property
     def name(self) -> str:
@@ -133,10 +183,14 @@ class GuardedEmbedder:
 
     def embed(self, value: str) -> list[float]:
         with self._lock:
+            if self._pace_remote:
+                _openrouter_pacer.wait()
             return self._inner.embed(value)
 
     def embed_many(self, values: list[str]) -> list[list[float]]:
         with self._lock:
+            if self._pace_remote:
+                _openrouter_pacer.wait()
             return self._inner.embed_many(values)
 
 
@@ -172,7 +226,7 @@ def shared_product_embedder(args: argparse.Namespace) -> GuardedEmbedder:
                 if provider_name == "openrouter":
                     from src.retrieval.embedding import OpenAICompatibleEmbeddingProvider  # noqa: E402
 
-                    _product_embedder = GuardedEmbedder(OpenAICompatibleEmbeddingProvider(model_name, dimensions=dimensions))
+                    _product_embedder = GuardedEmbedder(OpenAICompatibleEmbeddingProvider(model_name, dimensions=dimensions), pace_remote=True)
                 else:
                     _product_embedder = shared_embedder()
                 _product_embedder_key = key
@@ -414,7 +468,8 @@ def build_provider(args: argparse.Namespace):
         from src.memory.provider import OpenRouterExtractionProvider  # noqa: E402
 
         model = getattr(args, "extraction_model", None) or os.environ.get("TERMYTEDB_EXTRACTION_MODEL") or "openrouter/free"
-        return OpenRouterExtractionProvider(model=model)
+        provider = OpenRouterExtractionProvider(model=model)
+        return RateLimitedExtractionProvider(provider, max_retries=int(getattr(args, "openrouter_max_retries", 5)))
     if name == "rule":
         from src.memory.provider import FakeExtractionProvider  # noqa: E402
 
@@ -440,6 +495,19 @@ def _run_manifest_path(work_dir: Path) -> Path:
     return work_dir / _RUN_MANIFEST_NAME
 
 
+def resolve_work_dir(args: argparse.Namespace, previous: dict[str, Any] | None, *, is_e2e: bool) -> Path:
+    base = Path(args.work_dir)
+    if not is_e2e:
+        return base
+    if previous is not None:
+        prior_work_dir = previous.get("config", {}).get("work_dir")
+        if not prior_work_dir:
+            raise ValueError("resume result does not contain its work directory")
+        return Path(prior_work_dir)
+    run_id = f"{datetime.now(UTC).strftime('run-%Y%m%d-%H%M%S')}-{uuid4().hex[:8]}"
+    return base / run_id
+
+
 def _run_manifest(args: argparse.Namespace, data_path: Path, dataset_sha256: str, canonical_mode: str) -> dict[str, Any]:
     return {
         "mode": canonical_mode,
@@ -460,7 +528,7 @@ def _run_manifest(args: argparse.Namespace, data_path: Path, dataset_sha256: str
     }
 
 
-def ingest_and_process_e2e(work_dir: Path, sample: Sample, args: argparse.Namespace) -> tuple[Path, dict[str, Any]]:
+def ingest_e2e(work_dir: Path, sample: Sample, args: argparse.Namespace) -> tuple[Path, dict[str, Any]]:
     """Ingest LongMemEval history through the direct production pipeline.
 
     Returns (database_path, diagnostics).
@@ -476,7 +544,7 @@ def ingest_and_process_e2e(work_dir: Path, sample: Sample, args: argparse.Namesp
 
     # Use file lock for single-db concurrent access
     lock = _single_db_lock if single_db else threading.Lock()
-    # Serialize entire ingest+process for single_db to avoid WAL races
+    # Serialize direct ingestion for a shared SQLite file.
     with lock:
         engine = TermyteDB(database_path, extraction_provider=provider, embedding_provider=embedding_provider)  # type: ignore[arg-type]
         try:
@@ -501,11 +569,7 @@ def ingest_and_process_e2e(work_dir: Path, sample: Sample, args: argparse.Namesp
                 events_duplicate += sum(receipt.duplicate for receipt in result.receipts)
                 events_ingested += sum(not receipt.duplicate for receipt in result.receipts)
             ingest_latency_ms = (time.perf_counter() - ingest_started) * 1000
-            process_latency_ms = ingest_latency_ms
-            total_processed = events_ingested
-            total_failed = 0
-
-            # Collect post-process diagnostics from repository
+            # Collect completed direct-ingestion diagnostics.
             metrics_final = engine.metrics(namespace_id)
             runs = engine.extraction_runs(namespace_id, limit=1000)
             decisions = engine.extraction_decisions(namespace_id, limit=1000)
@@ -525,16 +589,13 @@ def ingest_and_process_e2e(work_dir: Path, sample: Sample, args: argparse.Namesp
                 "events_duplicate": events_duplicate,
                 "events_total": len(events_input),
                 "ingest_latency_ms": round(ingest_latency_ms, 2),
-                "events_processed": total_processed,
-                "processing_failures": total_failed,
                 "candidates_extracted": total_accepted + total_rejected,
                 "candidates_accepted": total_accepted,
                 "candidates_rejected": total_rejected,
                 "memories_created": len(memories),
                 "memory_versions_created": int(metrics_final.get("memory_versions", 0)),
                 "average_memories_per_sample": len(memories),
-                "extraction_latency_ms": round(process_latency_ms, 2),
-                "processing_latency_ms": round(process_latency_ms, 2),
+                "extraction_latency_ms": round(ingest_latency_ms, 2),
                 "metrics": metrics_final,
                 "rejection_reasons": dict(rejection_counter),
                 "runs_count": len(runs),
@@ -546,7 +607,7 @@ def ingest_and_process_e2e(work_dir: Path, sample: Sample, args: argparse.Namesp
 
 
 def retrieve_e2e_session_ranking(database_path: Path, sample: Sample, args: argparse.Namespace) -> dict[str, Any]:
-    """Retrieve after end-to-end processing using production memories."""
+    """Retrieve after direct ingestion using production memories."""
     from src import TermyteDB  # noqa: E402
 
     ns = sample.question_id
@@ -823,6 +884,7 @@ def evaluate_sample(args: argparse.Namespace, sample: Sample, budget: OpenRouter
     database_path = ingest_sample(Path(args.work_dir), sample, skip_embeddings=args.no_dense, single_db=getattr(args, "single_db", False))
     outcome = retrieve_session_ranking(database_path, sample, args)
     trace: dict[str, Any] = {
+        "status": "completed",
         "question_id": sample.question_id,
         "question_type": sample.question_type,
         "answer_session_ids": sorted(sample.answer_session_ids),
@@ -845,12 +907,12 @@ def evaluate_sample_e2e(args: argparse.Namespace, sample: Sample, budget: OpenRo
     """Evaluate one sample through production pipeline.
 
     Steps (with leakage boundary):
-      1. ingest_and_process_e2e  uses ONLY haystack_sessions (no question/answer)
+      1. ingest_e2e  uses ONLY haystack_sessions (no question/answer)
       2. retrieve_e2e_session_ranking  uses question ONLY for retrieval
     """
     work_dir = Path(args.work_dir)
     ingest_start = time.perf_counter()
-    db_path, e2e_diag = ingest_and_process_e2e(work_dir, sample, args)
+    db_path, e2e_diag = ingest_e2e(work_dir, sample, args)
     total_e2e_ms = (time.perf_counter() - ingest_start) * 1000
     retrieval_outcome = retrieve_e2e_session_ranking(db_path, sample, args)
     # Failure decomposition heuristics
@@ -884,6 +946,7 @@ def evaluate_sample_e2e(args: argparse.Namespace, sample: Sample, budget: OpenRo
             oracle_texts.append({"session_id": sid, "turns": [{"role": t["role"], "content": t["content"][:500]} for t in turns]})
 
     trace: dict[str, Any] = {
+        "status": "completed",
         "question_id": sample.question_id,
         "question_type": sample.question_type,
         "question": sample.question,
@@ -901,8 +964,6 @@ def evaluate_sample_e2e(args: argparse.Namespace, sample: Sample, budget: OpenRo
         # Memory-formation diagnostics
         "e2e_diagnostics": e2e_diag,
         "events_ingested": e2e_diag.get("events_ingested", 0),
-        "events_processed": e2e_diag.get("events_processed", 0),
-        "processing_failures": e2e_diag.get("processing_failures", 0),
         "candidates_extracted": e2e_diag.get("candidates_extracted", 0),
         "candidates_accepted": e2e_diag.get("candidates_accepted", 0),
         "candidates_rejected": e2e_diag.get("candidates_rejected", 0),
@@ -938,21 +999,22 @@ def evaluate_sample_e2e(args: argparse.Namespace, sample: Sample, budget: OpenRo
 
 
 def summarize(traces: list[dict[str, Any]], recall_k: int, judged: bool) -> list[dict[str, Any]]:
+    successful = [trace for trace in traces if trace.get("status", "completed") == "completed"]
     ks = ["5", "10", str(recall_k)]
     grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
-    for trace in traces:
+    for trace in successful:
         grouped[trace["question_type"]].append(trace)
     rows: list[dict[str, Any]] = []
 
     def row_for(name: str, items: list[dict[str, Any]]) -> dict[str, Any]:
         count = len(items)
-        row: dict[str, Any] = {"Category": name, "n": count}
+        row: dict[str, Any] = {"Category": name, "Completed": count}
         for k in ks:
-            row[f"Recall@{k} (%)"] = round(100 * sum(item["recall"][k] for item in items) / count, 1) if count else 0.0
-        row[f"MRR@{recall_k}"] = round(sum((1 / item["best_rank"]) if item["best_rank"] else 0.0 for item in items) / count, 3) if count else 0.0
-        row[f"NDCG@{recall_k}"] = round(sum(item["ndcg_at_k"] for item in items) / count, 3) if count else 0.0
-        row["Avg Context Tokens"] = round(sum(item["packed_words"] for item in items) / count, 1) if count else 0.0
-        row["Avg Latency (ms)"] = round(sum(item["retrieval_latency_ms"] for item in items) / count, 1) if count else 0.0
+            row[f"Recall@{k} (%)"] = round(100 * sum(item["recall"][k] for item in items) / count, 1) if count else None
+        row[f"MRR@{recall_k}"] = round(sum((1 / item["best_rank"]) if item["best_rank"] else 0.0 for item in items) / count, 3) if count else None
+        row[f"NDCG@{recall_k}"] = round(sum(item["ndcg_at_k"] for item in items) / count, 3) if count else None
+        row["Avg Context Tokens"] = round(sum(item["packed_words"] for item in items) / count, 1) if count else None
+        row["Avg Latency (ms)"] = round(sum(item["retrieval_latency_ms"] for item in items) / count, 1) if count else None
         # End-to-end diagnostics averages where present
         if any("e2e_diagnostics" in it for it in items):
             row["Avg Memories"] = round(sum(it.get("memories_created", 0) for it in items) / count, 1) if count else 0.0
@@ -964,13 +1026,24 @@ def summarize(traces: list[dict[str, Any]], recall_k: int, judged: bool) -> list
     for category in CATEGORY_ORDER:
         if category in grouped:
             rows.append(row_for(category, grouped[category]))
-    rows.append(row_for("Overall", traces))
+    rows.append(row_for("Overall", successful))
     return rows
 
 
 def failure_decomposition(traces: list[dict[str, Any]]) -> dict[str, Any]:
-    counter = Counter(t.get("failure_reason", "unknown") for t in traces if t.get("best_rank") is None)
-    return {"counts": dict(counter), "total_missed": sum(counter.values()), "total": len(traces)}
+    completed = [trace for trace in traces if trace.get("status", "completed") == "completed"]
+    counter = Counter(t.get("failure_reason", "unknown") for t in completed if t.get("best_rank") is None)
+    return {"counts": dict(counter), "total_missed": sum(counter.values()), "completed": len(completed)}
+
+
+def failed_trace(sample: Sample, exc: Exception) -> dict[str, Any]:
+    return {
+        "status": "failed",
+        "question_id": sample.question_id,
+        "question_type": sample.question_type,
+        "error_class": type(exc).__name__,
+        "error": str(exc),
+    }
 
 
 def _git_commit() -> str | None:
@@ -984,11 +1057,13 @@ def render_table(rows: list[dict[str, Any]]) -> str:
     headers = list(rows[0].keys()) if rows else []
     lines = ["| " + " | ".join(headers) + " |", "|" + "|".join("---:" for _ in headers) + "|"]
     for row in rows:
-        lines.append("| " + " | ".join(str(row.get(header, "")) for header in headers) + " |")
+        lines.append("| " + " | ".join("N/A" if row.get(header) is None else str(row.get(header, "")) for header in headers) + " |")
     return "\n".join(lines)
 
 
 def run(args: argparse.Namespace) -> int:
+    global _openrouter_pacer
+
     from dotenv import load_dotenv
 
     load_dotenv(ROOT / ".env")
@@ -1009,10 +1084,11 @@ def run(args: argparse.Namespace) -> int:
         samples = [item for item in samples if item.question_type == args.task]
     resume_ids: set[str] = set()
     previous_traces: list[dict[str, Any]] = []
+    previous: dict[str, Any] | None = None
     if args.resume_from:
         previous = json.loads(Path(args.resume_from).read_text(encoding="utf-8"))
-        previous_traces = previous.get("traces", [])
-        resume_ids = {trace["question_id"] for trace in previous_traces}
+        previous_traces = [trace for trace in previous.get("traces", []) if trace.get("status", "completed") == "completed"]
+        resume_ids = {trace["question_id"] for trace in previous_traces if trace.get("status", "completed") == "completed"}
         print(f"Resuming: {len(resume_ids)} already complete", flush=True)
     pending = [item for item in samples if item.question_id not in resume_ids]
     if args.limit:
@@ -1044,6 +1120,14 @@ def run(args: argparse.Namespace) -> int:
             raise SystemExit("end-to-end benchmark requires --embedding-provider openrouter")
         if getattr(args, "embedding_provider", None) is None:
             args.embedding_provider = "openrouter"
+        _openrouter_pacer = RequestPacer(float(getattr(args, "openrouter_min_interval", 3.0)))
+        try:
+            work_dir = resolve_work_dir(args, previous, is_e2e=True)
+        except ValueError as exc:
+            raise SystemExit(str(exc)) from exc
+        args.work_dir = str(work_dir)
+        work_dir.mkdir(parents=True, exist_ok=True)
+        print(f"Work directory: {work_dir}", flush=True)
     budget = OpenRouterBudget(args.budget_usd) if canonical_mode == "judged" else None
 
     manifest = _run_manifest(args, data_path, dataset_sha256, canonical_mode)
@@ -1057,7 +1141,7 @@ def run(args: argparse.Namespace) -> int:
     manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8")
 
     traces: list[dict[str, Any]] = list(previous_traces)
-    failures = 0
+    failures = sum(trace.get("status") == "failed" for trace in previous_traces)
     started = time.perf_counter()
 
     def worker_retrieval(sample: Sample) -> dict[str, Any]:
@@ -1085,11 +1169,13 @@ def run(args: argparse.Namespace) -> int:
                 print(f"[{number}/{len(pending)}] {sample.question_id} ({sample.question_type}): {status}; {trace['retrieval_latency_ms']:.0f}ms", flush=True)
             except BudgetExceeded as exc:
                 failures += 1
+                traces.append(failed_trace(sample, exc))
                 print(f"BUDGET STOP: {exc}", flush=True)
                 pool.shutdown(wait=False, cancel_futures=True)
                 break
             except Exception as exc:
                 failures += 1
+                traces.append(failed_trace(sample, exc))
                 print(f"[{number}/{len(pending)}] {sample.question_id}: FAILED {type(exc).__name__}: {exc}", flush=True)
                 import traceback as _tb
 
@@ -1103,6 +1189,7 @@ def run(args: argparse.Namespace) -> int:
     # Extraction provider info
     extraction_provider = getattr(args, "extraction", "openrouter") if is_e2e else "verbatim-atoms"
     extraction_model = getattr(args, "extraction_model", None)
+    completed = sum(trace.get("status", "completed") == "completed" for trace in traces)
     result = {
         "mode": canonical_mode,
         "raw_mode": raw_mode,
@@ -1111,6 +1198,9 @@ def run(args: argparse.Namespace) -> int:
         "dataset": {"path": str(data_path), "sha256": dataset_sha256, "samples_total": len(samples)},
         "config": {key: (str(value) if isinstance(value, Path) else value) for key, value in vars(args).items()},
         "runtime_seconds": round(time.perf_counter() - started, 1),
+        "samples_completed": completed,
+        "samples_failed": failures,
+        "samples_total": len(samples),
         "failures": failures,
         "budget_spent_usd": round(budget.spent_usd, 4) if budget else 0.0,
         "summary": rows,
@@ -1121,7 +1211,7 @@ def run(args: argparse.Namespace) -> int:
             "git_commit": git_commit,
             "benchmark_mode": canonical_mode,
             "dataset_sha256": dataset_sha256,
-            "question_count": len(traces),
+            "question_count": completed,
             "extraction_provider": extraction_provider,
             "extraction_model": str(extraction_model) if extraction_model else None,
             "embedding_provider": embed_name,
@@ -1135,7 +1225,7 @@ def run(args: argparse.Namespace) -> int:
             "abstain_threshold": args.abstain_threshold,
         },
     }
-    output_path = Path(args.results_dir) / f"longmemeval_s_{canonical_mode}_{time.strftime('%Y%m%d-%H%M%S')}.json"
+    output_path = Path(args.results_dir) / f"longmemeval_s_{canonical_mode}_{datetime.now(UTC).strftime('%Y%m%d-%H%M%S-%f')}.json"
     output_path.write_text(json.dumps(result, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     print("\n" + table)
     if is_e2e and result.get("failure_decomposition"):
@@ -1143,7 +1233,7 @@ def run(args: argparse.Namespace) -> int:
     print(f"\nTraces: {output_path}")
     if budget:
         print(f"Spend: ${budget.spent_usd:.4f}")
-    return 0
+    return 1 if failures else 0
 
 
 def hashlib_sha256(payload: bytes) -> str:
@@ -1171,7 +1261,7 @@ def main() -> int:
     parser.add_argument("--smoke-samples", type=int, default=5, help="number of questions to use for smoke runs")
     parser.add_argument("--confirm-benchmark", action="store_true", help="required to start a benchmark smoke loop")
     parser.add_argument("--task", choices=CATEGORY_ORDER, help="filter to single question_type")
-    parser.add_argument("--workers", type=int, default=4)
+    parser.add_argument("--workers", type=int, default=1)
     parser.add_argument("--recall-k", type=int, default=15)
     parser.add_argument("--token-budget", type=int, default=1500)
     parser.add_argument("--pack-atoms", type=int, default=40, help="max atoms/memories to pack into context")
@@ -1194,6 +1284,8 @@ def main() -> int:
         help="extraction provider for end-to-end mode (OpenRouter is the product default)",
     )
     parser.add_argument("--extraction-model", type=str, default=None, help="model for openrouter/http extraction (or env TERMYTEDB_EXTRACTION_MODEL)")
+    parser.add_argument("--openrouter-min-interval", type=float, default=3.0, help="minimum seconds between all OpenRouter requests")
+    parser.add_argument("--openrouter-max-retries", type=int, default=5, help="maximum attempts for retryable OpenRouter extraction failures")
     args = parser.parse_args()
     return run(args)
 
