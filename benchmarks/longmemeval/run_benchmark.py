@@ -134,16 +134,21 @@ class RequestPacer:
             self._next_request_at = time.monotonic() + self.min_interval_seconds
             return delay
 
+    def defer(self, delay_seconds: float) -> None:
+        with self._lock:
+            self._next_request_at = max(self._next_request_at, time.monotonic() + max(0.0, delay_seconds))
+
 
 _openrouter_pacer = RequestPacer()
 
 
 class RateLimitedExtractionProvider:
-    def __init__(self, inner: Any, *, max_retries: int) -> None:
+    def __init__(self, inner: Any, *, max_retries: int, rate_limit_cooldown: float = 60.0) -> None:
         self.inner = inner
         self.name = inner.name
         self.model = inner.model
         self.max_retries = max(1, max_retries)
+        self.rate_limit_cooldown = max(0.0, rate_limit_cooldown)
 
     def extract(self, request: Any, timeout_seconds: float = 30.0, cancellation: Any = None) -> Any:
         from src.memory.provider import ProviderError  # noqa: E402
@@ -159,9 +164,10 @@ class RateLimitedExtractionProvider:
                 last_error = exc
                 if not exc.retryable or attempt == self.max_retries - 1:
                     raise
-                delay = min(30.0, (2**attempt) + random.uniform(0.0, 1.0))
+                exponential_delay = min(30.0, (2**attempt) + random.uniform(0.0, 1.0))
+                delay = max(self.rate_limit_cooldown, exponential_delay) if "HTTP 429" in str(exc) else exponential_delay
                 print(f"OpenRouter retry {attempt + 1}/{self.max_retries - 1} after {delay:.1f}s: {exc}", flush=True)
-                time.sleep(delay)
+                _openrouter_pacer.defer(delay)
         raise RuntimeError("OpenRouter extraction retry loop ended unexpectedly") from last_error
 
 
@@ -469,7 +475,11 @@ def build_provider(args: argparse.Namespace):
 
         model = getattr(args, "extraction_model", None) or os.environ.get("TERMYTEDB_EXTRACTION_MODEL") or "openrouter/free"
         provider = OpenRouterExtractionProvider(model=model)
-        return RateLimitedExtractionProvider(provider, max_retries=int(getattr(args, "openrouter_max_retries", 5)))
+        return RateLimitedExtractionProvider(
+            provider,
+            max_retries=int(getattr(args, "openrouter_max_retries", 5)),
+            rate_limit_cooldown=float(getattr(args, "openrouter_rate_limit_cooldown", 60.0)),
+        )
     if name == "rule":
         from src.memory.provider import FakeExtractionProvider  # noqa: E402
 
@@ -1286,6 +1296,7 @@ def main() -> int:
     parser.add_argument("--extraction-model", type=str, default=None, help="model for openrouter/http extraction (or env TERMYTEDB_EXTRACTION_MODEL)")
     parser.add_argument("--openrouter-min-interval", type=float, default=3.0, help="minimum seconds between all OpenRouter requests")
     parser.add_argument("--openrouter-max-retries", type=int, default=5, help="maximum attempts for retryable OpenRouter extraction failures")
+    parser.add_argument("--openrouter-rate-limit-cooldown", type=float, default=60.0, help="seconds to wait after an OpenRouter HTTP 429")
     args = parser.parse_args()
     return run(args)
 

@@ -10,14 +10,15 @@ class FlakyProvider:
     name = "openrouter"
     model = "test"
 
-    def __init__(self, failures: int) -> None:
+    def __init__(self, failures: int, message: str = "rate limited") -> None:
         self.failures = failures
+        self.message = message
         self.calls = 0
 
     def extract(self, request, timeout_seconds=30.0, cancellation=None):
         self.calls += 1
         if self.calls <= self.failures:
-            raise ProviderError("rate limited", retryable=True, error_class="http_error")
+            raise ProviderError(self.message, retryable=True, error_class="http_error")
         return "ok"
 
 
@@ -49,6 +50,26 @@ def test_extraction_provider_does_not_retry_permanent_failure(monkeypatch):
     with pytest.raises(ProviderError, match="invalid output"):
         provider.extract(object())
     assert inner.calls == 0
+
+
+def test_http_429_uses_long_shared_cooldown(monkeypatch):
+    class RecordingPacer:
+        def __init__(self):
+            self.deferred = []
+
+        def wait(self):
+            return 0.0
+
+        def defer(self, delay):
+            self.deferred.append(delay)
+
+    pacer = RecordingPacer()
+    monkeypatch.setattr(run_benchmark, "_openrouter_pacer", pacer)
+    inner = FlakyProvider(failures=1, message="OpenRouter returned HTTP 429")
+    provider = run_benchmark.RateLimitedExtractionProvider(inner, max_retries=2, rate_limit_cooldown=60.0)
+
+    assert provider.extract(object()) == "ok"
+    assert pacer.deferred == [60.0]
 
 
 def test_failed_only_scores_are_unavailable():
