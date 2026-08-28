@@ -25,7 +25,7 @@ def _openrouter_chat(base_url: str, api_key: str | None, body: dict[str, object]
                 "authorization": f"Bearer {api_key}",
                 "content-type": "application/json",
                 "http-referer": "https://termyte.dev",
-                "x-title": title,
+                  "X-OpenRouter-Title": title,
             },
             method="POST",
         ),

@@ -63,7 +63,7 @@ class OpenAICompatibleEmbeddingProvider:
         if not self.api_key:
             raise ValueError("an embedding API key is required")
         self.base_url = (base_url or os.environ.get("TERMYTEDB_EMBEDDING_BASE_URL", "https://openrouter.ai/api/v1")).rstrip("/")
-        configured_dimensions = dimensions or int(os.environ.get("TERMYTEDB_EMBEDDING_DIMENSIONS", "1536"))
+        configured_dimensions = dimensions or int(os.environ.get("TERMYTEDB_EMBEDDING_DIMENSIONS", "1024"))
         self.dimensions = configured_dimensions
         if configured_dimensions < 1:
             raise ValueError("embedding dimensions must be positive")
@@ -78,10 +78,22 @@ class OpenAICompatibleEmbeddingProvider:
         if not values:
             return []
         body = json.dumps({"model": self.model, "input": values, "encoding_format": "float"}).encode("utf-8")
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+        }
+        # OpenRouter attribution headers are optional, but use its documented
+        # casing so requests show up correctly in the provider dashboard.
+        referer = os.environ.get("OPENROUTER_HTTP_REFERER", "https://termyte.dev")
+        title = os.environ.get("OPENROUTER_TITLE", "TermyteDB")
+        if referer:
+            headers["HTTP-Referer"] = referer
+        if title:
+            headers["X-OpenRouter-Title"] = title
         request = Request(
             f"{self.base_url}/embeddings",
             data=body,
-            headers={"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"},
+            headers=headers,
             method="POST",
         )
         last_error: Exception | None = None
