@@ -3,7 +3,7 @@ from uuid import uuid4
 
 import pytest
 
-from src.memory.provider import HttpExtractionProvider, ProviderError, build_extraction_prompt
+from src.memory.provider import HttpExtractionProvider, OpenRouterExtractionProvider, ProviderError, build_extraction_prompt
 from src.models import ExtractionRequest
 
 
@@ -73,8 +73,6 @@ def test_http_provider_rejects_malformed_output_without_leaking_response(monkeyp
 
 
 def test_openrouter_provider_requests_strict_extraction_schema(monkeypatch):
-    from src.memory.provider import OpenRouterExtractionProvider
-
     captured = {}
 
     class Response:
@@ -104,3 +102,10 @@ def test_openrouter_provider_requests_strict_extraction_schema(monkeypatch):
     assert response_format["json_schema"]["strict"] is True
     assert response_format["json_schema"]["schema"]["title"] == "ExtractionResponse"
     assert result.response.schema_version == "extraction-v1"
+
+
+def test_openrouter_extraction_requires_explicit_model(monkeypatch):
+    monkeypatch.delenv("TERMYTEDB_EXTRACTION_MODEL", raising=False)
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+    with pytest.raises(ValueError, match="TERMYTEDB_EXTRACTION_MODEL"):
+        OpenRouterExtractionProvider()

@@ -351,7 +351,9 @@ class OpenRouterExtractionProvider:
     name = "openrouter"
 
     def __init__(self, model: str | None = None, api_key: str | None = None, base_url: str | None = None):
-        self.model = model or os.environ.get("TERMYTEDB_EXTRACTION_MODEL", "openrouter/free")
+        self.model = model or os.environ.get("TERMYTEDB_EXTRACTION_MODEL", "")
+        if not self.model:
+            raise ValueError("TERMYTEDB_EXTRACTION_MODEL is required")
         self.api_key = api_key or os.environ.get("TERMYTEDB_EXTRACTION_API_KEY") or os.environ.get("OPENROUTER_API_KEY")
         self.base_url = (
             base_url or os.environ.get("TERMYTEDB_EXTRACTION_BASE_URL") or os.environ.get("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
@@ -415,7 +417,9 @@ class OpenRouterSessionSummaryProvider:
     name = "openrouter-summary"
 
     def __init__(self, model: str | None = None, api_key: str | None = None, base_url: str | None = None):
-        self.model = model or os.environ.get("TERMYTEDB_SUMMARY_MODEL") or os.environ.get("TERMYTEDB_EXTRACTION_MODEL") or "openrouter/free"
+        self.model = model or os.environ.get("TERMYTEDB_SUMMARY_MODEL") or os.environ.get("TERMYTEDB_EXTRACTION_MODEL") or ""
+        if not self.model:
+            raise ValueError("TERMYTEDB_SUMMARY_MODEL or TERMYTEDB_EXTRACTION_MODEL is required")
         self.api_key = (
             api_key or os.environ.get("TERMYTEDB_SUMMARY_API_KEY") or os.environ.get("TERMYTEDB_EXTRACTION_API_KEY") or os.environ.get("OPENROUTER_API_KEY")
         )

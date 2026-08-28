@@ -10,7 +10,7 @@ TermyteDB must never select a free model or silently choose a remote model. User
 - OpenRouter summaries require an explicit constructor model or `TERMYTEDB_SUMMARY_MODEL`.
 - The LongMemEval end-to-end benchmark requires extraction and embedding model configuration before it creates a run directory or sends requests.
 - Missing configuration raises a clear `ValueError` or command-line error naming the required setting.
-- No source default may contain `openrouter/free` or a `:free` model slug.
+- No source default may select a free-model alias.
 
 ## Configuration
 

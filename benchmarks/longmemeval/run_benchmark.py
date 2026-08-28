@@ -473,7 +473,9 @@ def build_provider(args: argparse.Namespace):
     if name == "openrouter":
         from src.memory.provider import OpenRouterExtractionProvider  # noqa: E402
 
-        model = getattr(args, "extraction_model", None) or os.environ.get("TERMYTEDB_EXTRACTION_MODEL") or "openrouter/free"
+        model = getattr(args, "extraction_model", None) or os.environ.get("TERMYTEDB_EXTRACTION_MODEL")
+        if not model:
+            raise ValueError("TERMYTEDB_EXTRACTION_MODEL or --extraction-model is required")
         provider = OpenRouterExtractionProvider(model=model)
         return RateLimitedExtractionProvider(
             provider,

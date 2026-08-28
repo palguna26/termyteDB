@@ -56,7 +56,9 @@ class OpenAICompatibleEmbeddingProvider:
         timeout: float = 60.0,
         retries: int = 3,
     ) -> None:
-        self.model = model or os.environ.get("TERMYTEDB_EMBEDDING_MODEL", "openai/text-embedding-3-small")
+        self.model = model or os.environ.get("TERMYTEDB_EMBEDDING_MODEL", "")
+        if not self.model:
+            raise ValueError("TERMYTEDB_EMBEDDING_MODEL is required")
         self.api_key = api_key or os.environ.get("OPENROUTER_API_KEY") or os.environ.get("TERMYTEDB_EMBEDDING_API_KEY")
         if not self.api_key:
             raise ValueError("an embedding API key is required")
