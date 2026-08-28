@@ -4,6 +4,7 @@ import math
 from functools import lru_cache
 from typing import Any
 
+from ..config.settings import RETRIEVAL as _RETRIEVAL_SETTINGS
 from ..models import ContextResponse, SearchResult
 from ..storage.repository import Repository
 
@@ -28,7 +29,7 @@ def token_count(text: str) -> int:
 
 def build_context(repository: Repository, namespace_id: str, query: str, limit: int, token_budget: int, historical: bool = False) -> ContextResponse:
     candidates = repository.search(namespace_id, query, limit, historical)
-    results = [result for result in candidates if result.score >= 0.05]
+    results = [result for result in candidates if result.score >= _RETRIEVAL_SETTINGS.context_score_floor]
     selected: list[SearchResult] = []
     chunks: list[str] = []
     used = 0

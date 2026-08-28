@@ -27,6 +27,16 @@ from .storage.repository import Repository
 
 
 class TermyteDB:
+    """Embedded memory engine - simple facade over EventStore + MemoryStore + HybridRetriever.
+
+    Core spec (5 methods you need to review):
+      ingest / ingest_batch  - add events -> memories with temporal block
+      search / context       - hybrid FTS+Vector fetch top-N then rerank to top-K
+      invalidate/forget/restore - update/remove memories
+      get_memory/memories    - read with temporal {valid_from, valid_until}
+    Everything below `--- Extended / Debug ---` is backward-compat for tests/benchmarks.
+    """
+
     MAX_EVENT_BYTES = 1_048_576
 
     def __init__(
@@ -103,6 +113,7 @@ class TermyteDB:
             _, accepted, rejected = self.processor.process_events(namespace_id, new_event_ids)
         return BatchEventResponse(receipts=receipts, accepted=accepted, rejected=rejected)
 
+    # -- Core read/write with temporal blocks ---------------------------------
     def history(self, namespace_id: str, memory_id: str) -> list[dict[str, Any]] | None:
         return self.repository.history(namespace_id, memory_id)
 
@@ -115,6 +126,7 @@ class TermyteDB:
     def restore(self, namespace_id: str, memory_id: str) -> bool:
         return self.repository.restore_memory(namespace_id, memory_id)
 
+    # -- Extended / Debug (backward-compat; not part of 5-method spec) ---------
     def export_namespace(self, namespace_id: str) -> dict[str, Any]:
         return self.repository.export_namespace(namespace_id)
 

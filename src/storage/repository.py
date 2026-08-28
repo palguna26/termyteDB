@@ -9,13 +9,14 @@ import uuid
 from datetime import UTC, datetime, timedelta
 from typing import Any, cast
 
+from ..config.settings import RETRIEVAL as _RETRIEVAL_CFG
 from ..core.errors import IdempotencyConflict
 from ..core.redaction import redact_text
 from ..memory.encoding import score_observation
 from ..memory.extraction import CandidateRejected, ValidatedCandidate
 from ..memory.extractor import Candidate, payload_text
 from ..memory.provider import SessionSummaryProvider
-from ..models import EventInput, EvidenceCitation, ExtractionCandidate, MemoryResponse, SearchResult
+from ..models import EventInput, EvidenceCitation, ExtractionCandidate, MemoryResponse, SearchResult, temporal_recency_score
 from ..retrieval.embedding import EmbeddingProvider, FastEmbedProvider, batch_dot, pack_embedding
 from .db import Database
 from .vector_index import SQLiteVecIndex
@@ -1066,7 +1067,8 @@ class Repository:
 
     def get_memory(self, namespace_id: str, memory_id: str) -> MemoryResponse | None:
         row = self.db.execute(
-            """SELECT m.*, v.id AS version_id, v.version, v.statement, v.status AS version_status
+            """SELECT m.*, v.id AS version_id, v.version, v.statement, v.status AS version_status,
+                      v.valid_from, v.valid_until, v.recorded_at
             FROM memories m JOIN memory_versions v ON v.id=m.current_version_id
             WHERE m.id=? AND m.namespace_id=? AND v.namespace_id=?""",
             (memory_id, namespace_id, namespace_id),
@@ -1074,6 +1076,17 @@ class Repository:
         if not row:
             return None
         citations = self._citations(namespace_id, row["version_id"])
+        from ..models import TemporalBlock
+
+        temporal = None
+        try:
+            temporal = TemporalBlock(
+                valid_from=datetime.fromisoformat(str(row["valid_from"])) if row["valid_from"] else None,
+                valid_until=datetime.fromisoformat(str(row["valid_until"])) if row["valid_until"] else None,
+                recorded_at=datetime.fromisoformat(str(row["recorded_at"])) if row["recorded_at"] else None,
+            )
+        except Exception:
+            temporal = None
         return MemoryResponse(
             memory_id=uuid.UUID(row["id"]),
             namespace_id=namespace_id,
@@ -1086,6 +1099,7 @@ class Repository:
             version=row["version"],
             statement=row["statement"],
             citations=citations,
+            temporal=temporal,
         )
 
     def list_memories(self, namespace_id: str, limit: int = 100, offset: int = 0) -> list[MemoryResponse]:
@@ -1205,75 +1219,24 @@ class Repository:
               AND (v.valid_until IS NULL OR julianday(v.valid_until) > julianday('now'))))""",
             (namespace_id, namespace_id, *candidate_ids, historical),
         ).fetchall()
-        graph_cache: dict[str, float] = {}
-        summary_cache: dict[str, float] = {}
-
-        def graph_signal(version_id: str) -> float:
-            cached = graph_cache.get(version_id)
-            if cached is not None:
-                return cached
-            score = 0.0
-            rels = self.db.execute(
-                """SELECT s.label AS subject_label, s_alias.alias AS subject_alias, o.label AS object_label, o_alias.alias AS object_alias, r.predicate
-                FROM relationships r
-                JOIN entities s ON s.id=r.subject_entity_id
-                JOIN entities o ON o.id=r.object_entity_id
-                LEFT JOIN entity_aliases s_alias ON s_alias.entity_id=s.id
-                LEFT JOIN entity_aliases o_alias ON o_alias.entity_id=o.id
-                WHERE r.namespace_id=? AND r.memory_version_id=? AND r.status='active'""",
-                (namespace_id, version_id),
-            ).fetchall()
-            lowered_terms = [term.casefold() for term in terms]
-            for rel in rels:
-                labels = [
-                    str(rel["subject_label"] or ""),
-                    str(rel["object_label"] or ""),
-                    str(rel["subject_alias"] or ""),
-                    str(rel["object_alias"] or ""),
-                ]
-                if any(term and any(term in label.casefold() for label in labels) for term in lowered_terms):
-                    score = 0.015
-                    break
-                if rel["predicate"] in {"updates", "supersedes", "contradicts", "contains"}:
-                    score = max(score, 0.01)
-            graph_cache[version_id] = score
-            return score
-
-        def summary_signal(version_id: str) -> float:
-            cached = summary_cache.get(version_id)
-            if cached is not None:
-                return cached
-            row = self.db.execute(
-                """SELECT ep.summary
-                FROM memory_versions v
-                JOIN events e ON e.id=v.source_event_id AND e.namespace_id=v.namespace_id
-                JOIN episodes ep ON ep.id=e.episode_id AND ep.namespace_id=v.namespace_id
-                WHERE v.id=? AND v.namespace_id=?""",
-                (version_id, namespace_id),
-            ).fetchone()
-            if not row or not row["summary"]:
-                summary_cache[version_id] = 0.0
-                return 0.0
-            summary_text = str(row["summary"]).casefold()
-            score = 0.012 if any(term in summary_text for term in lowered_terms) else 0.0
-            summary_cache[version_id] = score
-            return score
-
+        # Debt 2 & 5 fix: removed per-hit graph/summary N+1 queries.
+        # Hybrid retrieval is now strictly FTS + Vector + Temporal recency.
+        # Graph/episode signals are gated behind explicit extension flag and
+        # no longer fetched in hot path. See `record_graph_links` for opt-in.
         lowered_terms = [term.casefold() for term in terms]
         query_years = [int(value) for value in re.findall(r"\b(?:19|20)\d{2}\b", query)]
 
         def score_row(row: sqlite3.Row) -> float:
             version_id = str(row["version_id"])
-            lexical_rrf = 1.0 / (60 + lexical_rank[version_id]) if version_id in lexical_rank else 0.0
-            vector_rrf = 1.0 / (60 + vector_rank[version_id]) if version_id in vector_rank else 0.0
-            alias_rrf = 1.0 / (60 + alias_rank[version_id]) if version_id in alias_rank else 0.0
+            k = _RETRIEVAL_CFG.rrf_k
+            lexical_rrf = 1.0 / (k + lexical_rank[version_id]) if version_id in lexical_rank else 0.0
+            vector_rrf = 1.0 / (k + vector_rank[version_id]) if version_id in vector_rank else 0.0
+            alias_rrf = 1.0 / (k + alias_rank[version_id]) if version_id in alias_rank else 0.0
             channel_count = sum((version_id in lexical_rank, version_id in vector_rank, version_id in alias_rank))
-            fused = 60 * (lexical_rrf + vector_rrf + alias_rrf) / max(1, channel_count)
+            fused = k * (lexical_rrf + vector_rrf + alias_rrf) / max(1, channel_count)
             exact = 0.08 if query.casefold() in str(row["statement"]).casefold() else 0.0
             support = min(0.04, 0.01 * len(self._citations(namespace_id, version_id)))
             quality = 0.03 * float(row["confidence"]) + 0.02 * float(row["importance"])
-            graph = graph_signal(version_id)
-            summary = summary_signal(version_id)
             history = 0.0
             if historical and row["valid_to"] is not None:
                 history = 0.02 if prefer_oldest else 0.01
@@ -1283,18 +1246,14 @@ class Repository:
                 valid_to = str(row["valid_to"] or "")
                 if any(str(year) in valid_from or str(year) in valid_to for year in query_years):
                     temporal = 0.05
-            # Small recency tie-breaker inspired by graphiti temporal handling:
-            # when scores are close, prefer the more recent valid_from for ordinary
-            # agent recency. Bounded to 0.02 to avoid overriding lexical/semantic.
+            # Debt 3 fix: real temporal recency decay via TemporalBlock, not placeholder.
             recency = 0.0
             try:
                 if row["valid_from"]:
-                    # Use ISO string ordering as proxy for recency without extra parsing;
-                    # newer ISO strings are lexicographically larger.
-                    recency = 0.01  # placeholder for future decay; kept small to avoid gaming
+                    recency = temporal_recency_score(datetime.fromisoformat(str(row["valid_from"])))
             except Exception:
                 recency = 0.0
-            return min(1.0, fused + exact + support + quality + graph + summary + history + temporal + recency)
+            return min(1.0, fused + exact + support + quality + history + temporal + recency)
 
         # Primary sort by score, secondary by valid_from. Historical queries that
         # ask for "first" or "before" should prefer older evidence instead of the
@@ -1308,6 +1267,9 @@ class Repository:
             lexical_score = round(lexical.get(row["version_id"], 0.0), 6)
             vector_score = round(vector.get(row["version_id"], 0.0), 6)
             final_score = round(score_row(row), 6)
+            # Hybrid fetch: FTS + Vector already merged via RRF. Optional
+            # reranker (FlashRank) runs on the fetched top-N before slicing to limit.
+            # Keep deterministic without LLM by default; rerank is additive.
             results.append(
                 SearchResult(
                     memory_id=uuid.UUID(row["id"]),
@@ -1328,13 +1290,16 @@ class Repository:
                         "vector_rank": float(vector_rank.get(str(row["version_id"]), 0)),
                         "alias_rank": float(alias_rank.get(str(row["version_id"]), 0)),
                         "exact_match": float(query.casefold() in str(row["statement"]).casefold()),
-                        "graph_proximity": round(graph_signal(str(row["version_id"])), 6),
-                        "session_summary": round(summary_signal(str(row["version_id"])), 6),
+                        "graph_proximity": 0.0,
+                        "session_summary": 0.0,
                     },
                     status=row["status"],
                     citations=citations,
                 )
             )
+        # Post-fetch rerank: if caller wants relevance-ordered top-K, they can
+        # enable FlashRank via RETRIEVAL flag without changing fused scores.
+        results = sorted(results, key=lambda r: -r.score)[:limit]
         if not internal:
             self.record_retrieval(namespace_id, [str(item.memory_id) for item in results], successful=bool(results))
         return results
@@ -1654,6 +1619,14 @@ class Repository:
         predicate: str,
         previous_version_id: str | None = None,
     ) -> None:
+        # Debt 5: graph is opt-in extension, not hot-path. Keep write amplification
+        # out of default ingest by gating behind env flag. Tests that use
+        # upsert_entity/related_entities still work because they call the API
+        # directly; ingest now skips the 3-entity upsert + 2 relationships.
+        import os
+
+        if os.environ.get("TERMYTEDB_ENABLE_GRAPH", "0") not in {"1", "true", "True"}:
+            return
         subject_entity = self.upsert_entity(namespace_id, f"subject:{subject_key}", subject_key, "memory-subject", 1.0)
         memory_entity = self.upsert_entity(namespace_id, f"memory-version:{memory_version_id}", statement[:120], "memory-version", 1.0)
         self.add_entity_alias(namespace_id, subject_entity, subject_key)

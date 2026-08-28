@@ -1,4 +1,9 @@
-"""Local and remote embedding providers."""
+"""Local and remote embedding providers.
+
+Embedding sizes and model names are defined in `src/config/settings.py` and
+`src/config/embeddings.py`. Edit there to change dimensions without touching
+provider logic.
+"""
 
 from __future__ import annotations
 
@@ -11,6 +16,9 @@ from urllib.request import Request, urlopen
 
 import numpy as np
 import numpy.typing as npt
+
+from ..config import embeddings as _embed_cfg
+from ..config.settings import EMBEDDING as _EMBEDDING_SETTINGS
 
 
 class EmbeddingProvider(Protocol):
@@ -25,14 +33,14 @@ class EmbeddingProvider(Protocol):
 class FastEmbedProvider:
     """Local CPU embedding provider used by the retrieval path."""
 
-    name = "fastembed-bge-small-en-v1.5"
-    dimensions = 384
+    name = _embed_cfg.FASTEMBED_MODEL
+    dimensions = _embed_cfg.FASTEMBED_DIMENSIONS
 
-    def __init__(self, *, batch_size: int = 256, threads: int | None = None) -> None:
+    def __init__(self, *, batch_size: int | None = None, threads: int | None = None) -> None:
         from fastembed import TextEmbedding
 
-        self.batch_size = batch_size
-        self.model = TextEmbedding(model_name="BAAI/bge-small-en-v1.5", threads=threads)
+        self.batch_size = batch_size if batch_size is not None else _EMBEDDING_SETTINGS.fastembed_batch_size
+        self.model = TextEmbedding(model_name=_embed_cfg.FASTEMBED_MODEL, threads=threads)
 
     def embed(self, value: str) -> list[float]:
         return self.embed_many([value])[0]
@@ -62,13 +70,13 @@ class OpenAICompatibleEmbeddingProvider:
         self.api_key = api_key or os.environ.get("OPENROUTER_API_KEY") or os.environ.get("TERMYTEDB_EMBEDDING_API_KEY")
         if not self.api_key:
             raise ValueError("an embedding API key is required")
-        self.base_url = (base_url or os.environ.get("TERMYTEDB_EMBEDDING_BASE_URL", "https://openrouter.ai/api/v1")).rstrip("/")
-        configured_dimensions = dimensions or int(os.environ.get("TERMYTEDB_EMBEDDING_DIMENSIONS", "1024"))
+        self.base_url = (base_url or os.environ.get("TERMYTEDB_EMBEDDING_BASE_URL", _embed_cfg.OPENAI_DEFAULT_BASE_URL)).rstrip("/")
+        configured_dimensions = dimensions or int(os.environ.get("TERMYTEDB_EMBEDDING_DIMENSIONS", str(_EMBEDDING_SETTINGS.openai_default_dimensions)))
         self.dimensions = configured_dimensions
         if configured_dimensions < 1:
             raise ValueError("embedding dimensions must be positive")
-        self.timeout = timeout
-        self.retries = max(1, retries if retries != 3 else int(os.environ.get("TERMYTEDB_EMBEDDING_RETRIES", "6")))
+        self.timeout = timeout if timeout != 60.0 else _EMBEDDING_SETTINGS.openai_timeout
+        self.retries = max(1, retries if retries != 3 else _EMBEDDING_SETTINGS.openai_retries)
         self.name = f"openai-compatible-{self.model}"
 
     def embed(self, value: str) -> list[float]:
@@ -111,8 +119,13 @@ class OpenAICompatibleEmbeddingProvider:
                 return vectors
             except HTTPError as error:
                 last_error = error
+                detail = error.read().decode("utf-8", errors="replace").strip()
+                retry_after = error.headers.get("Retry-After")
+                suffix = f" response={detail}" if detail else ""
+                if retry_after:
+                    suffix += f" retry_after={retry_after}"
                 if error.code not in {408, 429, 500, 502, 503, 504} or attempt == self.retries - 1:
-                    raise RuntimeError(f"embedding provider returned HTTP {error.code}") from error
+                    raise RuntimeError(f"embedding provider returned HTTP {error.code}{suffix}") from error
             except (URLError, TimeoutError, OSError) as error:
                 last_error = error
                 if attempt == self.retries - 1:

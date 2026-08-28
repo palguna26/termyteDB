@@ -8,10 +8,11 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from functools import lru_cache
 
+from ..config.settings import RETRIEVAL as _RETRIEVAL_SETTINGS
 from ..storage.db import Database
 from .embedding import EmbeddingProvider, FastEmbedProvider, cosine
 
-RRF_K = 60
+RRF_K = _RETRIEVAL_SETTINGS.rrf_k
 HISTORY_RE = re.compile(r"\b(previously|used to|former|formerly|before|previous|history|historical)\b", re.I)
 
 
@@ -117,13 +118,15 @@ def _cached_fastembed_provider() -> FastEmbedProvider:
     return FastEmbedProvider()
 
 
-def rerank_and_filter(query: str, hits: list[AtomHit], threshold: float = 0.25) -> list[AtomHit] | None:
+def rerank_and_filter(query: str, hits: list[AtomHit], threshold: float | None = None) -> list[AtomHit] | None:
     """Optional FlashRank reranking with hard abstention."""
+    if threshold is None:
+        threshold = _RETRIEVAL_SETTINGS.reranker_threshold
     try:
         from flashrank import Ranker, RerankRequest  # type: ignore[import-untyped]
     except ImportError:
         return hits if hits else None
-    ranker = Ranker(model_name="ms-marco-MiniLM-L-12-v2")
+    ranker = Ranker(model_name=_RETRIEVAL_SETTINGS.reranker_model)
     passages = [{"id": hit.atom_id, "text": hit.fact, "meta": hit} for hit in hits]
     results = ranker.rerank(RerankRequest(query=query, passages=passages))
     if not results or float(results[0].get("score", 0.0)) < threshold:

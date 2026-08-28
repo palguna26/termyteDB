@@ -56,6 +56,49 @@ ReconciliationIntent = Literal["insert", "reinforce", "update", "supersede", "di
 Durability = Literal["permanent", "session", "task"]
 
 
+class TemporalBlock(BaseModel):
+    """Every memory carries a temporal block used at retrieval.
+
+    `valid_from`/`valid_until` define the world-time interval for which the
+    statement is true. `recorded_at` is the ingestion time. The retrieval
+    pipeline weights `valid_from` recency (see Repository.search) and filters
+    expired blocks for non-historical queries.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    valid_from: datetime | None = None
+    valid_until: datetime | None = None
+    recorded_at: datetime | None = None
+
+    def is_active(self, at: datetime | None = None) -> bool:
+        now = at or utc_now()
+        if self.valid_from and self.valid_from > now:
+            return False
+        if self.valid_until and self.valid_until <= now:
+            return False
+        return True
+
+    def overlaps_year(self, year: int) -> bool:
+        needle = str(year)
+        return needle in (self.valid_from.isoformat() if self.valid_from else "") or needle in (
+            self.valid_until.isoformat() if self.valid_until else ""
+        )
+
+
+def temporal_recency_score(valid_from: datetime | None, now: datetime | None = None) -> float:
+    """Small 0..0.02 recency bonus; newer `valid_from` wins when scores tie."""
+    if not valid_from:
+        return 0.0
+    current = now or utc_now()
+    try:
+        age_days = max(0.0, (current - valid_from).total_seconds() / 86400)
+    except Exception:
+        return 0.0
+    # Decay over 90 days, clamped to 0..0.02 - matches former placeholder but continuous.
+    return max(0.0, min(0.02, 0.02 * (1.0 - min(age_days, 90.0) / 90.0)))
+
+
 class EvidenceSpan(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -232,6 +275,7 @@ class MemoryResponse(BaseModel):
     version: int
     statement: str
     citations: list[EvidenceCitation]
+    temporal: TemporalBlock | None = None
 
 
 class StoredJob(BaseModel):
