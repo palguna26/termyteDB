@@ -6,15 +6,13 @@ Expensive graph/procedure extensions are gated to keep hot path simple.
 
 from __future__ import annotations
 
-import json
 import sqlite3
 import uuid
 from datetime import UTC, datetime
 from typing import Any, cast
 
-from ..core.redaction import redact_text
 from ..memory.extraction import CandidateRejected, ValidatedCandidate
-from ..models import EvidenceCitation, MemoryResponse, TemporalBlock, temporal_recency_score
+from ..models import EvidenceCitation, MemoryResponse, TemporalBlock
 from ..retrieval.embedding import EmbeddingProvider, FastEmbedProvider, pack_embedding
 from .db import Database
 from .vector_index import SQLiteVecIndex

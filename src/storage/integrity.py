@@ -70,13 +70,24 @@ def check_database(database: Database) -> IntegrityReport:
             WHERE v.id IS NULL"""
         ).fetchone()[0]
     )
+    # Phase 3: evidence is optional — versions without evidence are allowed,
+    # but corrupted provenance must still be detected. Count versions whose
+    # source_event_id points to a non-existent event and orphan evidence_refs.
     missing_evidence = int(
         connection.execute(
             """SELECT COUNT(*) FROM memory_versions v
-            LEFT JOIN evidence_refs r ON r.memory_version_id=v.id AND r.namespace_id=v.namespace_id
-            WHERE r.id IS NULL OR v.source_event_id IS NULL
-               OR v.evidence_start_offset IS NULL OR v.evidence_end_offset IS NULL
-               OR v.evidence_excerpt IS NULL"""
+            LEFT JOIN events e ON e.id=v.source_event_id AND e.namespace_id=v.namespace_id
+            WHERE v.source_event_id IS NOT NULL AND e.id IS NULL"""
+        ).fetchone()[0]
+    )
+    # Also include orphan evidence_refs that reference missing versions/events
+    # (kept separate as orphan_evidence, but missing_evidence must not be
+    # silently zeroed; we fold orphan ref count into missing for backward compat)
+    missing_evidence += int(
+        connection.execute(
+            """SELECT COUNT(*) FROM evidence_refs r
+            LEFT JOIN memory_versions v ON v.id=r.memory_version_id AND v.namespace_id=r.namespace_id
+            WHERE v.id IS NULL"""
         ).fetchone()[0]
     )
     missing_fts = int(

@@ -43,7 +43,14 @@ def validate_candidate(
     namespace_id: str,
     candidate: ExtractionCandidate,
     included_events: dict[UUID, str],
+    *,
+    strict: bool | None = None,
 ) -> ValidatedCandidate:
+    # Structural checks remain strict; heuristic semantic check is relaxed for LLM-first flow
+    if strict is None:
+        # Default: relaxed unless explicitly requested, to honor LLM semantic judgement
+        # Keep structural checks; relax semantic_support threshold for LLM candidates
+        strict = False
     statement = normalize_statement(candidate.statement)
     subject = normalize_subject(candidate.subject)
     if not statement or len(statement) < 3:
@@ -54,33 +61,51 @@ def validate_candidate(
         raise CandidateRejected("secret_in_statement")
     if candidate.valid_from and candidate.valid_until and candidate.valid_until <= candidate.valid_from:
         raise CandidateRejected("invalid_validity_interval")
+    # Additional structural checks required by plan: valid schema, event IDs, evidence exists, confidence, durability, non-empty
+    # These are partly enforced by Pydantic, but add explicit range checks for durability/confidence
+    if not (0 <= candidate.confidence <= 1):
+        raise CandidateRejected("invalid_confidence_range")
+    if candidate.durability not in {"permanent", "session", "task"}:
+        raise CandidateRejected("invalid_durability")
+    if not candidate.statement or not candidate.statement.strip():
+        raise CandidateRejected("empty_statement")
     evidence_excerpts: list[str] = []
-    for span in candidate.evidence:
-        if str(span.event_id) not in {str(event_id) for event_id in included_events}:
-            raise CandidateRejected("evidence_not_in_extraction_input")
-        source = included_events[span.event_id]
-        if span.end_offset > len(source) or span.start_offset >= span.end_offset:
-            raise CandidateRejected("invalid_evidence_span")
-        actual = source[span.start_offset : span.end_offset]
-        if actual != span.excerpt:
-            raise CandidateRejected("evidence_excerpt_mismatch")
-        if redact_text(actual) != actual:
-            raise CandidateRejected("secret_in_evidence")
-        evidence_excerpts.append(actual)
-    if not semantic_support(statement, " ".join(evidence_excerpts), subject):
-        raise CandidateRejected("unsupported_statement")
+    if candidate.evidence:
+        for span in candidate.evidence:
+            if str(span.event_id) not in {str(event_id) for event_id in included_events}:
+                raise CandidateRejected("evidence_not_in_extraction_input")
+            source = included_events[span.event_id]
+            if span.end_offset > len(source) or span.start_offset >= span.end_offset:
+                raise CandidateRejected("invalid_evidence_span")
+            actual = source[span.start_offset : span.end_offset]
+            if actual != span.excerpt:
+                raise CandidateRejected("evidence_excerpt_mismatch")
+            if redact_text(actual) != actual:
+                raise CandidateRejected("secret_in_evidence")
+            evidence_excerpts.append(actual)
+    # Evidence is now optional; skip semantic support check when no evidence is supplied
+    if evidence_excerpts:
+        if strict:
+            if not semantic_support(statement, " ".join(evidence_excerpts), subject):
+                raise CandidateRejected("unsupported_statement")
+        else:
+            if not semantic_support(statement, " ".join(evidence_excerpts), subject, threshold=0.35 if getattr(candidate, "source_stage", None) else 0.45):
+                raise CandidateRejected("unsupported_statement")
     normalized = candidate.model_copy(update={"subject": subject, "statement": statement})
     return ValidatedCandidate(normalized, candidate_fingerprint(normalized))
 
 
-def semantic_support(statement: str, excerpt: str, subject: str = "") -> bool:
-    """Require most meaningful terms, while allowing normal LLM paraphrasing."""
+def semantic_support(statement: str, excerpt: str, subject: str = "", *, threshold: float = 0.60) -> bool:
+    """Require most meaningful terms, while allowing normal LLM paraphrasing.
+
+    Threshold is relaxed for LLM-first flow (0.35-0.45) vs strict rule fallback (0.60).
+    """
     statement_terms = _significant_terms(statement)
     excerpt_terms = _significant_terms(excerpt)
     if not statement_terms:
         return False
     overlap = len(statement_terms & excerpt_terms) / len(statement_terms)
-    if overlap >= 0.60:
+    if overlap >= threshold:
         return True
     subject_terms = _significant_terms(subject)
     predicate_terms = statement_terms - subject_terms

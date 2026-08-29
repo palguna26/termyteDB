@@ -121,7 +121,29 @@ class Repository:
         self.embedding = embedding or FastEmbedProvider()
         self.vector_index = SQLiteVecIndex(self.db, self.embedding)
         self.vector_index.ensure()
+        self._ensure_extraction_runs_tracing_columns()
         self._claimed_lease_tokens: dict[str, str] = {}
+
+    def _ensure_extraction_runs_tracing_columns(self) -> None:
+        try:
+            cols = {row[1] for row in self.db.execute("PRAGMA table_info(extraction_runs)").fetchall()}
+            if "stage" not in cols:
+                self.db.execute("ALTER TABLE extraction_runs ADD COLUMN stage TEXT")
+            if "candidate_count" not in cols:
+                self.db.execute("ALTER TABLE extraction_runs ADD COLUMN candidate_count INTEGER")
+            if "input_event_ids" not in cols:
+                self.db.execute("ALTER TABLE extraction_runs ADD COLUMN input_event_ids TEXT")
+            if "existing_memory_count" not in cols:
+                self.db.execute("ALTER TABLE extraction_runs ADD COLUMN existing_memory_count INTEGER")
+            if "input_hash" not in cols:
+                pass
+        except Exception:
+            pass
+        # Phase 3: evidence becomes optional — drop strict guard that required offsets/excerpts
+        try:
+            self.db.execute("DROP TRIGGER IF EXISTS memory_versions_evidence_guard")
+        except Exception:
+            pass
 
     def _persist_embedding(self, memory_version_id: str, namespace_id: str, vector: list[float] | None, statement: str) -> None:
         packed = pack_embedding(vector if vector is not None else self.embedding.embed(statement))
@@ -955,10 +977,17 @@ class Repository:
         embedding: list[float] | None,
     ) -> tuple[str | None, str, str | None]:
         item = candidate.candidate
-        source = self.db.execute(
-            "SELECT namespace_id, created_at, occurred_at, payload_json FROM events WHERE id=? AND namespace_id=?",
-            (str(item.evidence[0].event_id), namespace_id),
-        ).fetchone()
+        # Phase 2/3: evidence is optional — use the ingested event as fallback source
+        if item.evidence:
+            source = self.db.execute(
+                "SELECT namespace_id, created_at, occurred_at, payload_json FROM events WHERE id=? AND namespace_id=?",
+                (str(item.evidence[0].event_id), namespace_id),
+            ).fetchone()
+        else:
+            source = self.db.execute(
+                "SELECT namespace_id, created_at, occurred_at, payload_json FROM events WHERE id=? AND namespace_id=?",
+                (str(event["id"]), namespace_id),
+            ).fetchone()
         if not source:
             raise ValueError("evidence event is not in the requested namespace")
         if source["created_at"] > iso():
@@ -990,27 +1019,36 @@ class Repository:
                     (str(uuid.uuid4()), current["id"], namespace_id, str(span.event_id), span.start_offset, span.end_offset, span.excerpt),
                 )
             return memory_id, "REINFORCE", current["id"]
-        if item.intent == "dispute":
-            action = "DISPUTE"
-            status = "contradicted"
-        elif current and item.intent in {"update", "supersede"}:
+        # Simplified reconciliation: only insert, reinforce, update, supersede, ignore
+        if current and item.intent in {"update", "supersede"}:
             explicit = item.confidence >= 0.85 or any(
                 marker in item.statement.casefold() or marker in span.excerpt.casefold() for span in item.evidence for marker in TRANSITION_MARKERS
-            )
+            ) or not item.evidence
             action = "UPDATE" if item.intent == "update" else "SUPERSEDE"
             if not explicit:
-                action, status = "DISPUTE", "contradicted"
-            else:
-                status = "active"
+                # Without explicit marker and low confidence, treat as ignore rather than dispute
+                return memory_id, "IGNORE", None
+            status = "active"
         elif current:
-            action, status = "DISPUTE", "contradicted"
+            # Any other conflicting insert without explicit intent is treated as ignore (no duplicate)
+            if item.statement == current["statement"]:
+                return memory_id, "REINFORCE", current["id"]
+            # For distinct statement with no intent, treat as update (history)
+            action, status = "UPDATE", "active"
+            if not item.evidence and current:
+                action = "UPDATE"
         else:
             action, status = "INSERT", "active"
         version = current["version"] + 1 if current else 1
         if current and status == "active":
             self.db.execute("UPDATE memory_versions SET status='superseded', valid_to=? WHERE id=? AND namespace_id=?", (iso(), current["id"], namespace_id))
             self.db.execute("DELETE FROM memory_fts WHERE memory_version_id=? AND namespace_id=?", (current["id"], namespace_id))
-        span = item.evidence[0]
+        # Evidence fields are optional — allow NULL
+        if item.evidence:
+            span = item.evidence[0]
+            src_id, start_off, end_off, excerpt = str(span.event_id), span.start_offset, span.end_offset, span.excerpt
+        else:
+            src_id, start_off, end_off, excerpt = str(event["id"]), None, None, item.statement[:500]
         version_id = str(uuid.uuid4())
         self.db.execute(
             """INSERT INTO memory_versions
@@ -1021,10 +1059,10 @@ class Repository:
                 version_id,
                 memory_id,
                 namespace_id,
-                str(span.event_id),
-                span.start_offset,
-                span.end_offset,
-                span.excerpt,
+                src_id,
+                start_off,
+                end_off,
+                excerpt,
                 version,
                 item.statement,
                 item.valid_from.astimezone(UTC).isoformat() if item.valid_from else source["occurred_at"],
@@ -1048,10 +1086,8 @@ class Repository:
             )
             self.db.execute(
                 "INSERT INTO memory_fts(memory_version_id, namespace_id, statement, evidence_text) VALUES (?, ?, ?, ?)",
-                (version_id, namespace_id, item.statement, span.excerpt),
+                (version_id, namespace_id, item.statement, excerpt or ""),
             )
-        elif status == "contradicted":
-            self.db.execute("UPDATE memories SET status='disputed' WHERE id=? AND namespace_id=?", (memory_id, namespace_id))
         self._persist_embedding(version_id, namespace_id, embedding, item.statement)
         self.record_graph_links(
             namespace_id,
@@ -1068,7 +1104,8 @@ class Repository:
     def get_memory(self, namespace_id: str, memory_id: str) -> MemoryResponse | None:
         row = self.db.execute(
             """SELECT m.*, v.id AS version_id, v.version, v.statement, v.status AS version_status,
-                      v.valid_from, v.valid_until, v.recorded_at
+                      v.valid_from, v.valid_until, v.recorded_at, v.source_event_id, v.evidence_excerpt,
+                      m.created_at AS mem_created_at, m.current_version_id
             FROM memories m JOIN memory_versions v ON v.id=m.current_version_id
             WHERE m.id=? AND m.namespace_id=? AND v.namespace_id=?""",
             (memory_id, namespace_id, namespace_id),
@@ -1087,6 +1124,9 @@ class Repository:
             )
         except Exception:
             temporal = None
+        source_ids = [c.event_id for c in citations]
+        if row["source_event_id"] and uuid.UUID(row["source_event_id"]) not in source_ids:
+            source_ids.append(uuid.UUID(row["source_event_id"]))
         return MemoryResponse(
             memory_id=uuid.UUID(row["id"]),
             namespace_id=namespace_id,
@@ -1100,32 +1140,47 @@ class Repository:
             statement=row["statement"],
             citations=citations,
             temporal=temporal,
+            source_event_ids=source_ids,
+            evidence_excerpt=row["evidence_excerpt"],
+            created_at=row["mem_created_at"],
+            updated_at=row["recorded_at"],
         )
 
     def list_memories(self, namespace_id: str, limit: int = 100, offset: int = 0) -> list[MemoryResponse]:
         rows = self.db.execute(
-            """SELECT m.*, v.id AS version_id, v.version, v.statement, v.status AS version_status
+            """SELECT m.*, v.id AS version_id, v.version, v.statement, v.status AS version_status,
+                      v.source_event_id, v.evidence_excerpt, v.recorded_at
             FROM memories m JOIN memory_versions v ON v.id=m.current_version_id
             WHERE m.namespace_id=? AND v.namespace_id=?
             ORDER BY m.created_at, m.id LIMIT ? OFFSET ?""",
             (namespace_id, namespace_id, limit, offset),
         ).fetchall()
-        return [
-            MemoryResponse(
-                memory_id=uuid.UUID(row["id"]),
-                namespace_id=namespace_id,
-                kind=row["kind"],
-                subject_key=row["subject_key"],
-                status=row["version_status"],
-                confidence=row["confidence"],
-                importance=row["importance"],
-                current_version_id=uuid.UUID(row["version_id"]),
-                version=row["version"],
-                statement=row["statement"],
-                citations=self._citations(namespace_id, row["version_id"]),
+        result: list[MemoryResponse] = []
+        for row in rows:
+            citations = self._citations(namespace_id, row["version_id"])
+            source_ids = [c.event_id for c in citations]
+            if row["source_event_id"] and uuid.UUID(row["source_event_id"]) not in source_ids:
+                source_ids.append(uuid.UUID(row["source_event_id"]))
+            result.append(
+                MemoryResponse(
+                    memory_id=uuid.UUID(row["id"]),
+                    namespace_id=namespace_id,
+                    kind=row["kind"],
+                    subject_key=row["subject_key"],
+                    status=row["version_status"],
+                    confidence=row["confidence"],
+                    importance=row["importance"],
+                    current_version_id=uuid.UUID(row["version_id"]),
+                    version=row["version"],
+                    statement=row["statement"],
+                    citations=citations,
+                    source_event_ids=source_ids,
+                    evidence_excerpt=row["evidence_excerpt"],
+                    created_at=row["created_at"],
+                    updated_at=row["recorded_at"],
+                )
             )
-            for row in rows
-        ]
+        return result
 
     def search(self, namespace_id: str, query: str, limit: int, historical: bool = False, *, internal: bool = False) -> list[SearchResult]:
         terms = list(dict.fromkeys(term.casefold() for term in re.findall(r"[\w./:-]+", query) if len(term) > 1 and term.casefold() not in SEARCH_STOP_WORDS))
@@ -1211,7 +1266,7 @@ class Repository:
             return []
         placeholders = ",".join("?" for _ in candidate_ids)
         rows = self.db.execute(
-            f"""SELECT m.id, m.kind, m.confidence, m.importance, v.id AS version_id, v.statement, v.status, v.valid_from, v.valid_to, v.recorded_at
+            f"""SELECT m.id, m.kind, m.confidence, m.importance, v.id AS version_id, v.statement, v.status, v.valid_from, v.valid_to, v.recorded_at, v.source_event_id, v.evidence_excerpt
             FROM memory_versions v JOIN memories m ON m.id=v.memory_id AND m.namespace_id=?
             WHERE v.namespace_id=? AND v.id IN ({placeholders}) AND (? OR (v.status='active' AND m.status='active'
               AND m.accessibility >= 0.05 AND v.valid_to IS NULL
@@ -1267,6 +1322,11 @@ class Repository:
             lexical_score = round(lexical.get(row["version_id"], 0.0), 6)
             vector_score = round(vector.get(row["version_id"], 0.0), 6)
             final_score = round(score_row(row), 6)
+            source_ids = [c.event_id for c in citations]
+            sid = row["source_event_id"]
+            excerpt_val = row["evidence_excerpt"]
+            if sid and uuid.UUID(sid) not in source_ids:
+                source_ids.append(uuid.UUID(sid))
             # Hybrid fetch: FTS + Vector already merged via RRF. Optional
             # reranker (FlashRank) runs on the fetched top-N before slicing to limit.
             # Keep deterministic without LLM by default; rerank is additive.
@@ -1295,6 +1355,8 @@ class Repository:
                     },
                     status=row["status"],
                     citations=citations,
+                    source_event_ids=source_ids,
+                    evidence_excerpt=excerpt_val,
                 )
             )
         # Post-fetch rerank: if caller wants relevance-ordered top-K, they can
@@ -1743,6 +1805,90 @@ class Repository:
                 (version["id"], namespace_id, version["statement"], version["evidence_excerpt"] or ""),
             )
             return True
+
+    def update_memory(self, namespace_id: str, memory_id: str, statement: str, confidence: float | None = None, kind: str | None = None, source_event_id: str | None = None, evidence_excerpt: str | None = None) -> bool:
+        """Phase 3: direct memory update creates a new version and supersedes the old.
+        Stores optional provenance without requiring evidence offsets."""
+        if not statement or not statement.strip():
+            raise ValueError("statement must be non-empty")
+        if confidence is not None and not (0 <= confidence <= 1):
+            raise ValueError("confidence must be between 0 and 1")
+        with self.db.lock, self.db.connection:
+            mem = self.db.execute("SELECT * FROM memories WHERE id=? AND namespace_id=?", (memory_id, namespace_id)).fetchone()
+            if not mem:
+                return False
+            current = self.db.execute("SELECT * FROM memory_versions WHERE id=? AND namespace_id=?", (mem["current_version_id"], namespace_id)).fetchone()
+            if not current:
+                return False
+            new_kind = kind or mem["kind"]
+            new_conf = confidence if confidence is not None else mem["confidence"]
+            # Create new version
+            version = current["version"] + 1
+            version_id = str(uuid.uuid4())
+            now = iso()
+            src_id = source_event_id
+            if src_id is None:
+                src_id = current["source_event_id"]
+            # P1: validate provenance event is in the same namespace before attaching
+            if src_id is not None:
+                provenance = self.db.execute(
+                    "SELECT 1 FROM events WHERE id=? AND namespace_id=?",
+                    (src_id, namespace_id),
+                ).fetchone()
+                if not provenance:
+                    raise ValueError("source_event_id is not in the requested namespace")
+            excerpt = evidence_excerpt if evidence_excerpt is not None else current["evidence_excerpt"] or statement[:500]
+            # Normalize provenance offsets to be consistent with excerpt; synthetic when evidence is optional
+            if src_id is not None:
+                if not excerpt:
+                    excerpt = statement[:500] or "provenance"
+                start_off = 0
+                end_off = len(excerpt)
+                if end_off <= start_off:
+                    end_off = start_off + 1
+            else:
+                start_off = current["evidence_start_offset"]
+                end_off = current["evidence_end_offset"]
+            # Supersede old
+            self.db.execute("UPDATE memory_versions SET status='superseded', valid_to=? WHERE id=? AND namespace_id=?", (now, current["id"], namespace_id))
+            self.db.execute("DELETE FROM memory_fts WHERE memory_version_id=? AND namespace_id=?", (current["id"], namespace_id))
+            self.db.execute(
+                """INSERT INTO memory_versions
+                (id, memory_id, namespace_id, source_event_id, evidence_start_offset, evidence_end_offset, evidence_excerpt,
+                 version, statement, valid_from, recorded_at, status, reason, durability, model_run_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', 'update', 'permanent', NULL)""",
+                (version_id, memory_id, namespace_id, src_id, start_off, end_off, excerpt, version, statement, now, now),
+            )
+            # P2: preserve citations for updated version when provenance is available
+            if src_id is not None:
+                # Ensure evidence_refs has a corresponding row so get_memory/list_memories return citations
+                ev_excerpt = excerpt
+                ev_start = start_off if isinstance(start_off, int) else 0
+                ev_end = end_off if isinstance(end_off, int) else len(ev_excerpt)
+                if ev_end <= ev_start:
+                    ev_end = ev_start + (len(ev_excerpt) if ev_excerpt else 1)
+                self.db.execute(
+                    """INSERT OR IGNORE INTO evidence_refs
+                    (id, memory_version_id, namespace_id, event_id, start_offset, end_offset, excerpt)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                    (str(uuid.uuid4()), version_id, namespace_id, src_id, ev_start, ev_end, ev_excerpt),
+                )
+            # Update memory row
+            self.db.execute(
+                "UPDATE memories SET kind=?, confidence=?, current_version_id=?, status='active' WHERE id=? AND namespace_id=?",
+                (new_kind, new_conf, version_id, memory_id, namespace_id),
+            )
+            self.db.execute(
+                "INSERT INTO memory_fts(memory_version_id, namespace_id, statement, evidence_text) VALUES (?, ?, ?, ?)",
+                (version_id, namespace_id, statement, excerpt or ""),
+            )
+            # Persist embedding for new version
+            self._persist_embedding(version_id, namespace_id, None, statement)
+            return True
+
+    def delete_memory(self, namespace_id: str, memory_id: str) -> bool:
+        """Target API alias for forget — tombstones memory while retaining history."""
+        return self.forget_memory(namespace_id, memory_id, "delete_memory")
 
     def history(self, namespace_id: str, memory_id: str) -> list[dict[str, Any]] | None:
         memory = self.db.execute("SELECT id FROM memories WHERE id=? AND namespace_id=?", (memory_id, namespace_id)).fetchone()

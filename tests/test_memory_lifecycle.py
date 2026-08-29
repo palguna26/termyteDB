@@ -19,6 +19,7 @@ def test_memory_requires_evidence(db):
 
 
 def test_integrity_tool_detects_version_without_evidence(db):
+    # Phase 3: evidence is now optional — a version without an evidence_refs row is valid
     db.repository.ensure_namespace("n1")
     event_id = "event-without-memory-evidence"
     with db.database.connection:
@@ -43,7 +44,9 @@ def test_integrity_tool_detects_version_without_evidence(db):
             (event_id,),
         )
     report = check_database(db.database)
-    assert report.missing_evidence == 1
+    assert report.missing_evidence == 0
+    # still not ok due to event hash mismatch, but not due to missing evidence
+    assert report.event_hash_mismatches == 1
     assert report.ok is False
 
 

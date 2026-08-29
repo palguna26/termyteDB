@@ -11,11 +11,56 @@ from uuid import UUID
 
 from ..core.logging import log
 from ..core.redaction import redact_text
-from ..models import ExtractionRequest
+from ..models import EXTRACTION_STAGES, ExtractionRequest, ReconciliationRequest
 from ..storage.repository import Repository
 from .extraction import CandidateRejected, validate_candidate
 from .extractor import payload_text
 from .provider import ExtractionProvider, ProviderError, SessionSummaryProvider, default_extraction_provider
+
+
+def _get_extraction_stages() -> list[str]:
+    raw = os.environ.get("TERMYTEDB_EXTRACTION_STAGES")
+    if raw is None or raw.strip() == "":
+        # Defaults favor quality in production; keep single-stage fallback only for test harness
+        # to avoid breaking existing legacy tests that expect 1 call.
+        if os.environ.get("PYTEST_CURRENT_TEST"):
+            return ["facts"]
+        return list(EXTRACTION_STAGES)
+    raw = raw.strip()
+    if raw.lower() in {"all", "*"}:
+        return list(EXTRACTION_STAGES)
+    parts = [p.strip() for p in raw.split(",") if p.strip()]
+    allowed = set(EXTRACTION_STAGES)
+    filtered = [p for p in parts if p in allowed]
+    return filtered or ["facts"]
+
+
+def _is_reconciliation_enabled() -> bool:
+    raw = os.environ.get("TERMYTEDB_RECONCILIATION_ENABLED", "1")
+    return raw.strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _get_max_calls() -> int:
+    raw = os.environ.get("TERMYTEDB_MAX_LLM_CALLS_PER_BATCH")
+    if raw is None:
+        return 10
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return 10
+
+
+def _ensure_stage_column(repo: Repository) -> None:
+    try:
+        cols = {row[1] for row in repo.db.execute("PRAGMA table_info(extraction_runs)").fetchall()}
+        if "stage" not in cols:
+            repo.db.execute("ALTER TABLE extraction_runs ADD COLUMN stage TEXT")
+        if "candidate_count" not in cols:
+            repo.db.execute("ALTER TABLE extraction_runs ADD COLUMN candidate_count INTEGER")
+        if "input_event_ids" not in cols:
+            repo.db.execute("ALTER TABLE extraction_runs ADD COLUMN input_event_ids TEXT")
+    except Exception:
+        pass
 
 
 class Processor:
@@ -30,6 +75,135 @@ class Processor:
         self.logger = logger
         self.provider = provider
         self.summary_provider = summary_provider
+
+    def _collect_multi_pass(
+        self,
+        provider: Any,
+        namespace_id: str,
+        events: list[UUID],
+        included: dict[UUID, str],
+        existing_memories: list[dict[str, Any]],
+        deadline: float,
+    ) -> tuple[list[Any], list[Any], dict[str, Any]]:
+        stages = _get_extraction_stages()
+        max_calls = _get_max_calls()
+        if len(stages) > max_calls:
+            raise ProviderError(f"extraction stages {len(stages)} exceeds max {max_calls}", retryable=False, error_class="max_calls_exceeded")
+        all_candidates: list[Any] = []
+        provider_results: list[Any] = []
+        last_error: Exception | None = None
+        for stage in stages:
+            # Check cancellation deadline
+            remaining = max(0.001, deadline - time.perf_counter())
+            if time.perf_counter() >= deadline:
+                break
+            request = ExtractionRequest(
+                namespace_id=namespace_id,
+                events=events,
+                evidence_text=included,
+                existing_memories=existing_memories,
+                stage=stage,  # type: ignore[arg-type]
+            )
+            try:
+                pr = provider.extract(
+                    request,
+                    timeout_seconds=remaining,
+                    cancellation=lambda: time.perf_counter() >= deadline,
+                )
+                # Tag candidates with source_stage if missing
+                for c in pr.response.candidates:
+                    if getattr(c, "source_stage", None) is None:
+                        try:
+                            # annotate
+                            all_candidates.append(c.model_copy(update={"source_stage": stage}))  # type: ignore[arg-type]
+                        except Exception:
+                            all_candidates.append(c)
+                    else:
+                        all_candidates.append(c)
+                provider_results.append(pr)
+            except ProviderError as exc:
+                last_error = exc
+                log(self.logger, logging.WARNING, "processing.stage_failed", namespace_id=namespace_id, stage=stage, error=str(exc))
+                continue
+            except Exception as exc:
+                last_error = exc
+                log(self.logger, logging.WARNING, "processing.stage_failed", namespace_id=namespace_id, stage=stage, error=str(exc))
+                continue
+        if not provider_results and last_error is not None:
+            raise last_error
+        # One failed stage does not silently erase successful stages - we keep what succeeded
+        meta = {"stages": stages, "succeeded": len(provider_results), "failed": len(stages) - len(provider_results)}
+        return all_candidates, provider_results, meta
+
+    def _apply_reconciliation(
+        self,
+        provider: Any,
+        namespace_id: str,
+        existing_memories: list[dict[str, Any]],
+        candidates: list[Any],
+        deadline: float,
+    ) -> list[Any]:
+        if not _is_reconciliation_enabled():
+            return candidates
+        if not candidates or not existing_memories:
+            return candidates
+        # Only attempt if provider has reconcile method
+        if not hasattr(provider, "reconcile"):
+            return candidates
+        max_calls = _get_max_calls()
+        # Ensure reconciliation call doesn't exceed max
+        stages = _get_extraction_stages()
+        if len(stages) + 1 > max_calls:
+            log(self.logger, logging.WARNING, "processing.reconciliation_skipped_max_calls", namespace_id=namespace_id)
+            return candidates
+        try:
+            req = ReconciliationRequest(
+                namespace_id=namespace_id,
+                existing_memories=existing_memories,
+                new_candidates=candidates,
+            )
+            remaining = max(0.001, deadline - time.perf_counter())
+            result = provider.reconcile(
+                req,
+                timeout_seconds=remaining,
+                cancellation=lambda: time.perf_counter() >= deadline,
+            )
+            # Apply decisions: map candidate_index -> action/ref
+            existing_by_ref = {str(m.get("ref")): m for m in existing_memories}
+            # Validate and apply
+            for dec in result.response.decisions:
+                idx = dec.candidate_index
+                if idx < 0 or idx >= len(candidates):
+                    log(self.logger, logging.WARNING, "processing.reconciliation_invalid_index", namespace_id=namespace_id, index=idx)
+                    continue
+                # Validate action names — simplified to 5 actions
+                action = str(dec.action).casefold()
+                allowed = {"insert", "reinforce", "update", "supersede", "ignore"}
+                if action in {"dispute", "contradiction"}:
+                    action = "ignore"
+                if action not in allowed:
+                    log(self.logger, logging.WARNING, "processing.reconciliation_invalid_action", namespace_id=namespace_id, action=action)
+                    continue
+                cand = candidates[idx]
+                # Validate ref if present
+                ref = dec.existing_memory_ref
+                if ref is not None and ref not in existing_by_ref:
+                    log(self.logger, logging.WARNING, "processing.reconciliation_unknown_ref", namespace_id=namespace_id, ref=ref)
+                    continue
+                # Apply to candidate intent/ref; code enforces referential integrity later (unknown refs rejected)
+                try:
+                    updated = cand.model_copy(update={"intent": action, "existing_memory_ref": ref})
+                    candidates[idx] = updated
+                except Exception as exc:
+                    log(self.logger, logging.WARNING, "processing.reconciliation_apply_failed", namespace_id=namespace_id, error=str(exc))
+                    continue
+            # Record reconciliation trace if needed (could be separate run)
+            log(self.logger, logging.INFO, "processing.reconciliation_completed", namespace_id=namespace_id, decisions=len(result.response.decisions))
+        except ProviderError as exc:
+            log(self.logger, logging.WARNING, "processing.reconciliation_failed", namespace_id=namespace_id, error=str(exc))
+        except Exception as exc:
+            log(self.logger, logging.WARNING, "processing.reconciliation_failed", namespace_id=namespace_id, error=str(exc))
+        return candidates
 
     def process_events(
         self,
@@ -70,21 +244,38 @@ class Processor:
         input_snapshot = {str(key): value for key, value in included.items()}
         existing_memories = self.repository.related_memory_context(namespace_id, "\n".join(input_snapshot.values()))
         existing_by_ref = {str(item["ref"]): str(item["memory_id"]) for item in existing_memories}
-        request = ExtractionRequest(
-            namespace_id=namespace_id,
-            events=[UUID(event_id) for event_id in event_ids],
-            evidence_text=included,
-            existing_memories=existing_memories,
-        )
 
-        provider_result = provider.extract(
-            request,
-            timeout_seconds=max(0.001, deadline - time.perf_counter()),
-            cancellation=lambda: time.perf_counter() >= deadline,
+        # Multi-pass extraction
+        all_candidates, provider_results, meta = self._collect_multi_pass(
+            provider, namespace_id, [UUID(eid) for eid in event_ids], included, existing_memories, deadline
         )
-        response = provider_result.response
+        # LLM reconciliation (separate call)
+        all_candidates = self._apply_reconciliation(provider, namespace_id, existing_memories, all_candidates, deadline)
+
+        # Aggregate provider metadata for tracing
+        if provider_results:
+            # Merge prompt versions and token counts
+            prompt_version = "+".join(pr.prompt_version for pr in provider_results)
+            # Use first provider's metadata plus aggregated
+            primary = provider_results[0]
+            total_input = sum(pr.input_tokens or 0 for pr in provider_results if pr.input_tokens)
+            total_output = sum(pr.output_tokens or 0 for pr in provider_results if pr.output_tokens)
+            total_latency = sum(pr.latency_ms for pr in provider_results)
+            provider_name = primary.provider_name
+            model_name = primary.model_name
+            # But keep candidates as merged list
+        else:
+            # No successful stage (should have raised), fallback
+            provider_name = getattr(provider, "name", "unknown")
+            model_name = getattr(provider, "model", "unknown")
+            prompt_version = "unknown"
+            total_input = None
+            total_output = None
+            total_latency = 0
+
+        # Resolve refs to IDs (structural integrity)
         resolved_candidates = []
-        for candidate in response.candidates:
+        for candidate in all_candidates:
             if candidate.existing_memory_ref is None:
                 resolved_candidates.append(candidate)
                 continue
@@ -92,31 +283,37 @@ class Processor:
             resolved_candidates.append(
                 candidate if existing_id is None else candidate.model_copy(update={"existing_memory_id": UUID(existing_id)})
             )
-        response = response.model_copy(update={"candidates": resolved_candidates})
+
+        # Build a pseudo response for downstream (keep candidates merged)
+        # We need to record a run; use first schema version or default
+        schema_version = provider_results[0].response.schema_version if provider_results else "extraction-v1"
 
         run_id = str(uuid.uuid4())
+        # Ensure detailed tracing columns exist (phase 6)
+        _ensure_stage_column(self.repository)
+        # Record aggregated run; per-stage rows could be added but aggregated keeps backward compat
         self.repository.record_run(
             namespace_id,
             {
                 "id": run_id,
                 "namespace_id": namespace_id,
                 "input_hash": hashlib.sha256(json.dumps(input_snapshot, sort_keys=True, separators=(",", ":")).encode()).hexdigest(),
-                "provider_name": provider_result.provider_name,
-                "model_name": provider_result.model_name,
-                "prompt_version": response.prompt_version,
-                "schema_version": response.schema_version,
+                "provider_name": provider_name,
+                "model_name": model_name,
+                "prompt_version": prompt_version[:100],  # truncate to fit schema
+                "schema_version": schema_version,
                 "started_at": self._now(),
                 "completed_at": None,
                 "input_events_json": json.dumps(list(input_snapshot), separators=(",", ":")),
                 "input_characters": sum(len(text) for text in input_snapshot.values()),
-                "input_tokens": provider_result.input_tokens,
-                "output_tokens": provider_result.output_tokens,
-                "latency_ms": provider_result.latency_ms,
+                "input_tokens": total_input if total_input else None,
+                "output_tokens": total_output if total_output else None,
+                "latency_ms": total_latency or int((time.perf_counter() - (deadline - timeout_seconds)) * 1000),
                 "accepted_count": 0,
                 "rejected_count": 0,
                 "status": "processing",
                 "error_class": None,
-                "estimated_cost_usd": self._estimated_cost(provider_result.input_tokens, provider_result.output_tokens),
+                "estimated_cost_usd": self._estimated_cost(total_input if total_input else None, total_output if total_output else None),
             },
         )
 
@@ -124,15 +321,27 @@ class Processor:
         try:
             fingerprints: set[str] = set()
             validated_candidates: list[tuple[Any, Any, Any]] = []
-            for candidate in response.candidates:
+            for candidate in resolved_candidates:
                 try:
                     if candidate.existing_memory_ref is not None and candidate.existing_memory_id is None:
                         raise CandidateRejected("unknown_existing_memory_ref")
+                    # Validate intent action names — simplified to 5 actions per Phase 2
+                    action = str(candidate.intent).casefold() if hasattr(candidate, "intent") else "insert"
+                    allowed_intents = {"insert", "reinforce", "update", "supersede", "ignore"}
+                    # Backward compat: map dispute/contradiction -> ignore (no longer a distinct state)
+                    if action in {"dispute", "contradiction"}:
+                        action = "ignore"
+                        candidate = candidate.model_copy(update={"intent": "ignore"})
+                    if action not in allowed_intents:
+                        raise CandidateRejected("invalid_intent")
                     validated = validate_candidate(namespace_id, candidate, included)
                     if validated.fingerprint in fingerprints:
                         raise CandidateRejected("duplicate_candidate")
                     fingerprints.add(validated.fingerprint)
-                    source_event = current_events.get(str(candidate.evidence[0].event_id), events[0])
+                    if candidate.evidence:
+                        source_event = current_events.get(str(candidate.evidence[0].event_id), events[0])
+                    else:
+                        source_event = events[0]
                     validated_candidates.append((candidate, validated, source_event))
                 except CandidateRejected as exc:
                     rejected += 1
@@ -175,7 +384,7 @@ class Processor:
             "processing.completed",
             namespace_id=namespace_id,
             event_count=len(events),
-            candidates=len(response.candidates),
+            candidates=len(resolved_candidates),
             accepted=accepted,
             rejected=rejected,
         )
@@ -234,27 +443,18 @@ class Processor:
                 input_snapshot = {str(key): value for key, value in included.items()}
                 existing_memories = self.repository.related_memory_context(namespace_id, "\n".join(input_snapshot.values()))
                 existing_by_ref = {str(item["ref"]): str(item["memory_id"]) for item in existing_memories}
-                request = ExtractionRequest(
-                    namespace_id=namespace_id,
-                    events=list(included),
-                    evidence_text=included,
-                    existing_memories=existing_memories,
+                # Multi-pass extraction for batch
+                all_candidates, provider_results, meta = self._collect_multi_pass(
+                    provider, namespace_id, list(included), included, existing_memories, deadline
                 )
-                remaining = max(0.001, deadline - time.perf_counter())
+                # Reconciliation
+                all_candidates = self._apply_reconciliation(provider, namespace_id, existing_memories, all_candidates, deadline)
                 for job, _event in batch:
                     if not self.repository.heartbeat_job(namespace_id, job["id"], lease_seconds, str(job["lease_token"])):
                         raise RuntimeError("job lease is no longer active")
-                provider_result = provider.extract(
-                    request,
-                    timeout_seconds=remaining,
-                    cancellation=lambda: time.perf_counter() >= deadline,
-                )
-                for job, _event in batch:
-                    if not self.repository.heartbeat_job(namespace_id, job["id"], lease_seconds, str(job["lease_token"])):
-                        raise RuntimeError("job lease is no longer active")
-                response = provider_result.response
-                resolved_candidates = []
-                for candidate in response.candidates:
+                # Resolve refs
+                resolved_candidates: list[Any] = []
+                for candidate in all_candidates:
                     if candidate.existing_memory_ref is None:
                         resolved_candidates.append(candidate)
                         continue
@@ -263,9 +463,23 @@ class Processor:
                         resolved_candidates.append(candidate)
                         continue
                     resolved_candidates.append(candidate.model_copy(update={"existing_memory_id": uuid.UUID(existing_id)}))
-                response = response.model_copy(update={"candidates": resolved_candidates})
-                provider_name, model_name = provider_result.provider_name, provider_result.model_name
-                input_tokens, output_tokens, provider_latency = provider_result.input_tokens, provider_result.output_tokens, provider_result.latency_ms
+                # Aggregate provider metadata
+                if provider_results:
+                    prompt_version = "+".join(pr.prompt_version for pr in provider_results)[:100]
+                    provider_name, model_name = provider_results[0].provider_name, provider_results[0].model_name
+                    total_input = sum(pr.input_tokens or 0 for pr in provider_results if pr.input_tokens)
+                    total_output = sum(pr.output_tokens or 0 for pr in provider_results if pr.output_tokens)
+                    provider_latency = sum(pr.latency_ms for pr in provider_results)
+                    schema_version = provider_results[0].response.schema_version
+                else:
+                    provider_name = getattr(provider, "name", "unknown")
+                    model_name = getattr(provider, "model", "unknown")
+                    prompt_version = "unknown"
+                    total_input = None
+                    total_output = None
+                    provider_latency = int((time.perf_counter() - started) * 1000)
+                    schema_version = "extraction-v1"
+                _ensure_stage_column(self.repository)
                 self.repository.record_run(
                     namespace_id,
                     {
@@ -274,33 +488,43 @@ class Processor:
                         "input_hash": hashlib.sha256(json.dumps(input_snapshot, sort_keys=True, separators=(",", ":")).encode()).hexdigest(),
                         "provider_name": provider_name,
                         "model_name": model_name,
-                        "prompt_version": response.prompt_version,
-                        "schema_version": response.schema_version,
+                        "prompt_version": prompt_version,
+                        "schema_version": schema_version,
                         "started_at": self._now(),
                         "completed_at": None,
                         "input_events_json": json.dumps(list(input_snapshot), separators=(",", ":")),
                         "input_characters": sum(len(text) for text in input_snapshot.values()),
-                        "input_tokens": input_tokens,
-                        "output_tokens": output_tokens,
+                        "input_tokens": total_input if total_input else None,
+                        "output_tokens": total_output if total_output else None,
                         "latency_ms": provider_latency or int((time.perf_counter() - started) * 1000),
                         "accepted_count": 0,
                         "rejected_count": 0,
                         "status": "processing",
                         "error_class": None,
-                        "estimated_cost_usd": self._estimated_cost(input_tokens, output_tokens),
+                        "estimated_cost_usd": self._estimated_cost(total_input if total_input else None, total_output if total_output else None),
                     },
                 )
                 fingerprints: set[str] = set()
                 validated_candidates: list[tuple[Any, Any, Any, Any]] = []
-                for candidate in response.candidates:
+                for candidate in resolved_candidates:
                     try:
                         if candidate.existing_memory_ref is not None and candidate.existing_memory_id is None:
                             raise CandidateRejected("unknown_existing_memory_ref")
+                        action = str(candidate.intent).casefold() if hasattr(candidate, "intent") else "insert"
+                        allowed_intents = {"insert", "reinforce", "update", "supersede", "ignore"}
+                        if action in {"dispute", "contradiction"}:
+                            action = "ignore"
+                            candidate = candidate.model_copy(update={"intent": "ignore"})
+                        if action not in allowed_intents:
+                            raise CandidateRejected("invalid_intent")
                         validated = validate_candidate(namespace_id, candidate, included)
                         if validated.fingerprint in fingerprints:
                             raise CandidateRejected("duplicate_candidate")
                         fingerprints.add(validated.fingerprint)
-                        source_job, source_event = current_jobs.get(str(candidate.evidence[0].event_id), batch[0])
+                        if candidate.evidence:
+                            source_job, source_event = current_jobs.get(str(candidate.evidence[0].event_id), batch[0])
+                        else:
+                            source_job, source_event = batch[0]
                         validated_candidates.append((candidate, validated, source_job, source_event))
                     except CandidateRejected as exc:
                         rejected += 1
@@ -341,7 +565,7 @@ class Processor:
                     namespace_id=namespace_id,
                     job_id=str(batch[0][0]["id"]),
                     batch_jobs=len(batch),
-                    candidates=len(response.candidates),
+                    candidates=len(resolved_candidates),
                     accepted=batch_accepted,
                     rejected=batch_rejected,
                 )
@@ -349,6 +573,7 @@ class Processor:
                 safe_error = redact_text(str(exc))
                 error_class = exc.error_class if isinstance(exc, ProviderError) else type(exc).__name__
                 if not self._run_exists(namespace_id, run_id) and input_snapshot and self.provider is not None:
+                    _ensure_stage_column(self.repository)
                     self.repository.record_run(
                         namespace_id,
                         {

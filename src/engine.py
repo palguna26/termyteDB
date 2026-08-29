@@ -233,6 +233,10 @@ class TermyteDB:
         return results
 
     def context(self, namespace_id: str, query: str, token_budget: int = 500, limit: int = 10, historical: bool = False) -> ContextResponse:
+        import warnings
+
+        warnings.warn("context() is deprecated; use search()", DeprecationWarning, stacklevel=2)
+        # Phase 5: keep compatibility by delegating to search but preserve old ContextResponse shape
         result = build_context(self.repository, namespace_id, query, limit, token_budget, historical)
         result.request_id = UUID(self.repository.record_context_request(namespace_id, query, token_budget, result))
         log(
@@ -250,6 +254,13 @@ class TermyteDB:
 
     def memories(self, namespace_id: str, limit: int = 100, offset: int = 0) -> list[MemoryResponse]:
         return self.repository.list_memories(namespace_id, limit, offset)
+
+    def update_memory(self, namespace_id: str, memory_id: str, statement: str, confidence: float | None = None, kind: str | None = None, source_event_ids: list[str] | None = None, evidence_excerpt: str | None = None) -> bool:
+        src = source_event_ids[0] if source_event_ids else None
+        return self.repository.update_memory(namespace_id, memory_id, statement, confidence=confidence, kind=kind, source_event_id=src, evidence_excerpt=evidence_excerpt)
+
+    def delete_memory(self, namespace_id: str, memory_id: str) -> bool:
+        return self.repository.delete_memory(namespace_id, memory_id)
 
     def close(self) -> None:
         if not self._closed:

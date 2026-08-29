@@ -52,8 +52,29 @@ MemoryKind = Literal[
     "correction",
     "question",
 ]
-ReconciliationIntent = Literal["insert", "reinforce", "update", "supersede", "dispute", "ignore"]
+ReconciliationIntent = Literal["insert", "reinforce", "update", "supersede", "dispute", "contradiction", "ignore"]
+# Canonical superset used for LLM reconciliation (contradiction is alias for dispute for backwards compat)
+ReconciliationAction = Literal["insert", "reinforce", "update", "supersede", "dispute", "contradiction", "ignore"]
 Durability = Literal["permanent", "session", "task"]
+
+ExtractionStage = Literal[
+    "facts",
+    "preferences",
+    "events",
+    "decisions",
+    "relationships",
+    "reconciliation",
+]
+
+EXTRACTION_STAGES: tuple[ExtractionStage, ...] = (
+    "facts",
+    "preferences",
+    "events",
+    "decisions",
+    "relationships",
+)
+
+RECONCILIATION_STAGE: ExtractionStage = "reconciliation"
 
 
 class TemporalBlock(BaseModel):
@@ -114,7 +135,7 @@ class ExtractionCandidate(BaseModel):
     kind: MemoryKind
     subject: str = Field(min_length=1, max_length=200)
     statement: str = Field(min_length=1, max_length=2000)
-    evidence: list[EvidenceSpan] = Field(min_length=1, max_length=8)
+    evidence: list[EvidenceSpan] = Field(default_factory=list, max_length=8)
     confidence: float = Field(ge=0, le=1)
     importance: float = Field(default=0.5, ge=0, le=1)
     durability: Durability
@@ -125,6 +146,7 @@ class ExtractionCandidate(BaseModel):
     existing_memory_ref: str | None = Field(default=None, pattern=r"^m[0-9]+$")
     timestamp: datetime | None = None
     source_role: Literal["user", "assistant"] = "user"
+    source_stage: ExtractionStage | None = None
 
 
 class ExtractionResponse(BaseModel):
@@ -142,6 +164,43 @@ class ExtractionRequest(BaseModel):
     events: list[UUID] = Field(min_length=1, max_length=1000)
     evidence_text: dict[UUID, str]
     existing_memories: list[dict[str, Any]] = Field(default_factory=list, max_length=20)
+    stage: ExtractionStage = "facts"
+
+
+class ReconciliationDecision(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    candidate_index: int = Field(ge=0)
+    action: ReconciliationAction
+    existing_memory_ref: str | None = Field(default=None, pattern=r"^m[0-9]+$")
+    confidence: float = Field(default=0.99, ge=0, le=1)
+    reason: str = Field(default="", max_length=2000)
+
+
+class ReconciliationRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    namespace_id: str = Field(min_length=1)
+    existing_memories: list[dict[str, Any]] = Field(default_factory=list, max_length=20)
+    new_candidates: list[ExtractionCandidate] = Field(default_factory=list, max_length=50)
+    stage: ExtractionStage = "reconciliation"
+
+
+class ReconciliationResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    schema_version: str = Field(default="reconciliation-v1", pattern=r"^reconciliation-v1$")
+    prompt_version: str = Field(min_length=1, max_length=100)
+    decisions: list[ReconciliationDecision] = Field(default_factory=list, max_length=50)
+
+
+class CandidateReview(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    candidate_id: str = Field(min_length=1)
+    decision: Literal["accepted", "rejected"]
+    reason: str = Field(default="", max_length=2000)
+    stage: ExtractionStage | None = None
 
 
 class ExtractionResult(BaseModel):
@@ -245,7 +304,10 @@ class SearchResult(BaseModel):
     vector_score: float = 0.0
     component_scores: dict[str, float] = Field(default_factory=dict)
     status: str
-    citations: list[EvidenceCitation]
+    citations: list[EvidenceCitation] = Field(default_factory=list)
+    # Simplified provenance — optional per Phase 1
+    source_event_ids: list[UUID] = Field(default_factory=list)
+    evidence_excerpt: str | None = None
 
 
 class ContextRequest(SearchRequest):
@@ -274,8 +336,21 @@ class MemoryResponse(BaseModel):
     current_version_id: UUID
     version: int
     statement: str
-    citations: list[EvidenceCitation]
+    citations: list[EvidenceCitation] = Field(default_factory=list)
     temporal: TemporalBlock | None = None
+    # Simplified provenance and timestamps (Phase 1 / Phase 3)
+    source_event_ids: list[UUID] = Field(default_factory=list)
+    evidence_excerpt: str | None = None
+    created_at: str | None = None
+    updated_at: str | None = None
+
+    @property
+    def id(self) -> UUID:
+        return self.memory_id
+
+    @property
+    def subject(self) -> str:
+        return self.subject_key
 
 
 class StoredJob(BaseModel):

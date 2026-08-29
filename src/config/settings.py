@@ -40,11 +40,18 @@ class ExtractionSettings:
 
     prompt_version: str = "v1"
     schema_version: str = "extraction-v1"
-    temperature: float = 0.0
+    temperature: float = float(os.environ.get("TERMYTEDB_EXTRACTION_TEMPERATURE", "0") or 0)
     max_tokens: int = 2500
     summary_max_tokens: int = 220
     request_timeout: float = 30.0
     summary_timeout: float = 45.0
+    # Phase 8 provider controls
+    stages: tuple[str, ...] = tuple(os.environ.get("TERMYTEDB_EXTRACTION_STAGES", "facts").split(",")) if os.environ.get("TERMYTEDB_EXTRACTION_STAGES") else ("facts",)
+    reconciliation_enabled: bool = os.environ.get("TERMYTEDB_RECONCILIATION_ENABLED", "1").strip().lower() not in {"0", "false", "no", "off"}
+    summary_enabled: bool = os.environ.get("TERMYTEDB_SUMMARY_ENABLED", "1").strip().lower() not in {"0", "false", "no", "off"}
+    max_llm_calls_per_batch: int = int(os.environ.get("TERMYTEDB_MAX_LLM_CALLS_PER_BATCH", "10") or 10)
+    reconciliation_model: str = os.environ.get("TERMYTEDB_RECONCILIATION_MODEL", os.environ.get("TERMYTEDB_EXTRACTION_MODEL", "") or "")
+    reconciliation_temperature: float = float(os.environ.get("TERMYTEDB_RECONCILIATION_TEMPERATURE", os.environ.get("TERMYTEDB_EXTRACTION_TEMPERATURE", "0") or 0) or 0)
 
 
 @dataclass(frozen=True)
