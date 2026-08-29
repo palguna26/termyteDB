@@ -1,6 +1,6 @@
 # TermyteDB
 
-TermyteDB is an embedded memory engine for AI agents. It stores conversation events in SQLite, extracts durable memories with evidence, reconciles updates, and retrieves bounded context.
+TermyteDB is an embedded memory engine for AI agents. It stores conversation events in SQLite, extracts durable memories with evidence, reconciles updates, and retrieves relevant memories via search. TermyteDB returns memories — the caller decides how those memories become model context.
 
 ## Install
 
@@ -21,7 +21,11 @@ db.ingest({
     "type": "decision",
     "payload": {"text": "Decision: use SQLite."},
 })
-print(db.context("demo", "database choice").text)
+results = db.search("demo", "database choice", limit=5)
+
+for memory in results:
+    print(memory.statement)
+
 db.close()
 ```
 

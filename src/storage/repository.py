@@ -566,35 +566,30 @@ class Repository:
         return window
 
     def record_context_request(self, namespace_id: str, query: str, token_budget: int, response: Any) -> str:
-        request_id = str(uuid.uuid4())
-        with self.db.lock, self.db.connection:
-            self.db.execute(
-                """INSERT INTO context_requests
-                (id, namespace_id, query, token_budget, selected_json, token_count, abstained, diagnostics_json, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (
-                    request_id,
-                    namespace_id,
-                    query,
-                    token_budget,
-                    json.dumps([str(item.memory_version_id) for item in response.results], separators=(",", ":")),
-                    response.token_count,
-                    int(response.abstained),
-                    json.dumps(response.diagnostics, sort_keys=True, separators=(",", ":")),
-                    iso(),
-                ),
-            )
-        return request_id
+        import warnings
+
+        warnings.warn("record_context_request is deprecated; context_requests are no longer recorded", DeprecationWarning, stacklevel=2)
+        # No longer creates new rows — table retained only for reading legacy databases.
+        return str(uuid.uuid4())
 
     def list_context_requests(self, namespace_id: str, limit: int = 100, offset: int = 0) -> list[dict[str, Any]]:
+        import warnings
+
+        warnings.warn("list_context_requests is deprecated; context_requests table is retained for legacy reads only", DeprecationWarning, stacklevel=2)
         rows = self.db.execute(
             "SELECT * FROM context_requests WHERE namespace_id=? ORDER BY created_at, id LIMIT ? OFFSET ?", (namespace_id, limit, offset)
         ).fetchall()
         result = []
         for row in rows:
             item = dict(row)
-            item["selected_json"] = json.loads(item["selected_json"])
-            item["diagnostics_json"] = json.loads(item["diagnostics_json"])
+            try:
+                item["selected_json"] = json.loads(item["selected_json"])
+            except Exception:
+                pass
+            try:
+                item["diagnostics_json"] = json.loads(item["diagnostics_json"])
+            except Exception:
+                pass
             result.append(item)
         return result
 
@@ -1278,7 +1273,6 @@ class Repository:
         # Hybrid retrieval is now strictly FTS + Vector + Temporal recency.
         # Graph/episode signals are gated behind explicit extension flag and
         # no longer fetched in hot path. See `record_graph_links` for opt-in.
-        lowered_terms = [term.casefold() for term in terms]
         query_years = [int(value) for value in re.findall(r"\b(?:19|20)\d{2}\b", query)]
 
         def score_row(row: sqlite3.Row) -> float:

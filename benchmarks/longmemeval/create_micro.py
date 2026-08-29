@@ -6,7 +6,6 @@ import json
 import random
 from pathlib import Path
 
-
 ROOT = Path(__file__).resolve().parents[2]
 SOURCE = ROOT / "benchmarks" / "longmemeval" / "longmemeval_s_cleaned.json"
 OUTPUT = ROOT / "benchmarks" / "longmemeval" / "longmemeval_micro.json"

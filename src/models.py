@@ -310,21 +310,6 @@ class SearchResult(BaseModel):
     evidence_excerpt: str | None = None
 
 
-class ContextRequest(SearchRequest):
-    token_budget: int = Field(default=500, ge=1, le=10000)
-
-
-class ContextResponse(BaseModel):
-    request_id: UUID | None = None
-    namespace_id: str
-    query: str
-    abstained: bool
-    token_count: int
-    text: str
-    results: list[SearchResult]
-    diagnostics: dict[str, Any] = Field(default_factory=dict)
-
-
 class MemoryResponse(BaseModel):
     memory_id: UUID
     namespace_id: str

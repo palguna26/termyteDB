@@ -56,7 +56,7 @@ class ExtractionSettings:
 
 @dataclass(frozen=True)
 class RetrievalSettings:
-    """Hybrid search + rerank + context packing."""
+    """Hybrid search + rerank."""
 
     rrf_k: int = 60
     lexical_overfetch: int = 5  # multiplier for FTS candidate pool (limit * 5)
@@ -64,8 +64,6 @@ class RetrievalSettings:
     vector_score_floor: float = 0.6
     reranker_threshold: float = 0.25
     reranker_model: str = "ms-marco-MiniLM-L-12-v2"
-    context_score_floor: float = 0.05
-    default_token_budget: int = 500
     default_search_limit: int = 10
 
 

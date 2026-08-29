@@ -27,5 +27,5 @@ def test_search_and_context_cannot_leak_between_namespaces(db):
     db.process("n1")
     db.process("n2")
     assert all("PostgreSQL" not in result.statement for result in db.search("n1", "PostgreSQL"))
-    context = db.context("n1", "PostgreSQL")
-    assert "PostgreSQL" not in context.text
+    # Search is the only retrieval path — verify namespace isolation via search as well
+    assert db.search("n1", "PostgreSQL") == [] or all("PostgreSQL" not in r.statement for r in db.search("n1", "PostgreSQL"))

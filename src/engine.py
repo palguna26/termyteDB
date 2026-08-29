@@ -13,14 +13,12 @@ from .memory.processor import Processor
 from .memory.provider import ExtractionProvider, SessionSummaryProvider
 from .models import (
     BatchEventResponse,
-    ContextResponse,
     EventInput,
     EventReceipt,
     MemoryResponse,
     ProcessResponse,
     SearchResult,
 )
-from .retrieval.context import build_context
 from .retrieval.embedding import EmbeddingProvider
 from .storage.db import Database
 from .storage.repository import Repository
@@ -29,12 +27,13 @@ from .storage.repository import Repository
 class TermyteDB:
     """Embedded memory engine - simple facade over EventStore + MemoryStore + HybridRetriever.
 
-    Core spec (5 methods you need to review):
+    Core API:
       ingest / ingest_batch  - add events -> memories with temporal block
-      search / context       - hybrid FTS+Vector fetch top-N then rerank to top-K
-      invalidate/forget/restore - update/remove memories
-      get_memory/memories    - read with temporal {valid_from, valid_until}
+      search                 - hybrid FTS+Vector fetch top-N then rerank to top-K (namespace-filtered, rank-fused, optional rerank; returns memories directly)
+      get_memory / memories  - read with temporal {valid_from, valid_until}
+      update / invalidate / forget / restore - manage memory lifecycle
     Everything below `--- Extended / Debug ---` is backward-compat for tests/benchmarks.
+    TermyteDB returns memories. The caller decides how those memories become model context.
     """
 
     MAX_EVENT_BYTES = 1_048_576
@@ -157,9 +156,6 @@ class TermyteDB:
     def jobs(self, namespace_id: str, limit: int = 100, offset: int = 0) -> list[dict[str, Any]]:
         return self.repository.list_jobs(namespace_id, limit, offset)
 
-    def context_requests(self, namespace_id: str, limit: int = 100, offset: int = 0) -> list[dict[str, Any]]:
-        return self.repository.list_context_requests(namespace_id, limit, offset)
-
     def extraction_runs(self, namespace_id: str, limit: int = 100, offset: int = 0) -> list[dict[str, Any]]:
         return self.repository.list_extraction_runs(namespace_id, limit, offset)
 
@@ -231,23 +227,6 @@ class TermyteDB:
             result_count=len(results),
         )
         return results
-
-    def context(self, namespace_id: str, query: str, token_budget: int = 500, limit: int = 10, historical: bool = False) -> ContextResponse:
-        import warnings
-
-        warnings.warn("context() is deprecated; use search()", DeprecationWarning, stacklevel=2)
-        # Phase 5: keep compatibility by delegating to search but preserve old ContextResponse shape
-        result = build_context(self.repository, namespace_id, query, limit, token_budget, historical)
-        result.request_id = UUID(self.repository.record_context_request(namespace_id, query, token_budget, result))
-        log(
-            self.logger,
-            logging.INFO,
-            "context.completed",
-            namespace_id=namespace_id,
-            result_count=len(result.results),
-            abstained=result.abstained,
-        )
-        return result
 
     def get_memory(self, namespace_id: str, memory_id: str) -> MemoryResponse | None:
         return self.repository.get_memory(namespace_id, memory_id)

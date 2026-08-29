@@ -4,15 +4,15 @@ Canonical harness supporting two distinct benchmark pipelines:
 
 * retrieval-only (``retrieval`` / ``retrieval-only``) — lossless episodic retrieval
   isolation benchmark: verbatim turn-level atoms -> FTS5 + dense hybrid (RRF) ->
-  FlashRank rerank -> session aggregation -> bounded context packing. This is the
+  FlashRank rerank -> session aggregation -> retrieval metrics. This is the
   existing upper-bound benchmark; it shortcuts memory formation and measures
   indexing + retrieval only.
 
 * end-to-end (``end-to-end``) — true production memory pipeline:
   LongMemEval conversation/session history -> direct EventInput ingestion ->
   extraction (OpenRouter / fake / HTTP) -> evidence validation
-  -> reconciliation/versioning -> embeddings/indexing -> hybrid retrieval ->
-  context packing -> retrieval metrics.
+  -> reconciliation/versioning -> embeddings/indexing -> hybrid retrieval
+  -> session aggregation -> retrieval metrics.
 
   No ground-truth question, answer, answer aliases, relevance annotations,
   evidence identifiers, or category hints leak into memory formation.
@@ -55,7 +55,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
 from src.retrieval.embedding import FastEmbedProvider  # noqa: E402
-from src.retrieval.retrieval import AtomHit, dense_search_atoms, pack_context, search_atoms  # noqa: E402
+from src.retrieval.retrieval import AtomHit, dense_search_atoms, search_atoms  # noqa: E402
 from src.storage.db import Database  # noqa: E402
 
 DEFAULT_DATA_PATH = ROOT / "benchmarks" / "longmemeval" / "longmemeval_s_cleaned.json"
@@ -521,6 +521,7 @@ def resolve_work_dir(args: argparse.Namespace, previous: dict[str, Any] | None, 
 
 
 def _run_manifest(args: argparse.Namespace, data_path: Path, dataset_sha256: str, canonical_mode: str) -> dict[str, Any]:
+    retrieval_limit = int(getattr(args, "retrieval_limit", None) or getattr(args, "pack_atoms", 40))
     return {
         "mode": canonical_mode,
         "dataset_path": str(data_path),
@@ -534,8 +535,7 @@ def _run_manifest(args: argparse.Namespace, data_path: Path, dataset_sha256: str
         "no_dense": bool(getattr(args, "no_dense", False)),
         "no_rerank": bool(getattr(args, "no_rerank", False)),
         "recall_k": int(getattr(args, "recall_k", 15)),
-        "token_budget": int(getattr(args, "token_budget", 1500)),
-        "pack_atoms": int(getattr(args, "pack_atoms", 40)),
+        "retrieval_limit": retrieval_limit,
         "abstain_threshold": float(getattr(args, "abstain_threshold", 0.25)),
     }
 
@@ -691,12 +691,9 @@ def retrieve_e2e_session_ranking(database_path: Path, sample: Sample, args: argp
                 seen.add(primary_session)
                 session_order.append(primary_session)
 
-        # If no citations sessions, we can't map; treat as missed
-        packed_text = ""
-        if not abstained:
-            # Use context building for token budget reporting
-            ctx = engine.context(ns, sample.question, token_budget=args.token_budget, limit=args.pack_atoms)
-            packed_text = ctx.text
+        # Retrieval quality: use search results directly (no token budget / prompt wrappers)
+        retrieval_limit = int(getattr(args, "retrieval_limit", None) or getattr(args, "pack_atoms", 40))
+        packed_text = "" if abstained else "\n".join(hit.statement for hit in ranked[:retrieval_limit])
 
         # If single_db, session_order already isolated via namespace
         oracle = {str(v).strip() for v in sample.answer_session_ids}
@@ -777,7 +774,8 @@ def retrieve_session_ranking(database_path: Path, sample: Sample, args: argparse
             if hit.session_id not in seen:
                 seen.add(hit.session_id)
                 session_order.append(str(hit.session_id))
-        packed = "" if abstained else pack_context(ranked[: args.pack_atoms], token_budget=args.token_budget)
+        retrieval_limit = int(getattr(args, "retrieval_limit", None) or getattr(args, "pack_atoms", 40))
+        packed = "" if abstained else "\n".join(hit.fact for hit in ranked[:retrieval_limit])
         oracle = {str(value).strip() for value in sample.answer_session_ids}
         best_rank: int | None = None
         for position, session_id in enumerate(session_order[: args.recall_k], 1):
@@ -945,11 +943,11 @@ def evaluate_sample_e2e(args: argparse.Namespace, sample: Sample, budget: OpenRo
     elif retrieval_missed:
         failure_reason = "memory_existed_retrieval_missed"
     else:
-        # Check token budget / ranking miss
+        # Check ranking miss (no token-budget after context removal)
         if retrieval_outcome.get("abstained"):
             failure_reason = "abstained"
         else:
-            failure_reason = "context_budget_or_ranking_miss"
+            failure_reason = "ranking_miss"
 
     # Build oracle session texts for failure analysis (without leaking into extraction)
     oracle_texts = []
@@ -1025,7 +1023,7 @@ def summarize(traces: list[dict[str, Any]], recall_k: int, judged: bool) -> list
             row[f"Recall@{k} (%)"] = round(100 * sum(item["recall"][k] for item in items) / count, 1) if count else None
         row[f"MRR@{recall_k}"] = round(sum((1 / item["best_rank"]) if item["best_rank"] else 0.0 for item in items) / count, 3) if count else None
         row[f"NDCG@{recall_k}"] = round(sum(item["ndcg_at_k"] for item in items) / count, 3) if count else None
-        row["Avg Context Tokens"] = round(sum(item["packed_words"] for item in items) / count, 1) if count else None
+        row["Avg Retrieved Words"] = round(sum(item["packed_words"] for item in items) / count, 1) if count else None
         row["Avg Latency (ms)"] = round(sum(item["retrieval_latency_ms"] for item in items) / count, 1) if count else None
         # End-to-end diagnostics averages where present
         if any("e2e_diagnostics" in it for it in items):
@@ -1230,10 +1228,9 @@ def run(args: argparse.Namespace) -> int:
             "reranker": "ms-marco-MiniLM-L-12-v2" if not args.no_rerank else None,
             "dense_enabled": not args.no_dense,
             "workers": args.workers,
-            "token_budget": args.token_budget,
+            "retrieval_limit": int(getattr(args, "retrieval_limit", None) or getattr(args, "pack_atoms", 40)),
             "top_k_values": [5, 10, args.recall_k],
             "recall_k": args.recall_k,
-            "pack_atoms": args.pack_atoms,
             "abstain_threshold": args.abstain_threshold,
         },
     }
@@ -1275,8 +1272,8 @@ def main() -> int:
     parser.add_argument("--task", choices=CATEGORY_ORDER, help="filter to single question_type")
     parser.add_argument("--workers", type=int, default=1)
     parser.add_argument("--recall-k", type=int, default=15)
-    parser.add_argument("--token-budget", type=int, default=1500)
-    parser.add_argument("--pack-atoms", type=int, default=40, help="max atoms/memories to pack into context")
+    parser.add_argument("--retrieval-limit", type=int, default=40, help="max memories/atoms to retrieve per query (replaces --pack-atoms)")
+    parser.add_argument("--pack-atoms", type=int, default=None, help="deprecated alias for --retrieval-limit")
     parser.add_argument("--abstain-threshold", type=float, default=0.25)
     parser.add_argument("--no-rerank", action="store_true")
     parser.add_argument("--no-dense", action="store_true")
@@ -1300,6 +1297,15 @@ def main() -> int:
     parser.add_argument("--openrouter-max-retries", type=int, default=5, help="maximum attempts for retryable OpenRouter extraction failures")
     parser.add_argument("--openrouter-rate-limit-cooldown", type=float, default=60.0, help="seconds to wait after an OpenRouter HTTP 429")
     args = parser.parse_args()
+    # Deprecated alias handling: --pack-atoms -> --retrieval-limit
+    if getattr(args, "pack_atoms", None) is not None:
+        import warnings
+
+        warnings.warn("--pack-atoms is deprecated; use --retrieval-limit", DeprecationWarning, stacklevel=2)
+        if getattr(args, "retrieval_limit", 40) == 40:  # only override if retrieval_limit is default
+            args.retrieval_limit = args.pack_atoms
+    elif getattr(args, "pack_atoms", None) is None:
+        args.pack_atoms = getattr(args, "retrieval_limit", 40)
     return run(args)
 
 

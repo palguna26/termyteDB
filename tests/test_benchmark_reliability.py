@@ -88,7 +88,7 @@ def test_failed_only_scores_are_unavailable():
             "Recall@15 (%)": None,
             "MRR@15": None,
             "NDCG@15": None,
-            "Avg Context Tokens": None,
+            "Avg Retrieved Words": None,
             "Avg Latency (ms)": None,
         }
     ]

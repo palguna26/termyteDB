@@ -202,7 +202,6 @@ class MemoryStore:
         current = self.db.execute(
             "SELECT * FROM memory_versions WHERE memory_id=? AND namespace_id=? ORDER BY version DESC LIMIT 1", (memory_id, namespace_id)
         ).fetchone()
-        previous_version_id = str(current["id"]) if current else None
         if current and current["statement"] == item.statement and current["status"] == "active":
             for span in item.evidence:
                 self.db.execute(
