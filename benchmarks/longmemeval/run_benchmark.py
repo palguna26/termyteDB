@@ -520,8 +520,15 @@ def resolve_work_dir(args: argparse.Namespace, previous: dict[str, Any] | None, 
     return base / run_id
 
 
+def _get_retrieval_limit(args: argparse.Namespace) -> int:
+    value = getattr(args, "retrieval_limit", None)
+    if value is None:
+        value = getattr(args, "pack_atoms", 40)
+    return int(value)
+
+
 def _run_manifest(args: argparse.Namespace, data_path: Path, dataset_sha256: str, canonical_mode: str) -> dict[str, Any]:
-    retrieval_limit = int(getattr(args, "retrieval_limit", None) or getattr(args, "pack_atoms", 40))
+    retrieval_limit = _get_retrieval_limit(args)
     return {
         "mode": canonical_mode,
         "dataset_path": str(data_path),
@@ -538,6 +545,36 @@ def _run_manifest(args: argparse.Namespace, data_path: Path, dataset_sha256: str
         "retrieval_limit": retrieval_limit,
         "abstain_threshold": float(getattr(args, "abstain_threshold", 0.25)),
     }
+
+
+def _normalize_manifest_for_comparison(manifest: dict[str, Any]) -> dict[str, Any]:
+    """Normalize legacy benchmark manifests for resume compatibility.
+
+    Pre-refactor manifests used `pack_atoms` and `token_budget`; post-refactor
+    uses `retrieval_limit` and drops `token_budget` (search no longer has token
+    budgets). For resume we treat `pack_atoms == retrieval_limit` and ignore
+    `token_budget` so existing work dirs remain resumable.
+    """
+    normalized = dict(manifest)
+    # Migrate pack_atoms -> retrieval_limit. If both exist, the canonical key wins.
+    if "retrieval_limit" not in normalized:
+        if "pack_atoms" in normalized:
+            try:
+                normalized["retrieval_limit"] = int(normalized["pack_atoms"])
+            except Exception:
+                normalized["retrieval_limit"] = 40
+        else:
+            normalized["retrieval_limit"] = 40
+    else:
+        try:
+            normalized["retrieval_limit"] = int(normalized["retrieval_limit"])
+        except (TypeError, ValueError):
+            normalized["retrieval_limit"] = 40
+    # token_budget is obsolete — do not affect run identity
+    normalized.pop("token_budget", None)
+    # pack_atoms is now an alias; remove legacy key for canonical comparison
+    normalized.pop("pack_atoms", None)
+    return normalized
 
 
 def ingest_e2e(work_dir: Path, sample: Sample, args: argparse.Namespace) -> tuple[Path, dict[str, Any]]:
@@ -692,7 +729,7 @@ def retrieve_e2e_session_ranking(database_path: Path, sample: Sample, args: argp
                 session_order.append(primary_session)
 
         # Retrieval quality: use search results directly (no token budget / prompt wrappers)
-        retrieval_limit = int(getattr(args, "retrieval_limit", None) or getattr(args, "pack_atoms", 40))
+        retrieval_limit = _get_retrieval_limit(args)
         packed_text = "" if abstained else "\n".join(hit.statement for hit in ranked[:retrieval_limit])
 
         # If single_db, session_order already isolated via namespace
@@ -774,7 +811,7 @@ def retrieve_session_ranking(database_path: Path, sample: Sample, args: argparse
             if hit.session_id not in seen:
                 seen.add(hit.session_id)
                 session_order.append(str(hit.session_id))
-        retrieval_limit = int(getattr(args, "retrieval_limit", None) or getattr(args, "pack_atoms", 40))
+        retrieval_limit = _get_retrieval_limit(args)
         packed = "" if abstained else "\n".join(hit.fact for hit in ranked[:retrieval_limit])
         oracle = {str(value).strip() for value in sample.answer_session_ids}
         best_rank: int | None = None
@@ -1144,10 +1181,11 @@ def run(args: argparse.Namespace) -> int:
     manifest_path = _run_manifest_path(work_dir)
     if manifest_path.exists():
         previous_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        if previous_manifest != manifest:
+        if _normalize_manifest_for_comparison(previous_manifest) != _normalize_manifest_for_comparison(manifest):
             raise SystemExit(
                 f"work dir {work_dir} already has a different LongMemEval run manifest; use a fresh work dir or pass --resume-from for the same run"
             )
+    # Write canonical manifest (migrates legacy work dirs: pack_atoms/token_budget -> retrieval_limit)
     manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8")
 
     traces: list[dict[str, Any]] = list(previous_traces)
@@ -1228,7 +1266,7 @@ def run(args: argparse.Namespace) -> int:
             "reranker": "ms-marco-MiniLM-L-12-v2" if not args.no_rerank else None,
             "dense_enabled": not args.no_dense,
             "workers": args.workers,
-            "retrieval_limit": int(getattr(args, "retrieval_limit", None) or getattr(args, "pack_atoms", 40)),
+            "retrieval_limit": _get_retrieval_limit(args),
             "top_k_values": [5, 10, args.recall_k],
             "recall_k": args.recall_k,
             "abstain_threshold": args.abstain_threshold,

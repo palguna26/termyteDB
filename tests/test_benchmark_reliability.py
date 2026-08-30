@@ -111,3 +111,37 @@ def test_resume_reuses_recorded_work_directory(tmp_path):
     args = SimpleNamespace(work_dir=str(tmp_path))
 
     assert run_benchmark.resolve_work_dir(args, {"config": {"work_dir": str(prior)}}, is_e2e=True) == prior
+
+
+def test_normalize_legacy_manifest_equals_new_manifest():
+    legacy = {"mode": "retrieval", "pack_atoms": 40, "token_budget": 1500, "dataset_sha256": "abc"}
+    current = {"mode": "retrieval", "retrieval_limit": 40, "dataset_sha256": "abc"}
+
+    assert run_benchmark._normalize_manifest_for_comparison(legacy) == run_benchmark._normalize_manifest_for_comparison(current)
+
+
+def test_normalize_legacy_custom_limit_mismatch():
+    legacy = {"pack_atoms": 20}
+    current = {"retrieval_limit": 40}
+
+    assert run_benchmark._normalize_manifest_for_comparison(legacy) != run_benchmark._normalize_manifest_for_comparison(current)
+
+
+def test_normalize_ignores_obsolete_token_budget():
+    assert run_benchmark._normalize_manifest_for_comparison({"retrieval_limit": 40, "token_budget": 1}) == run_benchmark._normalize_manifest_for_comparison({"retrieval_limit": 40, "token_budget": 9999})
+
+
+def test_normalize_prefers_canonical_limit_when_both_keys_exist():
+    canonical = {"retrieval_limit": 30}
+
+    assert run_benchmark._normalize_manifest_for_comparison({"retrieval_limit": 30, "pack_atoms": 20}) == run_benchmark._normalize_manifest_for_comparison(canonical)
+
+
+def test_normalize_defaults_missing_limit_to_40():
+    assert run_benchmark._normalize_manifest_for_comparison({"dataset_sha256": "x"})["retrieval_limit"] == 40
+
+
+def test_normalize_invalid_and_string_limits():
+    assert run_benchmark._normalize_manifest_for_comparison({"pack_atoms": "bad"})["retrieval_limit"] == 40
+    assert run_benchmark._normalize_manifest_for_comparison({"pack_atoms": "40"})["retrieval_limit"] == 40
+    assert run_benchmark._normalize_manifest_for_comparison({"retrieval_limit": "40"})["retrieval_limit"] == 40
