@@ -45,8 +45,8 @@ db = TermyteDB(
         api_key=os.environ["OPENROUTER_API_KEY"],
     ),
 )
-# Optional: enable multi-stage extraction (facts, preferences, events, decisions, relationships)
-# os.environ["TERMYTEDB_EXTRACTION_STAGES"] = "all"
+# Extraction uses one Mem0-style LLM call per batch and returns a small
+# {"memory": ["..."]} list. Optional LLM reconciliation is off by default.
 # os.environ["TERMYTEDB_RECONCILIATION_ENABLED"] = "1"
 db.ingest({
     "namespace_id": "demo",

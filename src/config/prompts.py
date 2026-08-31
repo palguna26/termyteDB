@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import re
 
-from ..models import ExtractionRequest, ExtractionResponse, ReconciliationRequest, ReconciliationResponse
+from ..models import ExtractionRequest, ExtractionResponse, ReconciliationRequest, ReconciliationResponse, SimpleExtractionResponse
 
 # ---------------------------------------------------------------------------
 # Extraction prompts - versioned v2 per stage
@@ -209,35 +209,17 @@ def _build_stage_prompt(stage: str, request: ExtractionRequest) -> str:
 
 
 def build_extraction_prompt(request: ExtractionRequest) -> str:
-    """Build a clearly delimited prompt for a future provider; delimiters are not a security boundary.
-
-    Inspired by mem0/graphiti separation of concerns: the model is asked to
-    focus first on claim extraction + evidence grounding, then lightweight
-    normalization (subject, intent, durability). Existing memories are
-    comparison context only, not instructions.
-    """
-    stage = getattr(request, "stage", "facts") or "facts"
-    if stage in STAGE_DEFINITIONS and stage != "reconciliation":
-        return _build_stage_prompt(stage, request)
-    # Fallback for legacy or reconciliation (uses facts template plus stage hint)
+    """Build one simple, one-call extraction request."""
     evidence = "\n".join(f"<event id='{event_id}'>\n{value}\n</event>" for event_id, value in request.evidence_text.items())
-    existing = "\n".join(
-        f"<memory ref='{item.get('ref', '')}' kind='{item.get('kind', '')}' status='{item.get('status', '')}'>\n{item.get('statement', '')}\n</memory>"
-        for item in request.existing_memories
-    )
-    comparison = (
-        "\n<existing_memories>\n" + existing + "\n</existing_memories>\n" + EXISTING_MEMORIES_INSTRUCTION
-        if existing
-        else NO_EXISTING_MEMORIES_HINT
-    )
     return (
-        EXTRACTION_TASK_HEADER
-        + f"Return ONLY valid JSON matching this exact schema, no preamble: {EXTRACTION_SCHEMA_EXAMPLE}\n"
-        + EXTRACTION_TASK_RULES
-        + "<evidence>\n"
+        "Extract useful long-term memories from this conversation. "
+        "Include facts, preferences, decisions, events, relationships, and updates that can help later. "
+        "Do not include small talk, questions, or temporary details. "
+        "Return only JSON in this exact form: {\"memory\":[\"short standalone memory\"]}. "
+        "Use an empty list when there is nothing worth remembering.\n\n"
+        + "<conversation>\n"
         + evidence
-        + "\n</evidence>"
-        + comparison
+        + "\n</conversation>"
     )
 
 
@@ -319,13 +301,13 @@ def clean_json_response(value: str) -> str:
 
 
 def extraction_response_format() -> dict[str, object]:
-    """Build the strict provider schema from the canonical Pydantic contract."""
+    """Build the small Mem0-style schema used for one-call extraction."""
     return {
         "type": "json_schema",
         "json_schema": {
-            "name": "extraction_v1",
+            "name": "memory_list_v1",
             "strict": True,
-            "schema": ExtractionResponse.model_json_schema(),
+            "schema": SimpleExtractionResponse.model_json_schema(),
         },
     }
 

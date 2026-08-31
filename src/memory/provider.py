@@ -32,10 +32,12 @@ from ..config.prompts import (
 # Re-export for backward compatibility: existing imports `from memory.provider
 # import build_extraction_prompt` continue to work while config is source of truth.
 from ..models import (
+    ExtractionCandidate,
     ExtractionRequest,
     ExtractionResponse,
     ReconciliationRequest,
     ReconciliationResponse,
+    SimpleExtractionResponse,
 )
 
 
@@ -97,7 +99,8 @@ def _retry_sleep(attempt: int, retry_after: float | None) -> float:
 def _get_retry_budget() -> int:
     raw = os.environ.get("TERMYTEDB_EXTRACTION_RETRIES")
     if raw is None:
-        return 3
+        # One retry keeps ingestion resilient without multiplying benchmark cost.
+        return 1
     try:
         return max(0, min(6, int(raw.strip())))
     except ValueError:
@@ -143,6 +146,49 @@ def extraction_response_format() -> dict[str, object]:
 def build_extraction_prompt(request: ExtractionRequest) -> str:
     """Backward-compat wrapper - canonical implementation lives in `config.prompts`."""
     return _build_extraction_prompt(request)
+
+
+def _simple_subject(statement: str) -> str:
+    words = [word.strip(".,:;!?()[]{}\"'").casefold() for word in statement.split()]
+    words = [word for word in words if word]
+    return " ".join(words[:6]) or "memory"
+
+
+def _simple_response_to_extraction(value: Any) -> ExtractionResponse:
+    """Convert the tiny LLM response into the existing storage contract.
+
+    Source event links are assigned by the processor.  We intentionally do not
+    ask the LLM to fabricate IDs, offsets, excerpts, or database actions.
+    """
+    if isinstance(value, dict) and value.get("schema_version") == "extraction-v1":
+        return ExtractionResponse.model_validate(value)
+    simple = SimpleExtractionResponse.model_validate(value)
+    candidates = []
+    seen: set[str] = set()
+    for raw in simple.memory:
+        statement = " ".join(str(raw).strip().split())
+        key = statement.casefold()
+        if len(statement) < 3 or key in seen:
+            continue
+        seen.add(key)
+        candidates.append(
+            ExtractionCandidate(
+                kind="fact",
+                subject=_simple_subject(statement),
+                statement=statement,
+                evidence=[],
+                confidence=0.9,
+                importance=0.5,
+                durability="permanent",
+                intent="insert",
+                source_role="user",
+            )
+        )
+    return ExtractionResponse(schema_version="extraction-v1", prompt_version="simple-v1", candidates=candidates)
+
+
+def _empty_extraction_response() -> ExtractionResponse:
+    return ExtractionResponse(schema_version="extraction-v1", prompt_version="simple-v1", candidates=[])
 
 
 def configured_extraction_provider() -> ExtractionProvider | None:
@@ -442,7 +488,7 @@ class HttpExtractionProvider:
             payload = json.loads(raw)
             if isinstance(payload, dict) and isinstance(payload.get("output"), str):
                 payload = json.loads(payload["output"])
-            parsed = ExtractionResponse.model_validate(payload)
+            parsed = _simple_response_to_extraction(payload)
         except (UnicodeError, json.JSONDecodeError, TypeError, ValueError) as exc:
             raise ProviderError("provider returned invalid extraction-v1 JSON", retryable=False, error_class="invalid_output") from exc
         return ProviderResult(
@@ -540,7 +586,7 @@ class OpenRouterExtractionProvider:
         body = {
             "model": self.model,
             "messages": [
-                {"role": "system", "content": "Return only valid JSON matching the supplied extraction-v1 schema."},
+                {"role": "system", "content": "Return only valid JSON matching the supplied memory-list schema."},
                 {"role": "user", "content": prompt},
             ],
             "temperature": temperature,
@@ -552,6 +598,7 @@ class OpenRouterExtractionProvider:
         max_retries = _get_retry_budget()
         payload: dict[str, Any] | None = None
         raw_bytes: bytes | None = None
+        parsed: ExtractionResponse | None = None
         last_exc: Exception | None = None
         for attempt in range(max_retries + 1):
             elapsed = time.perf_counter() - started
@@ -575,7 +622,25 @@ class OpenRouterExtractionProvider:
                 raise last_exc if last_exc else ProviderError("extraction timeout", retryable=True, error_class="timeout")  # type: ignore[misc]
             try:
                 payload, raw_bytes = _openrouter_chat(self.base_url, self.api_key, body, title=f"TermyteDB Memory Extraction {stage}", timeout=call_timeout)
+                choice = _message_text(payload, text_parts_only=True)
+                if not choice.strip():
+                    raise ValueError("empty extraction content")
+                parsed = _simple_response_to_extraction(json.loads(clean_json_response(choice)))
                 break
+            except (UnicodeError, json.JSONDecodeError, KeyError, IndexError, TypeError, ValueError) as exc:
+                # A completed request with unusable model output is not an
+                # ingestion failure. Retry it once, then preserve the events
+                # and record an empty extraction, just as Mem0 does.
+                last_exc = ProviderError("OpenRouter returned unusable extraction content", retryable=True, error_class="invalid_output")
+                if attempt >= max_retries:
+                    parsed = _empty_extraction_response()
+                    break
+                sleep_s = _retry_sleep(attempt, None)
+                if sleep_s > timeout_seconds - (time.perf_counter() - started):
+                    parsed = _empty_extraction_response()
+                    break
+                _cancellable_sleep(sleep_s, cancellation, started, timeout_seconds)
+                continue
             except HTTPError as exc:
                 detail = ""
                 try:
@@ -614,15 +679,8 @@ class OpenRouterExtractionProvider:
             raise last_exc  # type: ignore[misc]
         if cancellation and cancellation():
             raise ProviderError("extraction cancelled", retryable=True, error_class="cancelled")
-        try:
-            choice = _message_text(payload, text_parts_only=True)
-            if not choice.strip():
-                raise ProviderError("OpenRouter returned empty extraction content", retryable=True, error_class="empty_output")
-            parsed = ExtractionResponse.model_validate(json.loads(clean_json_response(choice)))
-        except ProviderError:
-            raise
-        except (UnicodeError, json.JSONDecodeError, KeyError, IndexError, TypeError, ValueError) as exc:
-            raise ProviderError("OpenRouter returned invalid extraction-v1 JSON", retryable=False, error_class="invalid_output") from exc
+        if parsed is None:
+            parsed = _empty_extraction_response()
         actual_model = str(payload.get("model", self.model))
         usage = payload.get("usage") or {}
         return ProviderResult(

@@ -11,7 +11,7 @@ from uuid import UUID
 
 from ..core.logging import log
 from ..core.redaction import redact_text
-from ..models import EXTRACTION_STAGES, ExtractionRequest, ReconciliationRequest
+from ..models import ExtractionRequest, ReconciliationRequest
 from ..storage.repository import Repository
 from .extraction import CandidateRejected, validate_candidate
 from .extractor import payload_text
@@ -19,22 +19,15 @@ from .provider import ExtractionProvider, ProviderError, SessionSummaryProvider,
 
 
 def _get_extraction_stages() -> list[str]:
-    raw = os.environ.get("TERMYTEDB_EXTRACTION_STAGES")
-    if raw is None or raw.strip() == "":
-        # Production default is single-stage (facts) to avoid 5× LLM cost.
-        # Opt-in to multi-stage via TERMYTEDB_EXTRACTION_STAGES=all or comma list.
-        return ["facts"]
-    raw = raw.strip()
-    if raw.lower() in {"all", "*"}:
-        return list(EXTRACTION_STAGES)
-    parts = [p.strip() for p in raw.split(",") if p.strip()]
-    allowed = set(EXTRACTION_STAGES)
-    filtered = [p for p in parts if p in allowed]
-    return filtered or ["facts"]
+    # The single prompt covers all memory types. This remains a list only for
+    # compatible tracing metadata in the existing processing pipeline.
+    return ["facts"]
 
 
 def _is_reconciliation_enabled() -> bool:
-    raw = os.environ.get("TERMYTEDB_RECONCILIATION_ENABLED", "1")
+    # Simple extraction is deliberately one LLM call. Reconciliation remains
+    # available as an explicit opt-in for applications that need it.
+    raw = os.environ.get("TERMYTEDB_RECONCILIATION_ENABLED", "0")
     return raw.strip().lower() not in {"0", "false", "no", "off"}
 
 

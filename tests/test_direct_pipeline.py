@@ -1,7 +1,8 @@
 import pytest
 
 from src import TermyteDB
-from src.memory.provider import FakeExtractionProvider, ProviderError
+from src.memory.provider import FakeExtractionProvider, ProviderError, ProviderResult
+from src.models import ExtractionCandidate, ExtractionResponse
 
 
 class RecordingProvider(FakeExtractionProvider):
@@ -37,6 +38,38 @@ class FailingProvider:
         raise ProviderError("provider unavailable", retryable=True, error_class="transport_error")
 
 
+class SimpleResultProvider:
+    name = "simple"
+    model = "simple-v1"
+
+    def extract(self, request, timeout_seconds=30.0, cancellation=None):
+        return ProviderResult(
+            response=ExtractionResponse(
+                schema_version="extraction-v1",
+                prompt_version="simple-v1",
+                candidates=[
+                    ExtractionCandidate(
+                        kind="fact",
+                        subject="user database preference",
+                        statement="User prefers SQLite for local storage.",
+                        evidence=[],
+                        confidence=0.9,
+                        importance=0.5,
+                        durability="permanent",
+                    )
+                ],
+            ),
+            provider_name=self.name,
+            model_name=self.model,
+            prompt_version="simple-v1",
+            raw_response_hash="test",
+            input_tokens=1,
+            output_tokens=1,
+            latency_ms=1,
+            stage="facts",
+        )
+
+
 def test_batch_is_one_extraction_call_and_one_memory_embedding_batch(tmp_path):
     provider = RecordingProvider()
     embedding = RecordingEmbedding()
@@ -67,6 +100,28 @@ def test_batch_is_one_extraction_call_and_one_memory_embedding_batch(tmp_path):
     assert len(embedding.batches[0]) == result.accepted == 2
     assert len(db.memories("batch")) == 2
     assert db.database.execute("SELECT COUNT(*) FROM processing_jobs").fetchone()[0] == 0
+    db.close()
+
+
+def test_single_extraction_call_stays_single_when_legacy_multistage_env_is_set(tmp_path, monkeypatch):
+    monkeypatch.setenv("TERMYTEDB_EXTRACTION_STAGES", "all")
+    provider = RecordingProvider()
+    db = TermyteDB(tmp_path / "single-call.sqlite", extraction_provider=provider, embedding_provider=RecordingEmbedding())
+
+    db.ingest({"namespace_id": "single", "idempotency_key": "one", "type": "decision", "payload": {"text": "Decision: use SQLite."}})
+
+    assert len(provider.requests) == 1
+    db.close()
+
+
+def test_simple_memory_candidate_without_llm_offsets_reaches_storage_and_search(tmp_path):
+    db = TermyteDB(tmp_path / "simple.sqlite", extraction_provider=SimpleResultProvider(), embedding_provider=RecordingEmbedding())
+
+    result = db.ingest({"namespace_id": "simple", "idempotency_key": "one", "type": "conversation", "payload": {"text": "I prefer SQLite for local storage."}})
+
+    assert result.accepted == 1
+    assert [memory.statement for memory in db.memories("simple")] == ["User prefers SQLite for local storage."]
+    assert db.search("simple", "Which database do I prefer?", limit=1)[0].statement == "User prefers SQLite for local storage."
     db.close()
 
 

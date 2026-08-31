@@ -157,6 +157,19 @@ class ExtractionResponse(BaseModel):
     candidates: list[ExtractionCandidate] = Field(max_length=50)
 
 
+class SimpleExtractionResponse(BaseModel):
+    """Small, Mem0-style LLM contract used for production extraction.
+
+    Provenance and storage metadata are created by TermyteDB after the model
+    returns these memory statements.  Keeping the LLM response this small makes
+    it work with a much wider range of models.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    memory: list[str] = Field(default_factory=list, max_length=50)
+
+
 class ExtractionRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
