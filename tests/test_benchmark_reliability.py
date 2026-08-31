@@ -145,3 +145,26 @@ def test_normalize_invalid_and_string_limits():
     assert run_benchmark._normalize_manifest_for_comparison({"pack_atoms": "bad"})["retrieval_limit"] == 40
     assert run_benchmark._normalize_manifest_for_comparison({"pack_atoms": "40"})["retrieval_limit"] == 40
     assert run_benchmark._normalize_manifest_for_comparison({"retrieval_limit": "40"})["retrieval_limit"] == 40
+
+
+def test_normalize_accepts_haystack_sessions_later_than_question_metadata():
+    samples = run_benchmark.normalize_samples(
+        [
+            {
+                "question_id": "same-day-ordering",
+                "question": "What was decided?",
+                "question_type": "single-session-user",
+                "answer": "Use SQLite.",
+                "answer_session_ids": ["session-2"],
+                "haystack_session_ids": ["session-2", "session-1"],
+                "haystack_dates": ["2023/04/10 (Mon) 15:36", "2023/04/10 (Mon) 03:02"],
+                "haystack_sessions": [
+                    [{"role": "user", "content": "Use SQLite."}],
+                    [{"role": "assistant", "content": "Noted."}],
+                ],
+                "question_date": "2023/04/10 (Mon) 10:15",
+            }
+        ]
+    )
+
+    assert [session[0] for session in samples[0].sessions] == ["session-1", "session-2"]

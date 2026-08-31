@@ -1,9 +1,10 @@
 import importlib.util
+import json
 
 import pytest
 
 from src import TermyteDB
-from src.retrieval.embedding import batch_dot, pack_embedding
+from src.retrieval.embedding import OpenAICompatibleEmbeddingProvider, batch_dot, pack_embedding
 
 
 class ConstantEmbedding:
@@ -34,6 +35,35 @@ def test_binary_embedding_batch_dot_product():
     vectors = [pack_embedding([1.0, 0.0]), pack_embedding([0.0, 1.0])]
     scores = batch_dot([1.0, 0.0], vectors, 2)
     assert scores.tolist() == [1.0, 0.0]
+
+
+def test_openrouter_embedding_requests_configured_dimensions(monkeypatch):
+    captured: dict[str, object] = {}
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def read(self):
+            return json.dumps({"data": [{"index": 0, "embedding": [0.1, 0.2]}]}).encode()
+
+    def fake_urlopen(request, **_kwargs):
+        captured["body"] = json.loads(request.data)
+        return Response()
+
+    monkeypatch.setattr("src.retrieval.embedding.urlopen", fake_urlopen)
+    provider = OpenAICompatibleEmbeddingProvider("voyageai/voyage-4-lite", api_key="test-key", dimensions=2)
+
+    assert provider.embed_many(["memory"]) == [[0.1, 0.2]]
+    assert captured["body"] == {
+        "model": "voyageai/voyage-4-lite",
+        "input": ["memory"],
+        "dimensions": 2,
+        "encoding_format": "float",
+    }
 
 
 @pytest.mark.skipif(importlib.util.find_spec("sqlite_vec") is None, reason="sqlite-vec is not installed")

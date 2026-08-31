@@ -85,7 +85,14 @@ class OpenAICompatibleEmbeddingProvider:
     def embed_many(self, values: list[str]) -> list[list[float]]:
         if not values:
             return []
-        body = json.dumps({"model": self.model, "input": values, "encoding_format": "float"}).encode("utf-8")
+        body = json.dumps(
+            {
+                "model": self.model,
+                "input": values,
+                "dimensions": self.dimensions,
+                "encoding_format": "float",
+            }
+        ).encode("utf-8")
         headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",

@@ -121,7 +121,9 @@ def _message_text(payload: dict[str, Any], *, text_parts_only: bool = False) -> 
     content = payload["choices"][0]["message"]["content"]
     if isinstance(content, list):
         content = "".join(
-            str(part.get("text") or "") for part in content if isinstance(part, dict) and (not text_parts_only or part.get("type", "text") == "text")
+            str(part.get("text") or part.get("content") or "")
+            for part in content
+            if isinstance(part, dict) and (not text_parts_only or part.get("type", "text") in {"text", "output_text"})
         )
     if isinstance(content, dict):
         return json.dumps(content)

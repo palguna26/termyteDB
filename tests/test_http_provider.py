@@ -3,7 +3,7 @@ from uuid import uuid4
 
 import pytest
 
-from src.memory.provider import HttpExtractionProvider, OpenRouterExtractionProvider, ProviderError, build_extraction_prompt
+from src.memory.provider import HttpExtractionProvider, OpenRouterExtractionProvider, ProviderError, _message_text, build_extraction_prompt
 from src.models import ExtractionRequest
 
 
@@ -109,3 +109,20 @@ def test_openrouter_extraction_requires_explicit_model(monkeypatch):
     monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
     with pytest.raises(ValueError, match="TERMYTEDB_EXTRACTION_MODEL"):
         OpenRouterExtractionProvider()
+
+
+def test_message_text_reads_openrouter_output_text_parts():
+    payload = {
+        "choices": [
+            {
+                "message": {
+                    "content": [
+                        {"type": "reasoning", "text": "internal reasoning"},
+                        {"type": "output_text", "text": '{"schema_version":"extraction-v1"}'},
+                    ]
+                }
+            }
+        ]
+    }
+
+    assert _message_text(payload, text_parts_only=True) == '{"schema_version":"extraction-v1"}'
