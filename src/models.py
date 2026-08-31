@@ -147,6 +147,10 @@ class ExtractionCandidate(BaseModel):
     timestamp: datetime | None = None
     source_role: Literal["user", "assistant"] = "user"
     source_stage: ExtractionStage | None = None
+    source_chunk_ids: list[str] = Field(default_factory=list, max_length=20)
+    event_dates: list[datetime] = Field(default_factory=list, max_length=20)
+    entities: list[str] = Field(default_factory=list, max_length=20)
+    relation: Literal["insert", "reinforce", "update", "supersede", "dispute", "extends", "derives", "ignore"] | None = None
 
 
 class ExtractionResponse(BaseModel):
@@ -168,6 +172,7 @@ class SimpleExtractionResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     memory: list[str] = Field(default_factory=list, max_length=50)
+    memories: list[dict[str, Any]] = Field(default_factory=list, max_length=50)
 
 
 class ExtractionRequest(BaseModel):
@@ -321,6 +326,9 @@ class SearchResult(BaseModel):
     # Simplified provenance — optional per Phase 1
     source_event_ids: list[UUID] = Field(default_factory=list)
     evidence_excerpt: str | None = None
+    source_chunk_ids: list[str] = Field(default_factory=list)
+    document_date: str | None = None
+    event_dates: list[str] = Field(default_factory=list)
 
 
 class SessionSearchResult(BaseModel):

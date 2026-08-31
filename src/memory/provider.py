@@ -165,16 +165,20 @@ def _simple_response_to_extraction(value: Any) -> ExtractionResponse:
     simple = SimpleExtractionResponse.model_validate(value)
     candidates = []
     seen: set[str] = set()
-    for raw in simple.memory:
+    structured = simple.memories
+    values = structured or [{"statement": raw} for raw in simple.memory]
+    for item in values:
+        raw = item.get("statement", "") if isinstance(item, dict) else item
         statement = " ".join(str(raw).strip().split())
         key = statement.casefold()
         if len(statement) < 3 or key in seen:
             continue
         seen.add(key)
+        fields = item if isinstance(item, dict) else {}
         candidates.append(
             ExtractionCandidate(
                 kind="fact",
-                subject=_simple_subject(statement),
+                subject=str(fields.get("subject") or _simple_subject(statement)),
                 statement=statement,
                 evidence=[],
                 confidence=0.9,
@@ -182,6 +186,9 @@ def _simple_response_to_extraction(value: Any) -> ExtractionResponse:
                 durability="permanent",
                 intent="insert",
                 source_role="user",
+                source_chunk_ids=[str(value) for value in fields.get("source_chunk_ids", [])],
+                entities=[str(value) for value in fields.get("entities", [])],
+                relation=fields.get("relation"),
             )
         )
     return ExtractionResponse(schema_version="extraction-v1", prompt_version="simple-v1", candidates=candidates)

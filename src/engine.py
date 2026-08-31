@@ -110,6 +110,9 @@ class TermyteDB:
                 duplicate=duplicate,
             )
 
+        # Index source-grounded chunks before extraction.
+        self.repository.rebuild_chunks(namespace_id)
+
         # Durability: enqueue jobs before extraction so failures remain retryable
         job_ids: dict[str, str] = {}
         for event_id in new_event_ids:
@@ -163,8 +166,19 @@ class TermyteDB:
         return self.repository.search_sessions(namespace_id, query, limit)
 
     def search_context(self, namespace_id: str, query: str, limit: int = 20) -> dict[str, list[Any]]:
-        """Return compact memories and raw source sessions for answer generation."""
-        return {"memories": self.search(namespace_id, query, limit), "sessions": self.search_sessions(namespace_id, query, limit)}
+        """Return compact memories and their source chunks for answer generation."""
+        memories = self.search(namespace_id, query, limit)
+        from .retrieval.context import pack_evidence
+
+        packed = pack_evidence(memories, lambda memory: self.repository.chunks_for_events(namespace_id, [str(x) for x in memory.source_event_ids]))
+        sessions = [] if memories else self.search_sessions(namespace_id, query, limit)
+        return {"memories": memories, "chunks": packed["memories"], "text": packed["text"], "token_count": packed["token_count"], "sessions": sessions}
+
+    def build_answer_context(self, namespace_id: str, query: str, limit: int = 6, token_budget: int = 3000) -> dict[str, Any]:
+        memories = self.search(namespace_id, query, limit)
+        from .retrieval.context import pack_evidence
+
+        return pack_evidence(memories, lambda memory: self.repository.chunks_for_events(namespace_id, [str(x) for x in memory.source_event_ids]), token_budget=token_budget)
 
     def invalidate(self, namespace_id: str, memory_id: str, reason: str) -> bool:
         return self.repository.invalidate_memory(namespace_id, memory_id, reason)

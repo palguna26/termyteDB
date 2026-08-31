@@ -26,6 +26,39 @@ class AtomHit:
     score: float
 
 
+@dataclass(frozen=True)
+class ChunkHit:
+    chunk_id: str
+    session_id: str
+    text: str
+    contextual_text: str
+    document_date: str | None
+    lexical_score: float
+    vector_score: float
+    score: float
+
+
+def search_chunks(db: Database, query: str, limit: int = 20, provider: EmbeddingProvider | None = None, namespace_id: str | None = None) -> list[ChunkHit]:
+    """Hybrid chunk search: exact terms plus raw and contextual vectors."""
+    where = "WHERE namespace_id=?" if namespace_id else ""
+    params: tuple[object, ...] = (namespace_id,) if namespace_id else ()
+    rows = db.execute(f"SELECT * FROM chunks {where} ORDER BY session_id, ordinal", params).fetchall()
+    terms = [t.casefold() for t in re.findall(r'[\w./:-]+', query) if len(t) > 1]
+    qv = provider.embed(query) if provider and rows else None
+    hits: list[ChunkHit] = []
+    for row in rows:
+        lexical = sum(t in (row['raw_text'] + ' ' + row['contextual_text']).casefold() for t in terms) / max(1, len(terms))
+        dense = 0.0
+        if qv is not None:
+            vectors = db.execute("SELECT vector FROM chunk_embeddings WHERE chunk_id=? AND provider=? ORDER BY contextual", (row['chunk_id'], provider.name)).fetchall()
+            if vectors:
+                dense = max(cosine(qv, list(array.array('f', bytes(v['vector'])))) for v in vectors)
+        score = 0.6 * dense + 0.4 * lexical
+        if score > 0:
+            hits.append(ChunkHit(row['chunk_id'], row['session_id'], row['raw_text'], row['contextual_text'], row['document_date'], lexical, dense, score))
+    return sorted(hits, key=lambda h: (-h.score, h.chunk_id))[:limit]
+
+
 def rrf_merge(lists: list[list[AtomHit]], k: int = RRF_K) -> list[AtomHit]:
     merged: dict[str, tuple[AtomHit, float]] = {}
     for ranked in lists:

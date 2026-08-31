@@ -499,6 +499,45 @@ class Repository:
         ).fetchall()
         return [event for row in rows if (event := self.get_event(namespace_id, row["id"])) is not None]
 
+    def rebuild_chunks(self, namespace_id: str, *, window: int = 4, overlap: int = 1) -> int:
+        from ..retrieval.chunking import build_chunks
+
+        events = self.list_events(namespace_id, limit=1_000_000)
+        source = [{**event, "text": payload_text(event["payload_json"], event["type"])} for event in events]
+        chunks = build_chunks(source, window=window, overlap=overlap)
+        with self.db.lock, self.db.connection:
+            self.db.execute("DELETE FROM chunks WHERE namespace_id=?", (namespace_id,))
+            self.db.executemany(
+                "INSERT INTO chunks(chunk_id,namespace_id,session_id,ordinal,event_ids_json,raw_text,document_date,event_dates_json,contextual_text,content_hash,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                [(c.chunk_id, namespace_id, c.session_id, c.ordinal, json.dumps(c.event_ids), c.text, c.document_date, json.dumps(c.event_dates), c.contextual_text, hashlib.sha256(c.text.encode()).hexdigest(), iso()) for c in chunks],
+            )
+            # Avoid changing the call shape of injected test/custom embedders;
+            # the built-in provider gets both source and contextual indexes.
+            if chunks and type(self.embedding) is FastEmbedProvider:
+                try:
+                    vectors = self.embed_many([value for c in chunks for value in (c.text, c.contextual_text)])
+                    self.db.executemany(
+                        "INSERT INTO chunk_embeddings VALUES (?,?,?,?,?,?)",
+                        [(c.chunk_id, namespace_id, self.embedding.name, len(vectors[index * 2]), pack_embedding(vectors[index * 2]), 0) for index, c in enumerate(chunks)]
+                        + [(c.chunk_id, namespace_id, self.embedding.name, len(vectors[index * 2 + 1]), pack_embedding(vectors[index * 2 + 1]), 1) for index, c in enumerate(chunks)],
+                    )
+                except Exception:
+                    pass
+        return len(chunks)
+
+    def chunks_for_events(self, namespace_id: str, event_ids: list[str], limit: int = 2) -> list[dict[str, Any]]:
+        wanted = set(event_ids)
+        if not wanted:
+            return []
+        result = []
+        for row in self.db.execute("SELECT * FROM chunks WHERE namespace_id=? ORDER BY session_id, ordinal", (namespace_id,)).fetchall():
+            ids = json.loads(row["event_ids_json"])
+            if wanted.intersection(ids):
+                result.append({**dict(row), "event_ids": ids, "event_dates": json.loads(row["event_dates_json"])})
+                if len(result) >= limit:
+                    break
+        return result
+
     def list_evidence(self, namespace_id: str, limit: int = 100, offset: int = 0) -> list[dict[str, Any]]:
         rows = self.db.execute(
             """SELECT * FROM evidence_refs WHERE namespace_id=?

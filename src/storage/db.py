@@ -454,6 +454,33 @@ MIGRATIONS: tuple[str, ...] = (
     ALTER TABLE atoms ADD COLUMN namespace_id TEXT REFERENCES namespaces(id);
     CREATE INDEX atoms_namespace_idx ON atoms(namespace_id, session_id);
     """,
+    """
+    CREATE TABLE chunks (
+      chunk_id TEXT PRIMARY KEY,
+      namespace_id TEXT NOT NULL REFERENCES namespaces(id),
+      session_id TEXT NOT NULL,
+      ordinal INTEGER NOT NULL,
+      event_ids_json TEXT NOT NULL,
+      raw_text TEXT NOT NULL,
+      document_date TEXT,
+      event_dates_json TEXT NOT NULL,
+      contextual_text TEXT NOT NULL,
+      content_hash TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      UNIQUE(namespace_id, session_id, ordinal)
+    );
+    CREATE INDEX chunks_namespace_session_idx ON chunks(namespace_id, session_id, ordinal);
+    CREATE TABLE chunk_embeddings (
+      chunk_id TEXT NOT NULL REFERENCES chunks(chunk_id) ON DELETE CASCADE,
+      namespace_id TEXT NOT NULL REFERENCES namespaces(id),
+      provider TEXT NOT NULL,
+      dimensions INTEGER NOT NULL,
+      vector BLOB NOT NULL,
+      contextual INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY(chunk_id, provider, contextual)
+    );
+    CREATE INDEX chunk_embeddings_provider_idx ON chunk_embeddings(namespace_id, provider, contextual);
+    """
 )
 
 
@@ -509,6 +536,9 @@ class Database:
 
     def execute(self, sql: str, parameters: tuple[Any, ...] = ()) -> sqlite3.Cursor:
         return self.connection.execute(sql, parameters)
+
+    def executemany(self, sql: str, parameters: list[tuple[Any, ...]]) -> sqlite3.Cursor:
+        return self.connection.executemany(sql, parameters)
 
     def close(self) -> None:
         with self.lock:
