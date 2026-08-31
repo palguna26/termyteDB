@@ -18,6 +18,7 @@ from .models import (
     MemoryResponse,
     ProcessResponse,
     SearchResult,
+    SessionSearchResult,
 )
 from .retrieval.embedding import EmbeddingProvider
 from .storage.db import Database
@@ -156,6 +157,14 @@ class TermyteDB:
     # -- Core read/write with temporal blocks ---------------------------------
     def history(self, namespace_id: str, memory_id: str) -> list[dict[str, Any]] | None:
         return self.repository.history(namespace_id, memory_id)
+
+    def search_sessions(self, namespace_id: str, query: str, limit: int = 20) -> list[SessionSearchResult]:
+        """Search original conversation sessions as a fallback to memory search."""
+        return self.repository.search_sessions(namespace_id, query, limit)
+
+    def search_context(self, namespace_id: str, query: str, limit: int = 20) -> dict[str, list[Any]]:
+        """Return compact memories and raw source sessions for answer generation."""
+        return {"memories": self.search(namespace_id, query, limit), "sessions": self.search_sessions(namespace_id, query, limit)}
 
     def invalidate(self, namespace_id: str, memory_id: str, reason: str) -> bool:
         return self.repository.invalidate_memory(namespace_id, memory_id, reason)

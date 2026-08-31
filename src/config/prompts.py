@@ -212,9 +212,9 @@ def build_extraction_prompt(request: ExtractionRequest) -> str:
     """Build one simple, one-call extraction request."""
     evidence = "\n".join(f"<event id='{event_id}'>\n{value}\n</event>" for event_id, value in request.evidence_text.items())
     return (
-        "Extract useful long-term memories from this conversation. "
-        "Include facts, preferences, decisions, events, relationships, and updates that can help later. "
-        "Do not include small talk, questions, or temporary details. "
+        "Extract factual details that can answer a later question about this conversation. "
+        "Include preferences, decisions, relationships, corrections, concrete events, tasks, dates, and updates. "
+        "Keep both durable facts and important temporary details; omit only greetings, small talk, and empty questions. "
         "Return only JSON in this exact form: {\"memory\":[\"short standalone memory\"]}. "
         "Use an empty list when there is nothing worth remembering.\n\n"
         + "<conversation>\n"

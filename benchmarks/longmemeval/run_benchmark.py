@@ -34,6 +34,7 @@ import argparse
 import array
 import hashlib
 import json
+import logging
 import math
 import os
 import random
@@ -115,6 +116,38 @@ _product_embedder: GuardedEmbedder | None = None
 _product_embedder_key: tuple[str, str | None, int | None] | None = None
 _product_embedder_lock = threading.Lock()
 _RUN_MANIFEST_NAME = "longmemeval_run_manifest.json"
+_CHECKPOINT_NAME = "longmemeval_checkpoint.json"
+_BENCHMARK_LOGGER = logging.getLogger("longmemeval.benchmark")
+
+
+def _configure_benchmark_logging(log_path: Path, *, append: bool) -> None:
+    """Keep the terminal concise while retaining full engine diagnostics."""
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    termyte_logger = logging.getLogger("termytedb")
+    termyte_logger.setLevel(logging.INFO)
+    # The library logger normally prints every accepted event to stderr. Keep
+    # that detail in the run log instead; progress belongs to the CLI.
+    for handler in termyte_logger.handlers:
+        handler.setLevel(logging.CRITICAL + 1)
+    for handler in list(termyte_logger.handlers):
+        if getattr(handler, "_longmemeval_log", False):
+            termyte_logger.removeHandler(handler)
+            handler.close()
+    mode = "a" if append else "w"
+    engine_file_handler = logging.FileHandler(log_path, mode=mode, encoding="utf-8")
+    engine_file_handler._longmemeval_log = True  # type: ignore[attr-defined]
+    engine_file_handler.setLevel(logging.INFO)
+    engine_file_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s"))
+    termyte_logger.addHandler(engine_file_handler)
+
+    _BENCHMARK_LOGGER.setLevel(logging.INFO)
+    _BENCHMARK_LOGGER.propagate = False
+    for handler in list(_BENCHMARK_LOGGER.handlers):
+        _BENCHMARK_LOGGER.removeHandler(handler)
+        handler.close()
+    runner_file_handler = logging.FileHandler(log_path, mode="a", encoding="utf-8")
+    runner_file_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+    _BENCHMARK_LOGGER.addHandler(runner_file_handler)
 
 
 class RequestPacer:
@@ -157,7 +190,7 @@ class RateLimitedExtractionProvider:
         for attempt in range(self.max_retries):
             waited = _openrouter_pacer.wait()
             if waited:
-                print(f"OpenRouter pacing: waited {waited:.1f}s", flush=True)
+                _BENCHMARK_LOGGER.info("OpenRouter pacing: waited %.1fs", waited)
             try:
                 return self.inner.extract(request, timeout_seconds=timeout_seconds, cancellation=None)
             except ProviderError as exc:
@@ -166,7 +199,7 @@ class RateLimitedExtractionProvider:
                     raise
                 exponential_delay = min(30.0, (2**attempt) + random.uniform(0.0, 1.0))
                 delay = max(self.rate_limit_cooldown, exponential_delay) if "HTTP 429" in str(exc) else exponential_delay
-                print(f"OpenRouter retry {attempt + 1}/{self.max_retries - 1} after {delay:.1f}s: {exc}", flush=True)
+                _BENCHMARK_LOGGER.warning("OpenRouter retry %s/%s after %.1fs: %s", attempt + 1, self.max_retries - 1, delay, exc)
                 _openrouter_pacer.defer(delay)
         raise RuntimeError("OpenRouter extraction retry loop ended unexpectedly") from last_error
 
@@ -281,6 +314,7 @@ def rerank_memory_hits(query: str, hits: list[Any], threshold: float, *, max_can
 class Sample:
     question_id: str
     question: str
+    question_date: str
     question_type: str
     answer: str
     answer_session_ids: frozenset[str]
@@ -331,6 +365,7 @@ def normalize_samples(raw: Any) -> list[Sample]:
             Sample(
                 question_id=str(item.get("question_id", len(samples))),
                 question=str(item.get("question", "")),
+                question_date=str(item.get("question_date", "")),
                 question_type=str(item.get("question_type", "unknown")),
                 answer=str(item.get("answer", "")),
                 answer_session_ids=frozenset(str(value) for value in item.get("answer_session_ids", [])),
@@ -529,10 +564,39 @@ def _run_manifest_path(work_dir: Path) -> Path:
     return work_dir / _RUN_MANIFEST_NAME
 
 
+def _checkpoint_path(work_dir: Path) -> Path:
+    return work_dir / _CHECKPOINT_NAME
+
+
+def _write_checkpoint(
+    work_dir: Path,
+    *,
+    manifest: dict[str, Any],
+    args: argparse.Namespace,
+    dataset_sha256: str,
+    traces: list[dict[str, Any]],
+) -> None:
+    """Persist completed traces so Ctrl+C never discards an expensive run."""
+    checkpoint = {
+        "created_at": datetime.now(UTC).isoformat(),
+        "dataset_sha256": dataset_sha256,
+        "manifest": manifest,
+        "config": {key: (str(value) if isinstance(value, Path) else value) for key, value in vars(args).items()},
+        "traces": traces,
+    }
+    path = _checkpoint_path(work_dir)
+    temporary = path.with_suffix(".tmp")
+    temporary.write_text(json.dumps(checkpoint, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    temporary.replace(path)
+
+
 def resolve_work_dir(args: argparse.Namespace, previous: dict[str, Any] | None, *, is_e2e: bool) -> Path:
     base = Path(args.work_dir)
     if not is_e2e:
         return base
+    resume_work_dir = getattr(args, "resume_work_dir", None)
+    if resume_work_dir:
+        return Path(resume_work_dir)
     if previous is not None:
         prior_work_dir = previous.get("config", {}).get("work_dir")
         if not prior_work_dir:
@@ -561,6 +625,7 @@ def _run_manifest(args: argparse.Namespace, data_path: Path, dataset_sha256: str
         "embedding_provider": getattr(args, "embedding_provider", None),
         "embedding_model": getattr(args, "embedding_model", None),
         "embedding_dimensions": getattr(args, "embedding_dimensions", None),
+        "extraction_batch_sessions": int(getattr(args, "extraction_batch_sessions", 4)),
         "single_db": bool(getattr(args, "single_db", False)),
         "no_dense": bool(getattr(args, "no_dense", False)),
         "no_rerank": bool(getattr(args, "no_rerank", False)),
@@ -633,13 +698,27 @@ def ingest_e2e(work_dir: Path, sample: Sample, args: argparse.Namespace) -> tupl
             for ev in events_input:
                 scope = str(ev.session_id or ev.stream_id or ev.idempotency_key)
                 session_batches.setdefault(scope, []).append(ev)
-            for batch in session_batches.values():
+            # One provider call handles a small group of complete sessions.
+            # This preserves session boundaries while avoiding one remote call
+            # per session (the dominant source of benchmark runtime).
+            sessions_per_extraction = max(1, int(getattr(args, "extraction_batch_sessions", 4)))
+            sessions = list(session_batches.values())
+            batches: list[list[EventInput]] = []
+            for index in range(0, len(sessions), sessions_per_extraction):
+                batches.append([event for session in sessions[index : index + sessions_per_extraction] for event in session])
+            for batch in batches:
                 result = engine.ingest_batch(batch)
                 receipts.extend(result.receipts)
                 total_accepted += result.accepted
                 total_rejected += result.rejected
                 events_duplicate += sum(receipt.duplicate for receipt in result.receipts)
                 events_ingested += sum(not receipt.duplicate for receipt in result.receipts)
+            # On resume, previously accepted events are duplicates. Process any
+            # durable failed jobs left by the interrupted attempt instead of
+            # silently treating the sample as complete without extraction.
+            retry_result = engine.process(namespace_id, limit=1000)
+            total_accepted += retry_result.accepted
+            total_rejected += retry_result.rejected
             ingest_latency_ms = (time.perf_counter() - ingest_started) * 1000
             # Collect completed direct-ingestion diagnostics.
             metrics_final = engine.metrics(namespace_id)
@@ -672,6 +751,8 @@ def ingest_e2e(work_dir: Path, sample: Sample, args: argparse.Namespace) -> tupl
                 "rejection_reasons": dict(rejection_counter),
                 "runs_count": len(runs),
                 "decisions_count": len(decisions),
+                "extraction_batches": len(batches),
+                "sessions_per_extraction": sessions_per_extraction,
             }
         finally:
             engine.close()
@@ -697,6 +778,11 @@ def retrieve_e2e_session_ranking(database_path: Path, sample: Sample, args: argp
             reranked = rerank_memory_hits(sample.question, search_results, args.abstain_threshold)
             abstained = reranked is None
             ranked = reranked if reranked is not None else []
+        # Raw-session fallback: an empty LLM extraction must never make a
+        # haystack session invisible to the end-to-end benchmark.
+        raw_sessions = engine.search_sessions(ns, sample.question, limit=max(args.recall_k * 2, 30))
+        if raw_sessions:
+            abstained = False
         latency_ms = (time.perf_counter() - started) * 1000
 
         # Map retrieved memories to session_ids via evidence events
@@ -717,6 +803,26 @@ def retrieve_e2e_session_ranking(database_path: Path, sample: Sample, args: argp
                 return sid
             return None
 
+        # Put raw sessions first. They are direct source material and make the
+        # benchmark answer context useful even when no memory was extracted.
+        for raw_session in raw_sessions:
+            if raw_session.session_id not in seen:
+                seen.add(raw_session.session_id)
+                session_order.append(raw_session.session_id)
+            retrieved_memories_detailed.append(
+                {
+                    "memory_id": None,
+                    "statement": "Raw conversation session",
+                    "kind": "session",
+                    "score": raw_session.score,
+                    "citations": [{"event_id": str(event_id), "excerpt": raw_session.text[:500]} for event_id in raw_session.event_ids[:1]],
+                    "evidence_sessions": [raw_session.session_id],
+                    "primary_session": raw_session.session_id,
+                    "documentDate": raw_session.occurred_at,
+                    "eventDate": [raw_session.occurred_at] if raw_session.occurred_at else [],
+                    "chunks": raw_session.text,
+                }
+            )
         for hit in ranked:
             # Gather sessions for this memory from citations
             sessions_for_hit: list[str] = []
@@ -753,7 +859,12 @@ def retrieve_e2e_session_ranking(database_path: Path, sample: Sample, args: argp
 
         # Retrieval quality: use search results directly (no token budget / prompt wrappers)
         retrieval_limit = _get_retrieval_limit(args)
-        packed_text = "" if abstained else "\n".join(hit.statement for hit in ranked[:retrieval_limit])
+        packed_parts = [
+            f"Memory: Raw conversation session\nChunks: {item.text}\ndocumentDate: {item.occurred_at or ''}\neventDate: {item.occurred_at or ''}"
+            for item in raw_sessions[:retrieval_limit]
+        ]
+        packed_parts.extend(f"Memory: {hit.statement}\nChunks: {hit.evidence_excerpt or ''}" for hit in ranked[:retrieval_limit])
+        packed_text = "" if abstained else "\n\n".join(packed_parts[:retrieval_limit])
 
         # If single_db, session_order already isolated via namespace
         oracle = {str(v).strip() for v in sample.answer_session_ids}
@@ -800,7 +911,7 @@ def retrieve_e2e_session_ranking(database_path: Path, sample: Sample, args: argp
             "packed": packed_text,
             "packed_words": len(packed_text.split()),
             "latency_ms": round(latency_ms, 2),
-            "candidate_count": len(search_results),
+            "candidate_count": len(search_results) + len(raw_sessions),
             "retrieved_memories": retrieved_memories_detailed,
             "all_memories": all_memories_summary,
             "oracle_memories_exist": oracle_memories_exist,
@@ -907,10 +1018,13 @@ def openrouter_chat(model: str, messages: list[dict[str, str]], budget: OpenRout
     raise RuntimeError(f"OpenRouter call failed after {max_retries} attempts: {last_error}")
 
 
-ANSWER_SYSTEM = (
-    "You answer questions strictly using the provided conversation memory. "
-    "Quote exact values when present. If the memory does not contain the answer, reply exactly: insufficient information."
-)
+ANSWER_SYSTEM = """You are a question-answering system. Answer only from Retrieved Context.
+
+Each result may contain Memory (a summary), Chunks (the raw source text),
+documentDate (when it was written), and eventDate (when it happened). Read
+chunks for detail, use dates to resolve time, and combine results only when
+the context supports it. Give a clear, concise answer. If the context lacks
+the answer, reply exactly: insufficient information."""
 
 JUDGE_SYSTEM = (
     "You are an evaluator for a conversational memory benchmark. Given a question, a reference answer, "
@@ -928,7 +1042,14 @@ def judge_question(question_model: str, judge_model: str, sample: Sample, contex
             question_model,
             [
                 {"role": "system", "content": ANSWER_SYSTEM},
-                {"role": "user", "content": f"Memory:\n{context}\n\nQuestion: {sample.question}"},
+                {
+                    "role": "user",
+                    "content": (
+                        f"Question: {sample.question}\n"
+                        f"Question Date: {sample.question_date}\n\n"
+                        f"Retrieved Context:\n{context}\n\nAnswer:"
+                    ),
+                },
             ],
             budget,
         )
@@ -977,7 +1098,7 @@ def evaluate_sample(args: argparse.Namespace, sample: Sample, budget: OpenRouter
         "retrieved_memory_count": outcome["candidate_count"],
         "session_order": outcome["session_order"],
     }
-    if args.mode == "judged" and budget is not None:
+    if (args.mode == "judged" or getattr(args, "judge", False)) and budget is not None:
         judged = judge_question(args.answer_model, args.judge_model, sample, outcome["packed"], budget)
         trace.update(judged)
     return trace
@@ -1073,7 +1194,7 @@ def evaluate_sample_e2e(args: argparse.Namespace, sample: Sample, budget: OpenRo
             "diagnostics": e2e_diag,
         },
     }
-    if args.mode == "judged" and budget is not None:
+    if (args.mode == "judged" or getattr(args, "judge", False)) and budget is not None:
         judged = judge_question(args.answer_model, args.judge_model, sample, retrieval_outcome["packed"], budget)
         trace.update(judged)
     return trace
@@ -1179,6 +1300,12 @@ def run(args: argparse.Namespace) -> int:
     previous: dict[str, Any] | None = None
     if args.resume_from:
         previous = json.loads(Path(args.resume_from).read_text(encoding="utf-8"))
+    elif getattr(args, "resume_work_dir", None):
+        checkpoint_file = _checkpoint_path(Path(args.resume_work_dir))
+        if not checkpoint_file.exists():
+            raise SystemExit(f"no checkpoint found in {Path(args.resume_work_dir)}")
+        previous = json.loads(checkpoint_file.read_text(encoding="utf-8"))
+    if previous is not None:
         previous_traces = [trace for trace in previous.get("traces", []) if trace.get("status", "completed") == "completed"]
         resume_ids = {trace["question_id"] for trace in previous_traces if trace.get("status", "completed") == "completed"}
         print(f"Resuming: {len(resume_ids)} already complete", flush=True)
@@ -1220,7 +1347,11 @@ def run(args: argparse.Namespace) -> int:
         args.work_dir = str(work_dir)
         work_dir.mkdir(parents=True, exist_ok=True)
         print(f"Work directory: {work_dir}", flush=True)
-    budget = OpenRouterBudget(args.budget_usd) if canonical_mode == "judged" else None
+    log_path = Path(args.log_file) if getattr(args, "log_file", None) else work_dir / "benchmark.log"
+    _configure_benchmark_logging(log_path, append=previous is not None)
+    print(f"Detailed log: {log_path}", flush=True)
+    should_judge = canonical_mode == "judged" or bool(getattr(args, "judge", False))
+    budget = OpenRouterBudget(args.budget_usd) if should_judge else None
 
     manifest = _run_manifest(args, data_path, dataset_sha256, canonical_mode)
     manifest_path = _run_manifest_path(work_dir)
@@ -1245,36 +1376,55 @@ def run(args: argparse.Namespace) -> int:
 
     worker = worker_e2e if is_e2e else worker_retrieval
 
-    with ThreadPoolExecutor(max_workers=args.workers) as pool:
+    total_questions = len(traces) + len(pending)
+
+    def print_progress(sample: Sample, *, failed: bool = False, error: Exception | None = None) -> None:
+        finished = len(traces)
+        percent = (100.0 * finished / total_questions) if total_questions else 100.0
+        answered = sum("hypothesis" in item for item in traces if item.get("status") == "completed")
+        failed_count = sum(item.get("status") == "failed" for item in traces)
+        answer_label = f"answered: {answered}" if should_judge else f"completed: {finished - failed_count}"
+        suffix = f" | failed: {failed_count}" if failed_count else ""
+        if failed and error is not None:
+            suffix += f" | last error: {type(error).__name__}: {error}"
+        print(f"Progress: {finished}/{total_questions} ({percent:.0f}%) | {answer_label}{suffix}", flush=True)
+
+    pool = ThreadPoolExecutor(max_workers=args.workers)
+    try:
         futures = {pool.submit(worker, sample): sample for sample in pending}
         for number, future in enumerate(as_completed(futures), 1):
             sample = futures[future]
             try:
                 trace = future.result()
                 traces.append(trace)
-                status = f"rank={trace['best_rank']}"
-                if "correct" in trace:
-                    status += f"; judged={'correct' if trace['correct'] else 'wrong'}"
-                # Add e2e extra info
-                if is_e2e:
-                    diag = trace.get("e2e_diagnostics", {})
-                    status += f"; mems={diag.get('memories_created', 0)} acc={diag.get('candidates_accepted', 0)} rej={diag.get('candidates_rejected', 0)}"
-                print(f"[{number}/{len(pending)}] {sample.question_id} ({sample.question_type}): {status}; {trace['retrieval_latency_ms']:.0f}ms", flush=True)
+                _write_checkpoint(work_dir, manifest=manifest, args=args, dataset_sha256=dataset_sha256, traces=traces)
+                _BENCHMARK_LOGGER.info("completed question=%s category=%s rank=%s", sample.question_id, sample.question_type, trace["best_rank"])
+                print_progress(sample)
             except BudgetExceeded as exc:
                 failures += 1
                 traces.append(failed_trace(sample, exc))
-                print(f"BUDGET STOP: {exc}", flush=True)
+                _write_checkpoint(work_dir, manifest=manifest, args=args, dataset_sha256=dataset_sha256, traces=traces)
+                _BENCHMARK_LOGGER.exception("budget stop for question=%s", sample.question_id)
+                print(f"BUDGET STOP: {exc}. See {log_path}", flush=True)
                 pool.shutdown(wait=False, cancel_futures=True)
                 break
             except Exception as exc:
                 failures += 1
                 traces.append(failed_trace(sample, exc))
-                print(f"[{number}/{len(pending)}] {sample.question_id}: FAILED {type(exc).__name__}: {exc}", flush=True)
-                import traceback as _tb
+                _write_checkpoint(work_dir, manifest=manifest, args=args, dataset_sha256=dataset_sha256, traces=traces)
+                _BENCHMARK_LOGGER.exception("failed question=%s category=%s", sample.question_id, sample.question_type)
+                print_progress(sample, failed=True, error=exc)
+    except KeyboardInterrupt:
+        _write_checkpoint(work_dir, manifest=manifest, args=args, dataset_sha256=dataset_sha256, traces=traces)
+        pool.shutdown(wait=False, cancel_futures=True)
+        _BENCHMARK_LOGGER.info("interrupted; checkpoint=%s", _checkpoint_path(work_dir))
+        print(f"\nInterrupted. Checkpoint saved: {_checkpoint_path(work_dir)}", flush=True)
+        print(f"Resume with: --resume-work-dir {work_dir}", flush=True)
+        return 130
+    else:
+        pool.shutdown(wait=True)
 
-                _tb.print_exc()
-
-    rows = summarize(traces, args.recall_k, judged=canonical_mode == "judged")
+    rows = summarize(traces, args.recall_k, judged=should_judge)
     table = render_table(rows)
     git_commit = _git_commit()
     # Embedding provider info
@@ -1319,6 +1469,7 @@ def run(args: argparse.Namespace) -> int:
     }
     output_path = Path(args.results_dir) / f"longmemeval_s_{canonical_mode}_{datetime.now(UTC).strftime('%Y%m%d-%H%M%S-%f')}.json"
     output_path.write_text(json.dumps(result, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    _write_checkpoint(work_dir, manifest=manifest, args=args, dataset_sha256=dataset_sha256, traces=traces)
     print("\n" + table)
     if is_e2e and result.get("failure_decomposition"):
         print("\nFailure decomposition:", json.dumps(result["failure_decomposition"], indent=2))
@@ -1349,6 +1500,7 @@ def main() -> int:
     )
     parser.add_argument("--work-dir", default=str(ROOT / ".termytedb-work" / "longmemeval"))
     parser.add_argument("--results-dir", default=str(ROOT / "results"))
+    parser.add_argument("--log-file", type=Path, help="path for detailed benchmark and engine logs (default: <work-dir>/benchmark.log)")
     parser.add_argument("--limit", type=int, help="limit number of questions (for smoke tests)")
     parser.add_argument("--smoke", action="store_true", help="run the manual 5-sample benchmark smoke subset")
     parser.add_argument("--smoke-samples", type=int, default=5, help="number of questions to use for smoke runs")
@@ -1363,6 +1515,8 @@ def main() -> int:
     parser.add_argument("--no-dense", action="store_true")
     parser.add_argument("--single-db", action="store_true", help="store all questions in one SQLite file (namespace-isolated)")
     parser.add_argument("--resume-from", type=Path)
+    parser.add_argument("--resume-work-dir", type=Path, help="resume an interrupted end-to-end run from its work-directory checkpoint")
+    parser.add_argument("--judge", action="store_true", help="run answer generation and judging after end-to-end retrieval")
     parser.add_argument("--answer-model", default="openai/gpt-4o-mini")
     parser.add_argument("--judge-model", default="openai/gpt-4o-mini")
     parser.add_argument("--budget-usd", type=float, default=8.0)
@@ -1377,6 +1531,7 @@ def main() -> int:
         help="extraction provider for end-to-end mode (OpenRouter is the product default)",
     )
     parser.add_argument("--extraction-model", type=str, default=None, help="model for openrouter/http extraction (or env TERMYTEDB_EXTRACTION_MODEL)")
+    parser.add_argument("--extraction-batch-sessions", type=int, default=4, help="complete sessions sent in one extraction call (default: 4)")
     parser.add_argument("--openrouter-min-interval", type=float, default=3.0, help="minimum seconds between all OpenRouter requests")
     parser.add_argument("--openrouter-max-retries", type=int, default=5, help="maximum attempts for retryable OpenRouter extraction failures")
     parser.add_argument("--openrouter-rate-limit-cooldown", type=float, default=60.0, help="seconds to wait after an OpenRouter HTTP 429")

@@ -323,6 +323,16 @@ class SearchResult(BaseModel):
     evidence_excerpt: str | None = None
 
 
+class SessionSearchResult(BaseModel):
+    """A raw conversation session returned by the fallback retrieval layer."""
+
+    session_id: str
+    event_ids: list[UUID]
+    text: str
+    occurred_at: str | None = None
+    score: float
+
+
 class MemoryResponse(BaseModel):
     memory_id: UUID
     namespace_id: str

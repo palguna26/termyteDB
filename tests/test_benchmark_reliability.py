@@ -113,6 +113,41 @@ def test_resume_reuses_recorded_work_directory(tmp_path):
     assert run_benchmark.resolve_work_dir(args, {"config": {"work_dir": str(prior)}}, is_e2e=True) == prior
 
 
+def test_resume_work_dir_is_used_directly(tmp_path):
+    prior = tmp_path / "run-existing"
+    args = SimpleNamespace(work_dir=str(tmp_path), resume_work_dir=prior)
+
+    assert run_benchmark.resolve_work_dir(args, None, is_e2e=True) == prior
+
+
+def test_checkpoint_round_trip(tmp_path):
+    args = SimpleNamespace(work_dir=str(tmp_path), mode="end-to-end")
+    traces = [{"status": "completed", "question_id": "q1"}]
+
+    run_benchmark._write_checkpoint(
+        tmp_path,
+        manifest={"mode": "end-to-end"},
+        args=args,
+        dataset_sha256="abc",
+        traces=traces,
+    )
+
+    saved = __import__("json").loads((tmp_path / "longmemeval_checkpoint.json").read_text(encoding="utf-8"))
+    assert saved["traces"] == traces
+    assert saved["dataset_sha256"] == "abc"
+
+
+def test_fresh_benchmark_log_replaces_old_contents(tmp_path):
+    log_path = tmp_path / "benchmark.log"
+    log_path.write_text("old failure", encoding="utf-8")
+
+    run_benchmark._configure_benchmark_logging(log_path, append=False)
+    run_benchmark._BENCHMARK_LOGGER.info("new run")
+
+    assert "old failure" not in log_path.read_text(encoding="utf-8")
+    assert "new run" in log_path.read_text(encoding="utf-8")
+
+
 def test_normalize_legacy_manifest_equals_new_manifest():
     legacy = {"mode": "retrieval", "pack_atoms": 40, "token_budget": 1500, "dataset_sha256": "abc"}
     current = {"mode": "retrieval", "retrieval_limit": 40, "dataset_sha256": "abc"}
@@ -168,3 +203,4 @@ def test_normalize_accepts_haystack_sessions_later_than_question_metadata():
     )
 
     assert [session[0] for session in samples[0].sessions] == ["session-1", "session-2"]
+    assert samples[0].question_date == "2023/04/10 (Mon) 10:15"

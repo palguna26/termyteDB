@@ -125,6 +125,38 @@ def test_simple_memory_candidate_without_llm_offsets_reaches_storage_and_search(
     db.close()
 
 
+def test_raw_session_search_survives_empty_memory_extraction(tmp_path):
+    class EmptyProvider:
+        name = "empty"
+        model = "empty-v1"
+
+        def extract(self, request, timeout_seconds=30.0, cancellation=None):
+            return ProviderResult(
+                response=ExtractionResponse(schema_version="extraction-v1", prompt_version="simple-v1", candidates=[]),
+                provider_name=self.name, model_name=self.model, prompt_version="simple-v1", raw_response_hash="test",
+                input_tokens=1, output_tokens=1, latency_ms=1, stage="facts",
+            )
+
+    db = TermyteDB(tmp_path / "raw-session.sqlite", extraction_provider=EmptyProvider(), embedding_provider=RecordingEmbedding())
+    db.ingest({"namespace_id": "raw", "idempotency_key": "one", "type": "conversation", "stream_id": "s1", "payload": {"text": "My favorite database is SQLite."}})
+
+    assert db.memories("raw") == []
+    hit = db.search_sessions("raw", "Which database is my favorite?", limit=1)[0]
+    assert hit.session_id == "s1"
+    assert "SQLite" in hit.text
+    assert db.search_context("raw", "favorite database", limit=1)["sessions"][0].session_id == "s1"
+    db.close()
+
+
+def test_memory_search_accepts_a_large_transcript_query(tmp_path):
+    db = TermyteDB(tmp_path / "large-query.sqlite", extraction_provider=SimpleResultProvider(), embedding_provider=RecordingEmbedding())
+    db.ingest({"namespace_id": "large", "idempotency_key": "one", "type": "conversation", "payload": {"text": "SQLite is used."}})
+
+    # This previously produced more than 1,000 SQL OR expressions.
+    assert isinstance(db.search("large", " ".join(f"token{index}" for index in range(1200)), limit=5), list)
+    db.close()
+
+
 def test_provider_failure_keeps_evidence_without_partial_memories(tmp_path):
     db = TermyteDB(tmp_path / "failure.sqlite", extraction_provider=FailingProvider(), embedding_provider=RecordingEmbedding())
 

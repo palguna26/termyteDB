@@ -16,7 +16,7 @@ from ..memory.encoding import score_observation
 from ..memory.extraction import CandidateRejected, ValidatedCandidate
 from ..memory.extractor import Candidate, payload_text
 from ..memory.provider import SessionSummaryProvider
-from ..models import EventInput, EvidenceCitation, ExtractionCandidate, MemoryResponse, SearchResult, temporal_recency_score
+from ..models import EventInput, EvidenceCitation, ExtractionCandidate, MemoryResponse, SearchResult, SessionSearchResult, temporal_recency_score
 from ..retrieval.embedding import EmbeddingProvider, FastEmbedProvider, batch_dot, pack_embedding
 from .db import Database
 from .vector_index import SQLiteVecIndex
@@ -521,7 +521,10 @@ class Repository:
         from the current input events.
         Keeps input tokens ~800 (5*~120) vs 20*120=2400 to avoid output>input.
         """
-        results = self.search(namespace_id, query, max(1, min(limit, 5)), historical=False, internal=True)
+        # Reconciliation receives an ingestion batch, not a user query. Bound
+        # it before search so a long transcript cannot generate a SQLite query
+        # with more than its 1,000-expression limit.
+        results = self.search(namespace_id, query[:12000], max(1, min(limit, 5)), historical=False, internal=True)
         return [
             {
                 "ref": f"m{index}",
@@ -1227,7 +1230,9 @@ class Repository:
         return result
 
     def search(self, namespace_id: str, query: str, limit: int, historical: bool = False, *, internal: bool = False) -> list[SearchResult]:
-        terms = list(dict.fromkeys(term.casefold() for term in re.findall(r"[\w./:-]+", query) if len(term) > 1 and term.casefold() not in SEARCH_STOP_WORDS))
+        # Each term becomes one SQL/FTS expression. SQLite has a hard maximum
+        # expression depth, so cap user and internal transcript queries alike.
+        terms = list(dict.fromkeys(term.casefold() for term in re.findall(r"[\w./:-]+", query) if len(term) > 1 and term.casefold() not in SEARCH_STOP_WORDS))[:64]
         prefer_oldest = historical and bool(re.search(r"\b(first|earliest|initial|original|before|used to|previous|previously|former|formerly)\b", query, re.I))
         lexical: dict[str, float] = {}
         lexical_rank: dict[str, int] = {}
@@ -1408,6 +1413,40 @@ class Repository:
         if not internal:
             self.record_retrieval(namespace_id, [str(item.memory_id) for item in results], successful=bool(results))
         return results
+
+    def search_sessions(self, namespace_id: str, query: str, limit: int = 20) -> list[SessionSearchResult]:
+        """Search raw conversation sessions without requiring LLM extraction.
+
+        Events are the durable source of truth. This small lexical fallback is
+        deliberately independent of embeddings so a failed/empty extraction
+        never makes a session disappear from retrieval.
+        """
+        terms = [term.casefold() for term in re.findall(r"[\w./:-]+", query) if len(term) > 1 and term.casefold() not in SEARCH_STOP_WORDS]
+        rows = self.db.execute(
+            "SELECT id, stream_id, session_id, occurred_at, payload_json, type FROM events WHERE namespace_id=? ORDER BY occurred_at, id",
+            (namespace_id,),
+        ).fetchall()
+        grouped: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            session_id = str(row["stream_id"] or row["session_id"] or row["id"])
+            item = grouped.setdefault(session_id, {"event_ids": [], "parts": [], "occurred_at": row["occurred_at"]})
+            item["event_ids"].append(uuid.UUID(row["id"]))
+            try:
+                item["parts"].append(payload_text(json.loads(row["payload_json"]), row["type"]))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+        hits: list[SessionSearchResult] = []
+        for session_id, item in grouped.items():
+            text = "\n".join(part for part in item["parts"] if part).strip()
+            if not text:
+                continue
+            lowered = text.casefold()
+            matched = sum(term in lowered for term in terms)
+            if terms and not matched:
+                continue
+            score = matched / max(1, len(terms))
+            hits.append(SessionSearchResult(session_id=session_id, event_ids=item["event_ids"], text=text, occurred_at=item["occurred_at"], score=score))
+        return sorted(hits, key=lambda hit: (-hit.score, hit.session_id))[:limit]
 
     def _citations(self, namespace_id: str, version_id: str) -> list[EvidenceCitation]:
         rows = self.db.execute(
