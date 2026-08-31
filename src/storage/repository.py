@@ -166,6 +166,40 @@ class Repository:
                 (namespace_id, org_id, iso()),
             )
 
+    def create_processing_job(self, namespace_id: str, event_id: str, content_hash: str) -> str:
+        """Create a pending processing job for an event. Idempotent per event."""
+        job_id = str(uuid.uuid4())
+        with self.db.lock, self.db.connection:
+            existing = self.db.execute(
+                "SELECT id FROM processing_jobs WHERE namespace_id=? AND event_id=? AND status IN ('pending','processing','failed')",
+                (namespace_id, event_id),
+            ).fetchone()
+            if existing:
+                return existing["id"]
+            self.db.execute(
+                """INSERT INTO processing_jobs
+                (id, namespace_id, event_id, input_hash, status, created_at, updated_at)
+                VALUES (?, ?, ?, ?, 'pending', ?, ?)""",
+                (job_id, namespace_id, event_id, content_hash, iso(), iso()),
+            )
+        return job_id
+
+    def enqueue_failed_job(self, namespace_id: str, event_id: str, content_hash: str, error: str, retryable: bool = True) -> str:
+        job_id = self.create_processing_job(namespace_id, event_id, content_hash)
+        # Transition pending -> failed/dead with backoff
+        self.fail_job(namespace_id, job_id, error, retryable=retryable)
+        return job_id
+
+    def delete_completed_jobs(self, namespace_id: str, event_ids: list[str]) -> None:
+        if not event_ids:
+            return
+        placeholders = ",".join("?" for _ in event_ids)
+        with self.db.lock, self.db.connection:
+            self.db.execute(
+                f"DELETE FROM processing_jobs WHERE namespace_id=? AND event_id IN ({placeholders}) AND status IN ('completed','pending')",
+                (namespace_id, *event_ids),
+            )
+
     def ingest(self, namespace_id: str, event: EventInput, redacted_payload: dict[str, Any]) -> tuple[str, bool, str]:
         if event.namespace_id != namespace_id:
             raise ValueError("event namespace does not match repository namespace")
@@ -662,6 +696,7 @@ class Repository:
         error: str,
         *,
         retryable: bool = True,
+        retry_after: float | None = None,
         lease_token: str | None = None,
     ) -> str:
         with self.db.connection:
@@ -682,7 +717,13 @@ class Repository:
                 if not owner:
                     return "stale"
             status = "dead" if not retryable or row["attempts"] >= row["max_attempts"] else "failed"
-            delay = min(300, 2 ** max(1, int(row["attempts"])))
+            # Honor Retry-After if provided (e.g. 429 retry_after=60 should not be immediately claimable)
+            if retry_after is not None and retry_after > 0:
+                delay = min(3600.0, max(0.0, float(retry_after)))
+            elif row["status"] == "pending" and int(row["attempts"]) == 0:
+                delay = 0
+            else:
+                delay = min(300, 2 ** max(1, int(row["attempts"])))
             self.db.execute(
                 """UPDATE processing_jobs
                 SET status=?, lease_until=NULL, lease_token=NULL, next_attempt_at=?, last_error=?, updated_at=?
@@ -690,10 +731,18 @@ class Repository:
                 (status, None, error, iso(), job_id, namespace_id),
             )
             if status != "dead":
-                self.db.execute(
-                    "UPDATE processing_jobs SET next_attempt_at=datetime('now', ?) WHERE id=? AND namespace_id=?",
-                    (f"+{delay} seconds", job_id, namespace_id),
-                )
+                if delay == 0:
+                    self.db.execute(
+                        "UPDATE processing_jobs SET next_attempt_at=datetime('now') WHERE id=? AND namespace_id=?",
+                        (job_id, namespace_id),
+                    )
+                else:
+                    # SQLite datetime modifier requires integer seconds; round up
+                    secs = int(delay) if delay == int(delay) else int(delay) + 1
+                    self.db.execute(
+                        "UPDATE processing_jobs SET next_attempt_at=datetime('now', ?) WHERE id=? AND namespace_id=?",
+                        (f"+{secs} seconds", job_id, namespace_id),
+                    )
             return status
 
     def cancel_job(self, namespace_id: str, job_id: str) -> bool:

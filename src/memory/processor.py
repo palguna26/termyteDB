@@ -21,11 +21,9 @@ from .provider import ExtractionProvider, ProviderError, SessionSummaryProvider,
 def _get_extraction_stages() -> list[str]:
     raw = os.environ.get("TERMYTEDB_EXTRACTION_STAGES")
     if raw is None or raw.strip() == "":
-        # Defaults favor quality in production; keep single-stage fallback only for test harness
-        # to avoid breaking existing legacy tests that expect 1 call.
-        if os.environ.get("PYTEST_CURRENT_TEST"):
-            return ["facts"]
-        return list(EXTRACTION_STAGES)
+        # Production default is single-stage (facts) to avoid 5× LLM cost.
+        # Opt-in to multi-stage via TERMYTEDB_EXTRACTION_STAGES=all or comma list.
+        return ["facts"]
     raw = raw.strip()
     if raw.lower() in {"all", "*"}:
         return list(EXTRACTION_STAGES)
@@ -92,6 +90,7 @@ class Processor:
         all_candidates: list[Any] = []
         provider_results: list[Any] = []
         last_error: Exception | None = None
+        retryable_error: ProviderError | None = None
         for stage in stages:
             # Check cancellation deadline
             remaining = max(0.001, deadline - time.perf_counter())
@@ -121,9 +120,14 @@ class Processor:
                     else:
                         all_candidates.append(c)
                 provider_results.append(pr)
+                # Pacing between stages to avoid burst 429s when multi-stage is enabled
+                if len(stages) > 1 and stage != stages[-1]:
+                    time.sleep(0.15)
             except ProviderError as exc:
                 last_error = exc
-                log(self.logger, logging.WARNING, "processing.stage_failed", namespace_id=namespace_id, stage=stage, error=str(exc))
+                if exc.retryable:
+                    retryable_error = exc
+                log(self.logger, logging.WARNING, "processing.stage_failed", namespace_id=namespace_id, stage=stage, error=str(exc), retryable=exc.retryable)
                 continue
             except Exception as exc:
                 last_error = exc
@@ -131,7 +135,11 @@ class Processor:
                 continue
         if not provider_results and last_error is not None:
             raise last_error
-        # One failed stage does not silently erase successful stages - we keep what succeeded
+        # Rate-limit or other retryable failures must not silently produce partial memories.
+        # If any stage failed retryably, fail the whole batch so the job remains retryable.
+        if retryable_error is not None and len(provider_results) != len(stages):
+            log(self.logger, logging.WARNING, "processing.retryable_partial_suppressed", namespace_id=namespace_id, succeeded=len(provider_results), failed=len(stages) - len(provider_results))
+            raise retryable_error
         meta = {"stages": stages, "succeeded": len(provider_results), "failed": len(stages) - len(provider_results)}
         return all_candidates, provider_results, meta
 
@@ -200,7 +208,10 @@ class Processor:
             # Record reconciliation trace if needed (could be separate run)
             log(self.logger, logging.INFO, "processing.reconciliation_completed", namespace_id=namespace_id, decisions=len(result.response.decisions))
         except ProviderError as exc:
-            log(self.logger, logging.WARNING, "processing.reconciliation_failed", namespace_id=namespace_id, error=str(exc))
+            log(self.logger, logging.WARNING, "processing.reconciliation_failed", namespace_id=namespace_id, error=str(exc), retryable=exc.retryable, retry_after=getattr(exc, "retry_after", None))
+            if exc.retryable:
+                # Retryable reconciliation failure must not silently persist partial extraction.
+                raise
         except Exception as exc:
             log(self.logger, logging.WARNING, "processing.reconciliation_failed", namespace_id=namespace_id, error=str(exc))
         return candidates
@@ -601,16 +612,28 @@ class Processor:
                 if self._run_exists(namespace_id, run_id):
                     self.repository.finish_run(namespace_id, run_id, batch_accepted, batch_rejected, "failed", error_class)
                 for job, _event in batch:
+                    retry_after = getattr(exc, "retry_after", None) if isinstance(exc, ProviderError) else None
+                    # Fallback parse from message
+                    if retry_after is None and "retry_after=" in safe_error:
+                        try:
+                            import re
+
+                            m = re.search(r"retry_after=([0-9.]+)", safe_error)
+                            if m:
+                                retry_after = float(m.group(1))
+                        except Exception:
+                            retry_after = None
                     status = self.repository.fail_job(
                         namespace_id,
                         job["id"],
                         safe_error,
                         retryable=not isinstance(exc, ProviderError) or exc.retryable,
+                        retry_after=retry_after,
                         lease_token=str(job["lease_token"]),
                     )
                     failed += 1
                     dead += status == "dead"
-                    log(self.logger, logging.ERROR, "processing.failed", namespace_id=namespace_id, job_id=job["id"], status=status, error=safe_error)
+                    log(self.logger, logging.ERROR, "processing.failed", namespace_id=namespace_id, job_id=job["id"], status=status, error=safe_error, retry_after=retry_after)
         for episode_id in sorted(episode_ids):
             try:
                 self.repository.refresh_episode_summary(namespace_id, episode_id, summary_provider=self.summary_provider)

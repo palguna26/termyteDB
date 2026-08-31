@@ -44,7 +44,7 @@ import threading
 import time
 from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -291,20 +291,42 @@ class Sample:
 
 def normalize_samples(raw: Any) -> list[Sample]:
     items = raw if isinstance(raw, list) else raw.get("data", raw.get("samples", []))
+    if not isinstance(items, list):
+        raise ValueError("dataset must contain a list of samples")
     samples: list[Sample] = []
     for item in items:
+        required = ("question_id", "question", "question_type", "answer", "answer_session_ids", "haystack_session_ids", "haystack_dates", "haystack_sessions")
+        missing = [key for key in required if key not in item]
+        if missing:
+            raise ValueError(f"sample missing required fields: {', '.join(missing)}")
         sessions: list[tuple[str, str, tuple[dict[str, str], ...]]] = []
         raw_words = 0
         ids = item.get("haystack_session_ids", [])
         dates = item.get("haystack_dates", [])
-        for index, messages in enumerate(item.get("haystack_sessions", [])):
-            session_id = str(ids[index]) if index < len(ids) else f"session-{index}"
-            date = str(dates[index]) if index < len(dates) else ""
+        histories = item.get("haystack_sessions", [])
+        if not (len(ids) == len(dates) == len(histories)):
+            raise ValueError(f"{item['question_id']}: haystack arrays must have matching lengths")
+        for index, messages in enumerate(histories):
+            if not isinstance(ids[index], str) or not ids[index].strip():
+                raise ValueError(f"{item['question_id']}: session IDs must be non-empty strings")
+            session_id = ids[index]
+            date = str(dates[index])
+            if not isinstance(messages, list):
+                raise ValueError(f"{item['question_id']}: session turns must be lists")
             turns = tuple(
-                {"role": str(message.get("role", "user")), "content": str(message.get("content", ""))} for message in messages if isinstance(message, dict)
+                {"role": message["role"], "content": message["content"]} for message in messages
             )
+            if any(turn["role"] not in ("user", "assistant") or not isinstance(turn["content"], str) for turn in turns):
+                raise ValueError(f"{item['question_id']}: turns require user/assistant role and string content")
             raw_words += sum(len(turn["content"].split()) for turn in turns)
             sessions.append((session_id, date, turns))
+        dated = [(_parse_haystack_date(date), index, session) for index, session in enumerate(sessions)]
+        if any(parsed is not None for parsed, _, _ in dated):
+            sessions = [session for _, _, session in sorted(dated, key=lambda value: (value[0] is None, value[0] or datetime.min.replace(tzinfo=UTC), value[1]))]
+        question_date = item.get("question_date")
+        qdate = _parse_haystack_date(str(question_date)) if question_date else None
+        if qdate and any(parsed and qdate <= parsed for parsed, _, _ in dated):
+            raise ValueError(f"{item['question_id']}: question_date must be later than haystack dates")
         samples.append(
             Sample(
                 question_id=str(item.get("question_id", len(samples))),
@@ -531,6 +553,7 @@ def _run_manifest(args: argparse.Namespace, data_path: Path, dataset_sha256: str
     retrieval_limit = _get_retrieval_limit(args)
     return {
         "mode": canonical_mode,
+        "baseline": getattr(args, "baseline", "system"),
         "dataset_path": str(data_path),
         "dataset_sha256": dataset_sha256,
         "extraction": getattr(args, "extraction", None),
@@ -673,7 +696,7 @@ def retrieve_e2e_session_ranking(database_path: Path, sample: Sample, args: argp
         if not getattr(args, "no_rerank", False):
             reranked = rerank_memory_hits(sample.question, search_results, args.abstain_threshold)
             abstained = reranked is None
-            ranked = reranked or search_results
+            ranked = reranked if reranked is not None else []
         latency_ms = (time.perf_counter() - started) * 1000
 
         # Map retrieved memories to session_ids via evidence events
@@ -792,6 +815,9 @@ def retrieve_session_ranking(database_path: Path, sample: Sample, args: argparse
     db = Database(database_path)
     started = time.perf_counter()
     try:
+        if getattr(args, "baseline", "system") == "full-history":
+            order = [session_id for session_id, _, _ in sample.sessions]
+            return {"session_order": order, "best_rank": next((i for i, sid in enumerate(order[:args.recall_k], 1) if sid in sample.answer_session_ids), None), "ndcg": 1.0 if sample.answer_session_ids else 0.0, "abstained": False, "packed": "\n".join(t["content"] for _, _, turns in sample.sessions for t in turns), "packed_words": sample.raw_words, "latency_ms": 0.0, "candidate_count": len(order)}
         limit = max(args.recall_k * 10, 50)
         ns = sample.question_id if getattr(args, "single_db", False) else None
         if args.no_dense:
@@ -803,7 +829,7 @@ def retrieve_session_ranking(database_path: Path, sample: Sample, args: argparse
         if not args.no_rerank:
             reranked = rerank_hits(sample.question, hits, args.abstain_threshold)
             abstained = reranked is None
-            ranked = reranked or hits
+            ranked = reranked if reranked is not None else []
         latency_ms = (time.perf_counter() - started) * 1000
         session_order: list[str] = []
         seen: set[str] = set()
@@ -928,7 +954,10 @@ def judge_question(question_model: str, judge_model: str, sample: Sample, contex
 
 
 def evaluate_sample(args: argparse.Namespace, sample: Sample, budget: OpenRouterBudget | None) -> dict[str, Any]:
-    database_path = ingest_sample(Path(args.work_dir), sample, skip_embeddings=args.no_dense, single_db=getattr(args, "single_db", False))
+    ingest_target = sample
+    if getattr(args, "baseline", "system") == "oracle":
+        ingest_target = replace(sample, sessions=tuple(s for s in sample.sessions if s[0] in sample.answer_session_ids))
+    database_path = ingest_sample(Path(args.work_dir), ingest_target, skip_embeddings=args.no_dense, single_db=getattr(args, "single_db", False))
     outcome = retrieve_session_ranking(database_path, sample, args)
     trace: dict[str, Any] = {
         "status": "completed",
@@ -938,11 +967,15 @@ def evaluate_sample(args: argparse.Namespace, sample: Sample, budget: OpenRouter
         "best_rank": outcome["best_rank"],
         "ndcg_at_k": round(outcome["ndcg"], 4),
         "abstained": outcome["abstained"],
+        "unanswerable": sample.unanswerable or sample.question_id.endswith("_abs"),
+        "abstention_correct": bool(outcome["abstained"] == (sample.unanswerable or sample.question_id.endswith("_abs"))),
         "recall": {str(k): int(outcome["best_rank"] is not None and outcome["best_rank"] <= k) for k in (5, 10, args.recall_k)},
         "packed_words": outcome["packed_words"],
         "raw_words": sample.raw_words,
         "retrieval_latency_ms": outcome["latency_ms"],
         "candidate_count": outcome["candidate_count"],
+        "retrieved_memory_count": outcome["candidate_count"],
+        "session_order": outcome["session_order"],
     }
     if args.mode == "judged" and budget is not None:
         judged = judge_question(args.answer_model, args.judge_model, sample, outcome["packed"], budget)
@@ -1008,6 +1041,7 @@ def evaluate_sample_e2e(args: argparse.Namespace, sample: Sample, budget: OpenRo
         "raw_words": sample.raw_words,
         "retrieval_latency_ms": retrieval_outcome["latency_ms"],
         "candidate_count": retrieval_outcome["candidate_count"],
+        "retrieved_memory_count": retrieval_outcome["candidate_count"],
         # Memory-formation diagnostics
         "e2e_diagnostics": e2e_diag,
         "events_ingested": e2e_diag.get("events_ingested", 0),
@@ -1056,12 +1090,17 @@ def summarize(traces: list[dict[str, Any]], recall_k: int, judged: bool) -> list
     def row_for(name: str, items: list[dict[str, Any]]) -> dict[str, Any]:
         count = len(items)
         row: dict[str, Any] = {"Category": name, "Completed": count}
+        scored = [item for item in items if not item.get("unanswerable", False)]
         for k in ks:
-            row[f"Recall@{k} (%)"] = round(100 * sum(item["recall"][k] for item in items) / count, 1) if count else None
-        row[f"MRR@{recall_k}"] = round(sum((1 / item["best_rank"]) if item["best_rank"] else 0.0 for item in items) / count, 3) if count else None
-        row[f"NDCG@{recall_k}"] = round(sum(item["ndcg_at_k"] for item in items) / count, 3) if count else None
+            row[f"Recall@{k} (%)"] = round(100 * sum(item["recall"][k] for item in scored) / len(scored), 1) if scored else None
+        row[f"MRR@{recall_k}"] = round(sum((1 / item["best_rank"]) if item["best_rank"] else 0.0 for item in scored) / len(scored), 3) if scored else None
+        row[f"NDCG@{recall_k}"] = round(sum(item["ndcg_at_k"] for item in scored) / len(scored), 3) if scored else None
         row["Avg Retrieved Words"] = round(sum(item["packed_words"] for item in items) / count, 1) if count else None
         row["Avg Latency (ms)"] = round(sum(item["retrieval_latency_ms"] for item in items) / count, 1) if count else None
+        if count:
+            row["Abstention Rate (%)"] = round(100 * sum(bool(item.get("abstained")) for item in items) / count, 1)
+            unanswerable = [item for item in items if item.get("unanswerable")]
+            row["Abstention Accuracy (%)"] = round(100 * sum(bool(item.get("abstention_correct")) for item in unanswerable) / len(unanswerable), 1) if unanswerable else None
         # End-to-end diagnostics averages where present
         if any("e2e_diagnostics" in it for it in items):
             row["Avg Memories"] = round(sum(it.get("memories_created", 0) for it in items) / count, 1) if count else 0.0
@@ -1127,6 +1166,12 @@ def run(args: argparse.Namespace) -> int:
     dataset_bytes = data_path.read_bytes()
     dataset_sha256 = hashlib_sha256(dataset_bytes)
     samples = normalize_samples(json.loads(dataset_bytes.decode("utf-8")))
+    if data_path.name == DEFAULT_DATA_PATH.name and len(samples) != 500:
+        raise SystemExit(f"standard LongMemEval-S dataset must contain 500 samples (found {len(samples)})")
+    if data_path.name == DEFAULT_MICRO_PATH.name:
+        counts = Counter(sample.question_type for sample in samples)
+        if len(samples) != 30 or any(counts.get(category, 0) != 5 for category in CATEGORY_ORDER):
+            raise SystemExit("micro dataset must contain 30 samples with five per category")
     if args.task:
         samples = [item for item in samples if item.question_type == args.task]
     resume_ids: set[str] = set()
@@ -1289,6 +1334,7 @@ def hashlib_sha256(payload: bytes) -> str:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="TermyteDB LongMemEval-S benchmark")
+    parser.add_argument("--baseline", choices=("system", "oracle", "full-history"), default="system", help="evaluation baseline")
     parser.add_argument(
         "--mode",
         choices=("retrieval", "retrieval-only", "end-to-end", "judged", "end_to_end", "e2e"),

@@ -13,9 +13,10 @@ __pycache__/
 research/
 *.egg-info/
 benchmarks/longmemeval/*.json
-!benchmarks/longmemeval/longmemeval_s_cleaned.json
+benchmarks/longmemeval/longmemeval_s_cleaned.json
 benchmarks/longmemeval/*.sqlite*
 benchmarks/longmemeval/*.log
 benchmarks/longmemeval/*.err
 benchmarks/runs/*
 results/
+skills/

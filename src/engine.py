@@ -86,10 +86,12 @@ class TermyteDB:
 
         receipts: list[EventReceipt] = []
         new_event_ids: list[str] = []
+        event_hashes: dict[str, str] = {}
         for parsed, redacted_payload in prepared:
             event_id, duplicate, content_hash = self.repository.ingest(parsed.namespace_id, parsed, redacted_payload)
             if not duplicate:
                 new_event_ids.append(event_id)
+                event_hashes[event_id] = content_hash
             receipts.append(
                 EventReceipt(
                     event_id=UUID(event_id),
@@ -107,9 +109,48 @@ class TermyteDB:
                 duplicate=duplicate,
             )
 
+        # Durability: enqueue jobs before extraction so failures remain retryable
+        job_ids: dict[str, str] = {}
+        for event_id in new_event_ids:
+            job_id = self.repository.create_processing_job(namespace_id, event_id, event_hashes[event_id])
+            job_ids[event_id] = job_id
+
         accepted = rejected = 0
         if new_event_ids:
-            _, accepted, rejected = self.processor.process_events(namespace_id, new_event_ids)
+            try:
+                _, accepted, rejected = self.processor.process_events(namespace_id, new_event_ids)
+                # Direct success: remove the now-completed jobs (keeps 0 pending after success)
+                self.repository.delete_completed_jobs(namespace_id, new_event_ids)
+            except Exception as exc:
+                from .memory.provider import ProviderError as _ProviderError
+
+                # Ensure jobs are marked as failed/retryable for later process() calls
+                retryable = getattr(exc, "retryable", True) if isinstance(exc, _ProviderError) else True
+                retry_after = getattr(exc, "retry_after", None) if isinstance(exc, _ProviderError) else None
+                # If provider was never configured, treat as retryable ValueError
+                if isinstance(exc, ValueError) and "no extraction provider" in str(exc):
+                    retryable = True
+                    retry_after = None
+                    exc = _ProviderError(str(exc), retryable=True, error_class="no_provider")
+                # Also try to parse Retry-After from message if not structured (fallback)
+                if retry_after is None and "retry_after=" in str(exc):
+                    try:
+                        import re
+
+                        m = re.search(r"retry_after=([0-9.]+)", str(exc))
+                        if m:
+                            retry_after = float(m.group(1))
+                    except Exception:
+                        retry_after = None
+                error_msg = str(exc)[:500]
+                for event_id in new_event_ids:
+                    job_id = job_ids.get(event_id)
+                    if job_id:
+                        try:
+                            self.repository.fail_job(namespace_id, job_id, error_msg, retryable=retryable, retry_after=retry_after)
+                        except Exception:
+                            pass
+                raise exc
         return BatchEventResponse(receipts=receipts, accepted=accepted, rejected=rejected)
 
     # -- Core read/write with temporal blocks ---------------------------------

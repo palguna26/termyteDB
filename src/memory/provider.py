@@ -39,6 +39,31 @@ from ..models import (
 )
 
 
+def _parse_retry_after(value: str | None) -> float | None:
+    if not value:
+        return None
+    value = str(value).strip()
+    try:
+        # Seconds as integer/float
+        return max(0.0, float(value))
+    except ValueError:
+        pass
+    # HTTP date - crude fallback: treat as 5s
+    try:
+        from email.utils import parsedate_to_datetime
+
+        dt = parsedate_to_datetime(value)
+        if dt is not None:
+            from datetime import datetime, timezone
+
+            now = datetime.now(timezone.utc)
+            delta = (dt - now).total_seconds()
+            return max(0.0, delta)
+    except Exception:
+        return None
+    return None
+
+
 def _openrouter_chat(base_url: str, api_key: str | None, body: dict[str, object], *, title: str, timeout: float) -> tuple[dict[str, Any], bytes]:
     if not api_key:
         raise ValueError("OPENROUTER_API_KEY is required")
@@ -50,13 +75,46 @@ def _openrouter_chat(base_url: str, api_key: str | None, body: dict[str, object]
                 "authorization": f"Bearer {api_key}",
                 "content-type": "application/json",
                 "http-referer": "https://termyte.dev",
-                  "X-OpenRouter-Title": title,
+                "X-OpenRouter-Title": title,
             },
             method="POST",
         ),
         timeout=timeout,
     ).read()
     return json.loads(raw.decode("utf-8")), raw
+
+
+def _retry_sleep(attempt: int, retry_after: float | None) -> float:
+    if retry_after is not None:
+        return min(60.0, max(0.5, retry_after))
+    # Exponential backoff: 1, 2, 4, 8 ... capped at 30s, with small jitter
+    base = min(30.0, 1.0 * (2**attempt))
+    # Add tiny jitter via hash of time to avoid thundering herd without random import
+    jitter = (hash(str(time.perf_counter())) % 100) / 1000.0
+    return base + jitter
+
+
+def _get_retry_budget() -> int:
+    raw = os.environ.get("TERMYTEDB_EXTRACTION_RETRIES")
+    if raw is None:
+        return 3
+    try:
+        return max(0, min(6, int(raw.strip())))
+    except ValueError:
+        return 3
+
+
+def _cancellable_sleep(seconds: float, cancellation: Callable[[], bool] | None, started: float, timeout_seconds: float) -> None:
+    if seconds <= 0:
+        return
+    end = time.perf_counter() + seconds
+    while time.perf_counter() < end:
+        if cancellation and cancellation():
+            raise ProviderError("extraction cancelled", retryable=True, error_class="cancelled")
+        if time.perf_counter() - started >= timeout_seconds:
+            raise ProviderError("extraction timeout", retryable=True, error_class="timeout")
+        # sleep in small increments to stay cancellation-aware
+        time.sleep(min(0.05, end - time.perf_counter()))
 
 
 def _message_text(payload: dict[str, Any], *, text_parts_only: bool = False) -> str:
@@ -135,10 +193,11 @@ class ReconciliationResult:
 
 
 class ProviderError(RuntimeError):
-    def __init__(self, message: str, *, retryable: bool, error_class: str):
+    def __init__(self, message: str, *, retryable: bool, error_class: str, retry_after: float | None = None):
         super().__init__(message)
         self.retryable = retryable
         self.error_class = error_class
+        self.retry_after = retry_after
 
 
 class ExtractionProvider(Protocol):
@@ -488,17 +547,69 @@ class OpenRouterExtractionProvider:
             "plugins": [{"id": "response-healing"}],
         }
         started = time.perf_counter()
-        try:
-            payload, raw_bytes = _openrouter_chat(self.base_url, self.api_key, body, title=f"TermyteDB Memory Extraction {stage}", timeout=timeout_seconds)
-        except HTTPError as exc:
-            detail = exc.read().decode("utf-8", errors="replace").strip()
-            retry_after = exc.headers.get("Retry-After")
-            suffix = f" response={detail}" if detail else ""
-            if retry_after:
-                suffix += f" retry_after={retry_after}"
-            raise ProviderError(f"OpenRouter returned HTTP {exc.code}{suffix}", retryable=exc.code in {408, 429, 500, 502, 503, 504}, error_class="http_error") from exc
-        except (TimeoutError, URLError, OSError) as exc:
-            raise ProviderError("OpenRouter request failed", retryable=True, error_class="transport_error") from exc
+        max_retries = _get_retry_budget()
+        payload: dict[str, Any] | None = None
+        raw_bytes: bytes | None = None
+        last_exc: Exception | None = None
+        for attempt in range(max_retries + 1):
+            elapsed = time.perf_counter() - started
+            remaining = timeout_seconds - elapsed
+            if remaining <= 0:
+                raise ProviderError("extraction timeout", retryable=True, error_class="timeout")
+            if cancellation and cancellation():
+                raise ProviderError("extraction cancelled", retryable=True, error_class="cancelled")
+            if attempt > 0:
+                # Pacing between retries / stages — cancellation-aware
+                _cancellable_sleep(0.1, cancellation, started, timeout_seconds)
+                # recompute remaining after pacing
+                elapsed = time.perf_counter() - started
+                remaining = timeout_seconds - elapsed
+                if remaining <= 0:
+                    raise last_exc if last_exc else ProviderError("extraction timeout", retryable=True, error_class="timeout")  # type: ignore[misc]
+            # Use actual remaining, but ensure a minimal viable timeout for the HTTP call
+            call_timeout = max(0.5, remaining) if remaining > 0.5 else remaining
+            # If remaining is tiny (<0.2) there is no point retrying — fail fast
+            if call_timeout < 0.2:
+                raise last_exc if last_exc else ProviderError("extraction timeout", retryable=True, error_class="timeout")  # type: ignore[misc]
+            try:
+                payload, raw_bytes = _openrouter_chat(self.base_url, self.api_key, body, title=f"TermyteDB Memory Extraction {stage}", timeout=call_timeout)
+                break
+            except HTTPError as exc:
+                detail = ""
+                try:
+                    detail = exc.read().decode("utf-8", errors="replace").strip()
+                except Exception:
+                    detail = ""
+                retry_after_raw = exc.headers.get("Retry-After") if hasattr(exc, "headers") and exc.headers else None
+                retry_after = _parse_retry_after(retry_after_raw)
+                suffix = f" response={detail}" if detail else ""
+                if retry_after_raw:
+                    suffix += f" retry_after={retry_after_raw}"
+                retryable = exc.code in {408, 429, 500, 502, 503, 504}
+                last_exc = ProviderError(f"OpenRouter returned HTTP {exc.code}{suffix}", retryable=retryable, error_class="http_error", retry_after=retry_after)
+                if not retryable or attempt >= max_retries:
+                    raise last_exc from exc
+                sleep_s = _retry_sleep(attempt, retry_after)
+                elapsed2 = time.perf_counter() - started
+                remaining2 = timeout_seconds - elapsed2
+                if sleep_s > remaining2:
+                    raise last_exc from exc
+                _cancellable_sleep(sleep_s, cancellation, started, timeout_seconds)
+                continue
+            except (TimeoutError, URLError, OSError) as exc:
+                last_exc = ProviderError("OpenRouter request failed", retryable=True, error_class="transport_error")
+                if attempt >= max_retries:
+                    raise last_exc from exc
+                sleep_s = _retry_sleep(attempt, None)
+                elapsed2 = time.perf_counter() - started
+                remaining2 = timeout_seconds - elapsed2
+                if sleep_s > remaining2:
+                    raise last_exc from exc
+                _cancellable_sleep(sleep_s, cancellation, started, timeout_seconds)
+                continue
+        if payload is None or raw_bytes is None:
+            assert last_exc is not None
+            raise last_exc  # type: ignore[misc]
         if cancellation and cancellation():
             raise ProviderError("extraction cancelled", retryable=True, error_class="cancelled")
         try:
@@ -506,6 +617,8 @@ class OpenRouterExtractionProvider:
             if not choice.strip():
                 raise ProviderError("OpenRouter returned empty extraction content", retryable=True, error_class="empty_output")
             parsed = ExtractionResponse.model_validate(json.loads(clean_json_response(choice)))
+        except ProviderError:
+            raise
         except (UnicodeError, json.JSONDecodeError, KeyError, IndexError, TypeError, ValueError) as exc:
             raise ProviderError("OpenRouter returned invalid extraction-v1 JSON", retryable=False, error_class="invalid_output") from exc
         actual_model = str(payload.get("model", self.model))
@@ -548,17 +661,65 @@ class OpenRouterExtractionProvider:
             "plugins": [{"id": "response-healing"}],
         }
         started = time.perf_counter()
-        try:
-            payload, raw_bytes = _openrouter_chat(self.base_url, self.api_key, body, title="TermyteDB Reconciliation", timeout=timeout_seconds)
-        except HTTPError as exc:
-            detail = exc.read().decode("utf-8", errors="replace").strip()
-            retry_after = exc.headers.get("Retry-After")
-            suffix = f" response={detail}" if detail else ""
-            if retry_after:
-                suffix += f" retry_after={retry_after}"
-            raise ProviderError(f"OpenRouter returned HTTP {exc.code}{suffix}", retryable=exc.code in {408, 429, 500, 502, 503, 504}, error_class="http_error") from exc
-        except (TimeoutError, URLError, OSError) as exc:
-            raise ProviderError("OpenRouter request failed", retryable=True, error_class="transport_error") from exc
+        max_retries = _get_retry_budget()
+        payload: dict[str, Any] | None = None
+        raw_bytes: bytes | None = None
+        last_exc: Exception | None = None
+        for attempt in range(max_retries + 1):
+            elapsed = time.perf_counter() - started
+            remaining = timeout_seconds - elapsed
+            if remaining <= 0:
+                raise ProviderError("reconciliation timeout", retryable=True, error_class="timeout")
+            if cancellation and cancellation():
+                raise ProviderError("reconciliation cancelled", retryable=True, error_class="cancelled")
+            if attempt > 0:
+                _cancellable_sleep(0.1, cancellation, started, timeout_seconds)
+                elapsed = time.perf_counter() - started
+                remaining = timeout_seconds - elapsed
+                if remaining <= 0:
+                    raise last_exc if last_exc else ProviderError("reconciliation timeout", retryable=True, error_class="timeout")  # type: ignore[misc]
+            call_timeout = max(0.5, remaining) if remaining > 0.5 else remaining
+            if call_timeout < 0.2:
+                raise last_exc if last_exc else ProviderError("reconciliation timeout", retryable=True, error_class="timeout")  # type: ignore[misc]
+            try:
+                payload, raw_bytes = _openrouter_chat(self.base_url, self.api_key, body, title="TermyteDB Reconciliation", timeout=call_timeout)
+                break
+            except HTTPError as exc:
+                detail = ""
+                try:
+                    detail = exc.read().decode("utf-8", errors="replace").strip()
+                except Exception:
+                    detail = ""
+                retry_after_raw = exc.headers.get("Retry-After") if hasattr(exc, "headers") and exc.headers else None
+                retry_after = _parse_retry_after(retry_after_raw)
+                suffix = f" response={detail}" if detail else ""
+                if retry_after_raw:
+                    suffix += f" retry_after={retry_after_raw}"
+                retryable = exc.code in {408, 429, 500, 502, 503, 504}
+                last_exc = ProviderError(f"OpenRouter returned HTTP {exc.code}{suffix}", retryable=retryable, error_class="http_error", retry_after=retry_after)
+                if not retryable or attempt >= max_retries:
+                    raise last_exc from exc
+                sleep_s = _retry_sleep(attempt, retry_after)
+                elapsed2 = time.perf_counter() - started
+                remaining2 = timeout_seconds - elapsed2
+                if sleep_s > remaining2:
+                    raise last_exc from exc
+                _cancellable_sleep(sleep_s, cancellation, started, timeout_seconds)
+                continue
+            except (TimeoutError, URLError, OSError) as exc:
+                last_exc = ProviderError("OpenRouter request failed", retryable=True, error_class="transport_error")
+                if attempt >= max_retries:
+                    raise last_exc from exc
+                sleep_s = _retry_sleep(attempt, None)
+                elapsed2 = time.perf_counter() - started
+                remaining2 = timeout_seconds - elapsed2
+                if sleep_s > remaining2:
+                    raise last_exc from exc
+                _cancellable_sleep(sleep_s, cancellation, started, timeout_seconds)
+                continue
+        if payload is None or raw_bytes is None:
+            assert last_exc is not None
+            raise last_exc  # type: ignore[misc]
         if cancellation and cancellation():
             raise ProviderError("reconciliation cancelled", retryable=True, error_class="cancelled")
         try:

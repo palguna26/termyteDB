@@ -85,5 +85,11 @@ def test_provider_failure_keeps_evidence_without_partial_memories(tmp_path):
 
     assert db.database.execute("SELECT COUNT(*) FROM events WHERE namespace_id='failure'").fetchone()[0] == 1
     assert db.database.execute("SELECT COUNT(*) FROM memories WHERE namespace_id='failure'").fetchone()[0] == 0
-    assert db.database.execute("SELECT COUNT(*) FROM processing_jobs").fetchone()[0] == 0
+    # Durable: failed ingestion must leave a retryable job
+    assert db.database.execute("SELECT COUNT(*) FROM processing_jobs WHERE namespace_id='failure'").fetchone()[0] == 1
+    row = db.database.execute("SELECT status, next_attempt_at FROM processing_jobs WHERE namespace_id='failure'").fetchone()
+    assert row[0] in {"failed", "dead", "pending"}
+    # Retry via process() still sees the job (will fail again with same provider, immediately retryable)
+    resp = db.process("failure")
+    assert resp.failed == 1 or resp.dead_lettered == 1
     db.close()

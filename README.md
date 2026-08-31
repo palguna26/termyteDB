@@ -11,10 +11,14 @@ python -m pytest
 
 ## Use
 
+Provider is explicit. Use `FakeExtractionProvider` for offline/tests and `OpenRouterExtractionProvider` in production.
+
 ```python
 from src import TermyteDB
+from src.memory.provider import FakeExtractionProvider
 
-db = TermyteDB("memory.sqlite")
+# Offline / tests (no network, single LLM call per ingest by default)
+db = TermyteDB("memory.sqlite", extraction_provider=FakeExtractionProvider())
 db.ingest({
     "namespace_id": "demo",
     "idempotency_key": "event-1",
@@ -22,10 +26,38 @@ db.ingest({
     "payload": {"text": "Decision: use SQLite."},
 })
 results = db.search("demo", "database choice", limit=5)
-
 for memory in results:
     print(memory.statement)
+db.close()
+```
 
+Production:
+
+```python
+import os
+from src import TermyteDB
+from src.memory.provider import OpenRouterExtractionProvider
+
+db = TermyteDB(
+    "memory.sqlite",
+    extraction_provider=OpenRouterExtractionProvider(
+        model=os.environ["TERMYTEDB_EXTRACTION_MODEL"],
+        api_key=os.environ["OPENROUTER_API_KEY"],
+    ),
+)
+# Optional: enable multi-stage extraction (facts, preferences, events, decisions, relationships)
+# os.environ["TERMYTEDB_EXTRACTION_STAGES"] = "all"
+# os.environ["TERMYTEDB_RECONCILIATION_ENABLED"] = "1"
+db.ingest({
+    "namespace_id": "demo",
+    "idempotency_key": "event-1",
+    "type": "decision",
+    "payload": {"text": "Decision: use SQLite."},
+})
+# If ingest raises ProviderError (e.g. 429), the event is durably stored and a retryable
+# processing job remains. Retry with:
+#   db.process("demo")
+results = db.search("demo", "database choice", limit=5)
 db.close()
 ```
 
