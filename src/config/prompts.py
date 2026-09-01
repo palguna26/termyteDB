@@ -209,14 +209,21 @@ def _build_stage_prompt(stage: str, request: ExtractionRequest) -> str:
 
 
 def build_extraction_prompt(request: ExtractionRequest) -> str:
-    """Build one simple, one-call extraction request."""
-    evidence = "\n".join(f"<event id='{event_id}'>\n{value}\n</event>" for event_id, value in request.evidence_text.items())
+    """Build the small, one-call extraction prompt used in production."""
+    labels = request.event_labels or {f"e{index + 1}": event_id for index, event_id in enumerate(request.evidence_text)}
+    reverse_labels = {str(event_id): label for label, event_id in labels.items()}
+    evidence = "\n".join(
+        f"<event id='{reverse_labels[str(event_id)]}' role='{request.event_roles.get(event_id, 'user')}'>\n{value}\n</event>"
+        for event_id, value in request.evidence_text.items()
+    )
     return (
-        "Extract factual details that can answer a later question about this conversation. "
-        "Include preferences, decisions, relationships, corrections, concrete events, tasks, dates, and updates. "
-        "Keep both durable facts and important temporary details; omit only greetings, small talk, and empty questions. "
-        "Return only JSON in this exact form: {\"memory\":[\"short standalone memory\"]}. "
-        "Use an empty list when there is nothing worth remembering.\n\n"
+        "Extract useful long-term memories from the conversation. Return several short, standalone memories when the event contains several facts. "
+        "Keep user preferences, assistant facts, decisions, corrections, concrete events, tasks, relationships, and changes. Omit greetings and empty small talk. "
+        "For every memory, cite the event label where it came from. Do not invent labels. "
+        "TermyteDB handles chunks, roles, dates, evidence spans, identity, and updates; do not return them. "
+        "Return only JSON in exactly this shape: {\"schema_version\":\"extraction-v2\",\"memories\":[{\"memory\":\"short standalone fact\",\"source_event\":\"e1\"}]}. "
+        "Use an empty memories list only when there is nothing worth remembering. "
+        "\n\n"
         + "<conversation>\n"
         + evidence
         + "\n</conversation>"

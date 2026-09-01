@@ -480,6 +480,17 @@ MIGRATIONS: tuple[str, ...] = (
       PRIMARY KEY(chunk_id, provider, contextual)
     );
     CREATE INDEX chunk_embeddings_provider_idx ON chunk_embeddings(namespace_id, provider, contextual);
+    """,
+    """
+    CREATE TABLE chunk_events (
+      chunk_id TEXT NOT NULL REFERENCES chunks(chunk_id) ON DELETE CASCADE,
+      namespace_id TEXT NOT NULL REFERENCES namespaces(id),
+      event_id TEXT NOT NULL REFERENCES events(id),
+      session_id TEXT NOT NULL,
+      PRIMARY KEY(chunk_id, event_id)
+    );
+    CREATE INDEX chunk_events_event_idx ON chunk_events(namespace_id, event_id, chunk_id);
+    CREATE INDEX chunk_events_session_idx ON chunk_events(namespace_id, session_id, chunk_id);
     """
 )
 

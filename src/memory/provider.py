@@ -154,7 +154,7 @@ def _simple_subject(statement: str) -> str:
     return " ".join(words[:6]) or "memory"
 
 
-def _simple_response_to_extraction(value: Any) -> ExtractionResponse:
+def _simple_response_to_extraction(value: Any, request: ExtractionRequest | None = None) -> ExtractionResponse:
     """Convert the tiny LLM response into the existing storage contract.
 
     Source event links are assigned by the processor.  We intentionally do not
@@ -162,6 +162,66 @@ def _simple_response_to_extraction(value: Any) -> ExtractionResponse:
     """
     if isinstance(value, dict) and value.get("schema_version") == "extraction-v1":
         return ExtractionResponse.model_validate(value)
+    if isinstance(value, dict) and value.get("schema_version") == "extraction-v2":
+        candidates: list[ExtractionCandidate] = []
+        event_labels = request.event_labels if request else {}
+        chunk_labels = request.chunk_labels if request else {}
+        event_chunk_labels = request.event_chunk_labels if request else {}
+        roles = request.event_roles if request else {}
+        for fields in value.get("memories", []):
+            if not isinstance(fields, dict):
+                continue
+            # The model only supplies the memory and compact event label.  It
+            # does not need to reproduce fragile quotes, roles, or chunk ids.
+            statement = " ".join(str(fields.get("memory") or fields.get("statement", "")).split())
+            event_id = event_labels.get(str(fields.get("source_event") or fields.get("source_event_label", "")))
+            if not statement or event_id is None or request is None:
+                continue
+            source = request.evidence_text.get(event_id, "")
+            if not source:
+                continue
+            quote = str(fields.get("evidence_quote", "")).strip()
+            if quote:
+                start = source.find(quote)
+                if start < 0:
+                    continue
+            else:
+                # Trusted raw event text is evidence.  Never substitute the
+                # generated statement as evidence.
+                start = 0
+                quote = source[:2000]
+            chunk_label = str(fields.get("source_chunk_label", "")) or event_chunk_labels.get(event_id, "")
+            chunk_id = chunk_labels.get(chunk_label)
+            role = roles.get(event_id, "user")
+            entity = " ".join(str(fields.get("entity_key", "")).casefold().split())
+            predicate = " ".join(str(fields.get("predicate_key", "")).casefold().split())
+            subject = f"{entity}::{predicate}" if entity and predicate else _simple_subject(statement)
+            kind = str(fields.get("kind", "fact"))
+            if kind not in {"fact", "decision", "attempt", "failure", "outcome", "constraint", "procedure", "task_state", "correction", "question"}:
+                kind = "fact"
+            action = str(fields.get("action", "insert"))
+            if action not in {"insert", "reinforce", "update", "supersede", "ignore"}:
+                action = "insert"
+            update: dict[str, Any] = {
+                "kind": kind,
+                "subject": subject,
+                "statement": statement,
+                "evidence": [{"event_id": event_id, "start_offset": start, "end_offset": start + len(quote), "excerpt": quote}],
+                "confidence": float(fields.get("confidence", 0.9)),
+                "importance": float(fields.get("importance", 0.5)),
+                "durability": str(fields.get("durability", "permanent")),
+                "intent": action,
+                "source_role": role,
+                "source_chunk_ids": [chunk_id] if chunk_id else [],
+                "entities": [entity] if entity else [],
+            }
+            if fields.get("event_time"):
+                update["valid_from"] = fields["event_time"]
+            try:
+                candidates.append(ExtractionCandidate.model_validate(update))
+            except (TypeError, ValueError):
+                continue
+        return ExtractionResponse(schema_version="extraction-v1", prompt_version="grounded-v2-simple", candidates=candidates)
     simple = SimpleExtractionResponse.model_validate(value)
     candidates = []
     seen: set[str] = set()
@@ -495,7 +555,7 @@ class HttpExtractionProvider:
             payload = json.loads(raw)
             if isinstance(payload, dict) and isinstance(payload.get("output"), str):
                 payload = json.loads(payload["output"])
-            parsed = _simple_response_to_extraction(payload)
+            parsed = _simple_response_to_extraction(payload, request)
         except (UnicodeError, json.JSONDecodeError, TypeError, ValueError) as exc:
             raise ProviderError("provider returned invalid extraction-v1 JSON", retryable=False, error_class="invalid_output") from exc
         return ProviderResult(
@@ -632,7 +692,7 @@ class OpenRouterExtractionProvider:
                 choice = _message_text(payload, text_parts_only=True)
                 if not choice.strip():
                     raise ValueError("empty extraction content")
-                parsed = _simple_response_to_extraction(json.loads(clean_json_response(choice)))
+                parsed = _simple_response_to_extraction(json.loads(clean_json_response(choice)), request)
                 break
             except (UnicodeError, json.JSONDecodeError, KeyError, IndexError, TypeError, ValueError) as exc:
                 # A completed request with unusable model output is not an

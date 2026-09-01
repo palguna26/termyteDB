@@ -3,7 +3,7 @@ from uuid import uuid4
 
 import pytest
 
-from src.memory.provider import HttpExtractionProvider, OpenRouterExtractionProvider, ProviderError, _message_text, build_extraction_prompt
+from src.memory.provider import HttpExtractionProvider, OpenRouterExtractionProvider, ProviderError, _message_text, _simple_response_to_extraction, build_extraction_prompt
 from src.models import ExtractionRequest
 
 
@@ -67,6 +67,45 @@ def test_http_provider_accepts_simple_memory_list(monkeypatch):
     result = HttpExtractionProvider("http://provider").extract(request())
     assert [candidate.statement for candidate in result.response.candidates] == ["User prefers SQLite."]
     assert result.response.candidates[0].evidence == []
+
+
+def test_grounded_v2_response_resolves_event_chunk_role_and_quote():
+    req = request()
+    event_id = req.events[0]
+    req = req.model_copy(
+        update={
+            "event_labels": {"e1": event_id},
+            "chunk_labels": {"c1": "chunk-1"},
+            "event_roles": {event_id: "assistant"},
+        }
+    )
+    response = _simple_response_to_extraction(
+        {
+            "schema_version": "extraction-v2",
+            "memories": [
+                {
+                    "statement": "The assistant decided to use SQLite.",
+                    "kind": "decision",
+                    "entity_key": "assistant",
+                    "predicate_key": "database_decision",
+                    "source_event_label": "e1",
+                    "source_chunk_label": "c1",
+                    "source_role": "assistant",
+                    "evidence_quote": "Decision: use SQLite.",
+                    "durability": "permanent",
+                    "action": "insert",
+                    "event_time": None,
+                }
+            ],
+        },
+        req,
+    )
+    candidate = response.candidates[0]
+    assert candidate.subject == "assistant::database_decision"
+    assert candidate.source_chunk_ids == ["chunk-1"]
+    assert candidate.source_role == "assistant"
+    assert candidate.evidence[0].event_id == event_id
+    assert candidate.evidence[0].excerpt == "Decision: use SQLite."
 
 
 def test_openrouter_provider_requests_simple_memory_schema(monkeypatch):

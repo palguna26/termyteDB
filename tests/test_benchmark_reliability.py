@@ -87,9 +87,10 @@ def test_failed_only_scores_are_unavailable():
             "Recall@10 (%)": None,
             "Recall@15 (%)": None,
             "MRR@15": None,
-            "NDCG@15": None,
-            "Avg Retrieved Words": None,
-            "Avg Latency (ms)": None,
+                "NDCG@15": None,
+                "Avg Retrieved Words": None,
+                "Avg Context Tokens": None,
+                "Avg Latency (ms)": None,
         }
     ]
     assert "N/A" in run_benchmark.render_table(rows)

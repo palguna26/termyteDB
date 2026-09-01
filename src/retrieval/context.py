@@ -5,6 +5,42 @@ from collections.abc import Callable, Iterable
 from typing import Any
 
 
+def count_tokens(text: str, *, model: str | None = None) -> int:
+    """Count model tokens when tiktoken is installed; use a clear fallback."""
+    try:
+        import tiktoken  # type: ignore[import-not-found]
+
+        try:
+            encoding = tiktoken.encoding_for_model(model or "gpt-4o-mini")
+        except KeyError:
+            encoding = tiktoken.get_encoding("o200k_base")
+        return len(encoding.encode(text))
+    except Exception:
+        # Conservative approximation for installations without the optional
+        # tokenizer dependency.  Traces mark this as approximate.
+        import re
+
+        return len(re.findall(r"\w+|[^\w\s]", text))
+
+
+def truncate_to_tokens(text: str, budget: int, *, model: str | None = None) -> str:
+    if count_tokens(text, model=model) <= budget:
+        return text
+    try:
+        import tiktoken  # type: ignore[import-not-found]
+
+        try:
+            encoding = tiktoken.encoding_for_model(model or "gpt-4o-mini")
+        except KeyError:
+            encoding = tiktoken.get_encoding("o200k_base")
+        return encoding.decode(encoding.encode(text)[:budget])
+    except Exception:
+        # The fallback is deliberately conservative rather than calling words
+        # "tokens".  It preserves early, highest-ranked evidence.
+        words = text.split()
+        return " ".join(words[: max(1, budget // 2)])
+
+
 def pack_evidence(
     memories: Iterable[Any],
     chunks_for_memory: Callable[[Any], list[dict[str, Any]]],
@@ -12,6 +48,7 @@ def pack_evidence(
     token_budget: int = 3000,
     max_memories: int = 6,
     hard_max: int = 6000,
+    tokenizer_model: str | None = None,
 ) -> dict[str, Any]:
     """Packing policy (shared by API search and benchmark):
 
@@ -120,11 +157,15 @@ def pack_evidence(
             continue
 
     text = render_context(selected)
+    exact_tokens = count_tokens(text, model=tokenizer_model)
+    if exact_tokens > budget:
+        text = truncate_to_tokens(text, budget, model=tokenizer_model)
+        exact_tokens = count_tokens(text, model=tokenizer_model)
     # In benchmark mode, missing evidence returns exactly `insufficient information` for stable abstention scoring.
     # The API layer maps abstained=True to that string; raw text here keeps structured data.
     return {
         "memories": selected,
-        "token_count": used,
+        "token_count": exact_tokens,
         "abstained": not bool(selected),
         "text": text if selected else "insufficient information",
         "deduplicated_sessions": len(seen_sessions),

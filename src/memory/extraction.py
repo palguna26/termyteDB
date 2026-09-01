@@ -46,6 +46,7 @@ def validate_candidate(
     *,
     strict: bool | None = None,
     included_chunks: set[str] | None = None,
+    require_evidence: bool = False,
 ) -> ValidatedCandidate:
     # Structural checks remain strict; heuristic semantic check is relaxed for LLM-first flow
     if strict is None:
@@ -70,6 +71,8 @@ def validate_candidate(
         raise CandidateRejected("invalid_durability")
     if included_chunks is not None and any(chunk_id not in included_chunks for chunk_id in candidate.source_chunk_ids):
         raise CandidateRejected("unknown_source_chunk_id")
+    if require_evidence and not candidate.evidence:
+        raise CandidateRejected("missing_source_evidence")
     if not candidate.statement or not candidate.statement.strip():
         raise CandidateRejected("empty_statement")
     evidence_excerpts: list[str] = []

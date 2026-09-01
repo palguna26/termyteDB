@@ -127,8 +127,12 @@ def _configure_benchmark_logging(log_path: Path, *, append: bool) -> None:
     termyte_logger.setLevel(logging.INFO)
     # The library logger normally prints every accepted event to stderr. Keep
     # that detail in the run log instead; progress belongs to the CLI.
-    for handler in termyte_logger.handlers:
-        handler.setLevel(logging.CRITICAL + 1)
+    # Remove terminal handlers altogether.  Setting their level is not enough:
+    # a later logger configuration can lower it again and flood the CLI.
+    for handler in list(termyte_logger.handlers):
+        if isinstance(handler, logging.StreamHandler) and not isinstance(handler, logging.FileHandler):
+            termyte_logger.removeHandler(handler)
+            handler.close()
     for handler in list(termyte_logger.handlers):
         if getattr(handler, "_longmemeval_log", False):
             termyte_logger.removeHandler(handler)
@@ -631,6 +635,10 @@ def _run_manifest(args: argparse.Namespace, data_path: Path, dataset_sha256: str
         "no_rerank": bool(getattr(args, "no_rerank", False)),
         "recall_k": int(getattr(args, "recall_k", 15)),
         "retrieval_limit": retrieval_limit,
+        "answer_context_tokens": int(getattr(args, "answer_context_tokens", 1200)),
+        "extraction_batch_max_chars": int(getattr(args, "extraction_batch_max_chars", 24000)),
+        "raw_session_fallback": bool(getattr(args, "raw_session_fallback", False)),
+        "sample_retries": int(getattr(args, "sample_retries", 2)),
         "abstain_threshold": float(getattr(args, "abstain_threshold", 0.25)),
     }
 
@@ -662,6 +670,12 @@ def _normalize_manifest_for_comparison(manifest: dict[str, Any]) -> dict[str, An
     normalized.pop("token_budget", None)
     # pack_atoms is now an alias; remove legacy key for canonical comparison
     normalized.pop("pack_atoms", None)
+    # These operational controls do not affect data or scoring semantics and
+    # should not make an interrupted legacy run impossible to resume.
+    normalized.setdefault("answer_context_tokens", normalized.pop("answer_context_words", 1200))
+    normalized.setdefault("extraction_batch_max_chars", 24000)
+    normalized.setdefault("raw_session_fallback", False)
+    normalized.setdefault("sample_retries", 2)
     return normalized
 
 
@@ -704,8 +718,20 @@ def ingest_e2e(work_dir: Path, sample: Sample, args: argparse.Namespace) -> tupl
             sessions_per_extraction = max(1, int(getattr(args, "extraction_batch_sessions", 4)))
             sessions = list(session_batches.values())
             batches: list[list[EventInput]] = []
-            for index in range(0, len(sessions), sessions_per_extraction):
-                batches.append([event for session in sessions[index : index + sessions_per_extraction] for event in session])
+            max_batch_chars = max(1000, int(getattr(args, "extraction_batch_max_chars", 24000)))
+            pending: list[EventInput] = []
+            pending_chars = 0
+            pending_sessions = 0
+            for session in sessions:
+                session_chars = sum(len(json.dumps(event.payload, ensure_ascii=False)) for event in session)
+                if pending and (pending_sessions >= sessions_per_extraction or pending_chars + session_chars > max_batch_chars):
+                    batches.append(pending)
+                    pending, pending_chars, pending_sessions = [], 0, 0
+                pending.extend(session)
+                pending_chars += session_chars
+                pending_sessions += 1
+            if pending:
+                batches.append(pending)
             for batch in batches:
                 result = engine.ingest_batch(batch)
                 receipts.extend(result.receipts)
@@ -770,17 +796,23 @@ def retrieve_e2e_session_ranking(database_path: Path, sample: Sample, args: argp
     try:
         limit = max(args.recall_k * 10, 50)
         # Repository.search hybrid retrieval
+        memory_search_started = time.perf_counter()
         search_results = engine.search(ns, sample.question, limit=limit)
-        # Rerank if enabled
+        memory_search_ms = (time.perf_counter() - memory_search_started) * 1000
+        # Repository.search owns product reranking.  Do not instantiate a
+        # second FlashRank model in the runner.
         abstained = False
         ranked = search_results
-        if not getattr(args, "no_rerank", False):
-            reranked = rerank_memory_hits(sample.question, search_results, args.abstain_threshold)
-            abstained = reranked is None
-            ranked = reranked if reranked is not None else []
-        # Raw-session fallback: an empty LLM extraction must never make a
-        # haystack session invisible to the end-to-end benchmark.
-        raw_sessions = engine.search_sessions(ns, sample.question, limit=max(args.recall_k * 2, 30))
+        if ranked and ranked[0].score < args.abstain_threshold:
+            abstained = True
+            ranked = []
+        # Raw-session search is a deliberate hybrid retrieval channel.  It
+        # preserves exact source-session matches that an extractor may omit.
+        # It affects session Recall, but never makes the answer prompt huge:
+        # answer packing below still prefers compact memory/chunk context.
+        raw_search_started = time.perf_counter()
+        raw_sessions = engine.search_sessions(ns, sample.question, limit=max(args.recall_k * 2, 30)) if getattr(args, "raw_session_fallback", False) else []
+        raw_search_ms = (time.perf_counter() - raw_search_started) * 1000
         if raw_sessions:
             abstained = False
         latency_ms = (time.perf_counter() - started) * 1000
@@ -803,8 +835,8 @@ def retrieve_e2e_session_ranking(database_path: Path, sample: Sample, args: argp
                 return sid
             return None
 
-        # Put raw sessions first. They are direct source material and make the
-        # benchmark answer context useful even when no memory was extracted.
+        # Put direct source-session hits first for the session-level retrieval
+        # benchmark.  The answer context remains compact and memory-led below.
         for raw_session in raw_sessions:
             if raw_session.session_id not in seen:
                 seen.add(raw_session.session_id)
@@ -820,7 +852,7 @@ def retrieve_e2e_session_ranking(database_path: Path, sample: Sample, args: argp
                     "primary_session": raw_session.session_id,
                     "documentDate": raw_session.occurred_at,
                     "eventDate": [raw_session.occurred_at] if raw_session.occurred_at else [],
-                    "chunks": raw_session.text,
+                    "chunks": raw_session.text[:3000],
                 }
             )
         for hit in ranked:
@@ -857,14 +889,40 @@ def retrieve_e2e_session_ranking(database_path: Path, sample: Sample, args: argp
                 seen.add(primary_session)
                 session_order.append(primary_session)
 
-        # Retrieval quality: use search results directly (no token budget / prompt wrappers)
+        # Use the shared compact context builder: top memories, up to two
+        # source chunks each, temporal metadata, and a hard prompt budget.
+        context_started = time.perf_counter()
         retrieval_limit = _get_retrieval_limit(args)
-        packed_parts = [
-            f"Memory: Raw conversation session\nChunks: {item.text}\ndocumentDate: {item.occurred_at or ''}\neventDate: {item.occurred_at or ''}"
-            for item in raw_sessions[:retrieval_limit]
-        ]
-        packed_parts.extend(f"Memory: {hit.statement}\nChunks: {hit.evidence_excerpt or ''}" for hit in ranked[:retrieval_limit])
-        packed_text = "" if abstained else "\n\n".join(packed_parts[:retrieval_limit])
+        token_budget = max(200, int(getattr(args, "answer_context_tokens", 1200)))
+        if ranked:
+            from src.retrieval.context import pack_evidence  # noqa: E402
+
+            packed_context = pack_evidence(
+                ranked[:retrieval_limit],
+                lambda hit: engine.repository.chunks_for_events(ns, [str(event_id) for event_id in hit.source_event_ids], limit=2),
+                token_budget=token_budget,
+                hard_max=token_budget,
+                tokenizer_model=getattr(args, "answer_model", None),
+            )
+            packed_text = str(packed_context["text"])
+        else:
+            packed_parts: list[str] = []
+            used_tokens = 0
+            from src.retrieval.context import count_tokens, truncate_to_tokens  # noqa: E402
+            for item in raw_sessions[:min(retrieval_limit, 3)]:
+                part = f"Memory: Raw conversation session\nChunks: {item.text[:3000]}\ndocumentDate: {item.occurred_at or ''}"
+                part_tokens = count_tokens(part, model=getattr(args, "answer_model", None))
+                if used_tokens + part_tokens > token_budget:
+                    part = truncate_to_tokens(part, token_budget - used_tokens, model=getattr(args, "answer_model", None))
+                    part_tokens = count_tokens(part, model=getattr(args, "answer_model", None))
+                if not part.strip():
+                    break
+                packed_parts.append(part)
+                used_tokens += part_tokens
+            packed_text = "\n\n".join(packed_parts) if packed_parts else "insufficient information"
+        if abstained:
+            packed_text = ""
+        context_pack_ms = (time.perf_counter() - context_started) * 1000
 
         # If single_db, session_order already isolated via namespace
         oracle = {str(v).strip() for v in sample.answer_session_ids}
@@ -910,8 +968,14 @@ def retrieve_e2e_session_ranking(database_path: Path, sample: Sample, args: argp
             "abstained": abstained,
             "packed": packed_text,
             "packed_words": len(packed_text.split()),
+            "packed_tokens": __import__("src.retrieval.context", fromlist=["count_tokens"]).count_tokens(packed_text, model=getattr(args, "answer_model", None)),
             "latency_ms": round(latency_ms, 2),
             "candidate_count": len(search_results) + len(raw_sessions),
+            "retrieval_stages_ms": {
+                "memory_search": round(memory_search_ms, 2),
+                "raw_fallback_search": round(raw_search_ms, 2),
+                "context_pack": round(context_pack_ms, 2),
+            },
             "retrieved_memories": retrieved_memories_detailed,
             "all_memories": all_memories_summary,
             "oracle_memories_exist": oracle_memories_exist,
@@ -1016,6 +1080,8 @@ def _parse_retry_after_header(value: str | None) -> float | None:
 
 def _is_retryable_openrouter_error(exc: Exception) -> tuple[bool, float | None]:
     msg = str(exc)
+    if bool(getattr(exc, "retryable", False)):
+        return True, getattr(exc, "retry_after", None)
     retry_after: float | None = None
     # Parse Retry-After from message if present
     if "retry_after=" in msg:
@@ -1026,7 +1092,7 @@ def _is_retryable_openrouter_error(exc: Exception) -> tuple[bool, float | None]:
     # IncompleteRead and transport errors
     if "IncompleteRead" in type(exc).__name__ or "IncompleteRead" in msg:
         return True, retry_after
-    if isinstance(exc, OSError) or "Connection reset" in msg or "transport" in msg.lower():
+    if isinstance(exc, OSError) or "Connection reset" in msg or "transport" in msg.lower() or "request failed" in msg.lower():
         return True, retry_after
     # HTTP status codes
     for code in ("408", "429", "500", "502", "503", "504"):
@@ -1113,13 +1179,14 @@ def openrouter_chat(model: str, messages: list[dict[str, str]], budget: OpenRout
     raise RuntimeError(f"OpenRouter call failed after {max_retries} attempts: {last_error}")
 
 
-ANSWER_SYSTEM = """You are a question-answering system. Answer only from Retrieved Context.
+ANSWER_SYSTEM = """You are a question-answering system. Based on the retrieved context, answer the question.
 
-Each result may contain Memory (a summary), Chunks (the raw source text),
-documentDate (when it was written), and eventDate (when it happened). Read
-chunks for detail, use dates to resolve time, and combine results only when
-the context supports it. Give a clear, concise answer. If the context lacks
-the answer, reply exactly: insufficient information."""
+Each result can contain a Memory (a high-level fact), Chunks (the detailed raw
+source), and temporal context: documentDate and eventDate. Scan memory titles
+for relevant results, then use chunks as the primary evidence for specifics.
+Use dates to resolve when facts happened and synthesize only information in
+the provided context. Give a clear, concise answer. If context is insufficient,
+reply exactly: I don't know."""
 
 JUDGE_SYSTEM = (
     "You are an evaluator for a conversational memory benchmark. Given a question, a reference answer, "
@@ -1187,6 +1254,7 @@ def evaluate_sample(args: argparse.Namespace, sample: Sample, budget: OpenRouter
         "abstention_correct": bool(outcome["abstained"] == (sample.unanswerable or sample.question_id.endswith("_abs"))),
         "recall": {str(k): int(outcome["best_rank"] is not None and outcome["best_rank"] <= k) for k in (5, 10, args.recall_k)},
         "packed_words": outcome["packed_words"],
+        "packed_tokens": outcome.get("packed_tokens", outcome["packed_words"]),
         "raw_words": sample.raw_words,
         "retrieval_latency_ms": outcome["latency_ms"],
         "candidate_count": outcome["candidate_count"],
@@ -1254,8 +1322,10 @@ def evaluate_sample_e2e(args: argparse.Namespace, sample: Sample, budget: OpenRo
         "abstained": retrieval_outcome["abstained"],
         "recall": {str(k): int(best_rank is not None and best_rank <= k) for k in (5, 10, args.recall_k)},
         "packed_words": retrieval_outcome["packed_words"],
+        "packed_tokens": retrieval_outcome.get("packed_tokens", retrieval_outcome["packed_words"]),
         "raw_words": sample.raw_words,
         "retrieval_latency_ms": retrieval_outcome["latency_ms"],
+        "retrieval_stages_ms": retrieval_outcome.get("retrieval_stages_ms", {}),
         "candidate_count": retrieval_outcome["candidate_count"],
         "retrieved_memory_count": retrieval_outcome["candidate_count"],
         # Memory-formation diagnostics
@@ -1312,6 +1382,7 @@ def summarize(traces: list[dict[str, Any]], recall_k: int, judged: bool) -> list
         row[f"MRR@{recall_k}"] = round(sum((1 / item["best_rank"]) if item["best_rank"] else 0.0 for item in scored) / len(scored), 3) if scored else None
         row[f"NDCG@{recall_k}"] = round(sum(item["ndcg_at_k"] for item in scored) / len(scored), 3) if scored else None
         row["Avg Retrieved Words"] = round(sum(item["packed_words"] for item in items) / count, 1) if count else None
+        row["Avg Context Tokens"] = round(sum(item.get("packed_tokens", item["packed_words"]) for item in items) / count, 1) if count else None
         row["Avg Latency (ms)"] = round(sum(item["retrieval_latency_ms"] for item in items) / count, 1) if count else None
         if count:
             row["Abstention Rate (%)"] = round(100 * sum(bool(item.get("abstained")) for item in items) / count, 1)
@@ -1426,7 +1497,9 @@ def run(args: argparse.Namespace) -> int:
     else:
         canonical_mode = raw_mode
 
-    is_e2e = canonical_mode == "end-to-end"
+    # `judged` is end-to-end plus answer/judge calls.  It must never fall
+    # through to the local retrieval-only implementation.
+    is_e2e = canonical_mode in {"end-to-end", "judged"}
     if is_e2e:
         if getattr(args, "extraction", "openrouter") != "openrouter":
             raise SystemExit("end-to-end benchmark requires --extraction openrouter")
@@ -1434,6 +1507,13 @@ def run(args: argparse.Namespace) -> int:
             raise SystemExit("end-to-end benchmark requires --embedding-provider openrouter")
         if getattr(args, "embedding_provider", None) is None:
             args.embedding_provider = "openrouter"
+        print(
+            "End-to-end providers: "
+            f"extraction=openrouter ({getattr(args, 'extraction_model', None) or os.environ.get('TERMYTEDB_EXTRACTION_MODEL', 'unset')}), "
+            f"embeddings=openrouter ({getattr(args, 'embedding_model', None) or os.environ.get('TERMYTEDB_EMBEDDING_MODEL', 'unset')}, "
+            f"dimensions={getattr(args, 'embedding_dimensions', None) or os.environ.get('TERMYTEDB_EMBEDDING_DIMENSIONS', 'default')})",
+            flush=True,
+        )
         _openrouter_pacer = RequestPacer(float(getattr(args, "openrouter_min_interval", 3.0)))
         try:
             work_dir = resolve_work_dir(args, previous, is_e2e=True)
@@ -1467,7 +1547,29 @@ def run(args: argparse.Namespace) -> int:
         return evaluate_sample(args, sample, budget)
 
     def worker_e2e(sample: Sample) -> dict[str, Any]:
-        return evaluate_sample_e2e(args, sample, budget)
+        # A transient provider failure must not discard a question after hours
+        # of ingestion.  Re-running is safe: events are idempotent and the
+        # durable processing job resumes the failed extraction batch.
+        attempts = max(0, int(getattr(args, "sample_retries", 2))) + 1
+        for attempt in range(attempts):
+            try:
+                return evaluate_sample_e2e(args, sample, budget)
+            except Exception as exc:
+                retryable, retry_after = _is_retryable_openrouter_error(exc)
+                if not retryable or attempt == attempts - 1:
+                    raise
+                delay = _retry_delay(attempt, retry_after)
+                _BENCHMARK_LOGGER.warning(
+                    "retrying question=%s attempt=%s/%s after %.1fs: %s",
+                    sample.question_id,
+                    attempt + 1,
+                    attempts - 1,
+                    delay,
+                    exc,
+                )
+                _openrouter_pacer.defer(delay)
+                time.sleep(delay)
+        raise RuntimeError("sample retry loop ended unexpectedly")
 
     worker = worker_e2e if is_e2e else worker_retrieval
 
@@ -1604,6 +1706,8 @@ def main() -> int:
     parser.add_argument("--workers", type=int, default=1)
     parser.add_argument("--recall-k", type=int, default=15)
     parser.add_argument("--retrieval-limit", type=int, default=40, help="max memories/atoms to retrieve per query (replaces --pack-atoms)")
+    parser.add_argument("--answer-context-tokens", type=int, default=1200, help="strict token cap for answer context")
+    parser.add_argument("--answer-context-words", type=int, help="deprecated; use --answer-context-tokens")
     parser.add_argument("--pack-atoms", type=int, default=None, help="deprecated alias for --retrieval-limit")
     parser.add_argument("--abstain-threshold", type=float, default=0.25)
     parser.add_argument("--no-rerank", action="store_true")
@@ -1626,9 +1730,12 @@ def main() -> int:
         help="extraction provider for end-to-end mode (OpenRouter is the product default)",
     )
     parser.add_argument("--extraction-model", type=str, default=None, help="model for openrouter/http extraction (or env TERMYTEDB_EXTRACTION_MODEL)")
-    parser.add_argument("--extraction-batch-sessions", type=int, default=4, help="complete sessions sent in one extraction call (default: 4)")
+    parser.add_argument("--extraction-batch-sessions", type=int, default=4, help="maximum complete sessions per extraction call")
+    parser.add_argument("--extraction-batch-max-chars", type=int, default=24000, help="split extraction batches above this source-text size")
+    parser.add_argument("--raw-session-fallback", action="store_true", help="include raw-session search in hybrid results; off for memory-only scoring")
     parser.add_argument("--openrouter-min-interval", type=float, default=3.0, help="minimum seconds between all OpenRouter requests")
     parser.add_argument("--openrouter-max-retries", type=int, default=5, help="maximum attempts for retryable OpenRouter extraction failures")
+    parser.add_argument("--sample-retries", type=int, default=2, help="retry a whole idempotent sample after a transient provider failure")
     parser.add_argument("--openrouter-rate-limit-cooldown", type=float, default=60.0, help="seconds to wait after an OpenRouter HTTP 429")
     args = parser.parse_args()
     # Deprecated alias handling: --pack-atoms -> --retrieval-limit
@@ -1638,8 +1745,10 @@ def main() -> int:
         warnings.warn("--pack-atoms is deprecated; use --retrieval-limit", DeprecationWarning, stacklevel=2)
         if getattr(args, "retrieval_limit", 40) == 40:  # only override if retrieval_limit is default
             args.retrieval_limit = args.pack_atoms
-    elif getattr(args, "pack_atoms", None) is None:
+    else:
         args.pack_atoms = getattr(args, "retrieval_limit", 40)
+    if args.answer_context_words is not None:
+        args.answer_context_tokens = args.answer_context_words
     return run(args)
 
 

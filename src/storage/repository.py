@@ -5,6 +5,7 @@ import hashlib
 import json
 import re
 import sqlite3
+import threading
 import uuid
 from datetime import UTC, datetime, timedelta
 from typing import Any, cast
@@ -68,6 +69,23 @@ SEARCH_STOP_WORDS = {
     "with",
 }
 
+_RERANKER_LOCK = threading.Lock()
+_RERANKERS: dict[str, Any] = {}
+
+
+def _cached_reranker(model_name: str) -> Any | None:
+    """Create a FlashRank model once per process, not once per query."""
+    with _RERANKER_LOCK:
+        if model_name in _RERANKERS:
+            return _RERANKERS[model_name]
+        try:
+            from flashrank import Ranker  # type: ignore[import-untyped]
+
+            _RERANKERS[model_name] = Ranker(model_name=model_name)
+        except Exception:
+            return None
+        return _RERANKERS[model_name]
+
 
 def iso(value: datetime | None = None) -> str:
     return (value or datetime.now(UTC)).astimezone(UTC).isoformat()
@@ -122,6 +140,7 @@ class Repository:
         self.vector_index = SQLiteVecIndex(self.db, self.embedding)
         self.vector_index.ensure()
         self._ensure_extraction_runs_tracing_columns()
+        self._ensure_chunk_event_index()
         self._claimed_lease_tokens: dict[str, str] = {}
 
     def _ensure_extraction_runs_tracing_columns(self) -> None:
@@ -138,6 +157,24 @@ class Repository:
             if "input_hash" not in cols:
                 pass
         except Exception:
+            pass
+
+    def _ensure_chunk_event_index(self) -> None:
+        """Backfill normalized chunk/event rows for databases created pre-v2."""
+        try:
+            rows = self.db.execute(
+                "SELECT c.chunk_id, c.namespace_id, c.session_id, c.event_ids_json FROM chunks c "
+                "WHERE NOT EXISTS (SELECT 1 FROM chunk_events ce WHERE ce.chunk_id=c.chunk_id)"
+            ).fetchall()
+            values: list[tuple[str, str, str, str]] = []
+            for row in rows:
+                values.extend((str(row["chunk_id"]), str(row["namespace_id"]), str(event_id), str(row["session_id"])) for event_id in json.loads(row["event_ids_json"]))
+            if values:
+                with self.db.connection:
+                    self.db.executemany("INSERT OR IGNORE INTO chunk_events(chunk_id, namespace_id, event_id, session_id) VALUES (?,?,?,?)", values)
+        except Exception:
+            # A partially migrated legacy database remains usable through the
+            # legacy JSON paths until its next successful open.
             pass
         # Phase 3: evidence becomes optional — drop strict guard that required offsets/excerpts
         try:
@@ -499,21 +536,51 @@ class Repository:
         ).fetchall()
         return [event for row in rows if (event := self.get_event(namespace_id, row["id"])) is not None]
 
-    def rebuild_chunks(self, namespace_id: str, *, window: int = 4, overlap: int = 1) -> int:
+    def rebuild_chunks(
+        self,
+        namespace_id: str,
+        *,
+        window: int = 4,
+        overlap: int = 1,
+        event_ids: list[str] | None = None,
+    ) -> int:
+        """Reindex only sessions changed by an ingestion batch.
+
+        The old full rebuild remains available when ``event_ids`` is omitted,
+        which keeps repair and migration callers compatible.
+        """
         from ..retrieval.chunking import build_chunks
 
         events = self.list_events(namespace_id, limit=1_000_000)
-        source = [{**event, "text": payload_text(event["payload_json"], event["type"])} for event in events]
+        source = [{**event, "text": payload_text(event["payload_json"], event["type"], include_roles=True)} for event in events]
         chunks = build_chunks(source, window=window, overlap=overlap)
+        changed_sessions: set[str] | None = None
+        if event_ids is not None:
+            wanted = set(event_ids)
+            changed_sessions = {
+                str(event.get("session_id") or event.get("stream_id") or event["id"])
+                for event in events
+                if str(event["id"]) in wanted
+            }
+            chunks = [chunk for chunk in chunks if chunk.session_id in changed_sessions]
         with self.db.lock, self.db.connection:
-            self.db.execute("DELETE FROM chunks WHERE namespace_id=?", (namespace_id,))
-            self.db.executemany(
-                "INSERT INTO chunks(chunk_id,namespace_id,session_id,ordinal,event_ids_json,raw_text,document_date,event_dates_json,contextual_text,content_hash,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-                [(c.chunk_id, namespace_id, c.session_id, c.ordinal, json.dumps(c.event_ids), c.text, c.document_date, json.dumps(c.event_dates), c.contextual_text, hashlib.sha256(c.text.encode()).hexdigest(), iso()) for c in chunks],
-            )
-            # Avoid changing the call shape of injected test/custom embedders;
-            # the built-in provider gets both source and contextual indexes.
-            if chunks and type(self.embedding) is FastEmbedProvider:
+            if changed_sessions is None:
+                self.db.execute("DELETE FROM chunks WHERE namespace_id=?", (namespace_id,))
+            elif changed_sessions:
+                placeholders = ",".join("?" for _ in changed_sessions)
+                self.db.execute(f"DELETE FROM chunks WHERE namespace_id=? AND session_id IN ({placeholders})", (namespace_id, *sorted(changed_sessions)))
+            if chunks:
+                self.db.executemany(
+                    "INSERT INTO chunks(chunk_id,namespace_id,session_id,ordinal,event_ids_json,raw_text,document_date,event_dates_json,contextual_text,content_hash,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                    [(c.chunk_id, namespace_id, c.session_id, c.ordinal, json.dumps(c.event_ids), c.text, c.document_date, json.dumps(c.event_dates), c.contextual_text, hashlib.sha256(c.text.encode()).hexdigest(), iso()) for c in chunks],
+                )
+                self.db.executemany(
+                    "INSERT INTO chunk_events(chunk_id, namespace_id, event_id, session_id) VALUES (?,?,?,?)",
+                    [(chunk.chunk_id, namespace_id, event_id, chunk.session_id) for chunk in chunks for event_id in chunk.event_ids],
+                )
+            # Every configured embedding provider indexes chunks.  This is
+            # essential for OpenRouter-backed embeddings, not only FastEmbed.
+            if chunks:
                 try:
                     vectors = self.embed_many([value for c in chunks for value in (c.text, c.contextual_text)])
                     self.db.executemany(
@@ -541,14 +608,15 @@ class Repository:
         wanted = set(event_ids)
         if not wanted:
             return []
-        result = []
-        for row in self.db.execute("SELECT * FROM chunks WHERE namespace_id=? ORDER BY session_id, ordinal", (namespace_id,)).fetchall():
-            ids = json.loads(row["event_ids_json"])
-            if wanted.intersection(ids):
-                result.append({**dict(row), "event_ids": ids, "event_dates": json.loads(row["event_dates_json"])})
-                if len(result) >= limit:
-                    break
-        return result
+        placeholders = ",".join("?" for _ in wanted)
+        rows = self.db.execute(
+            f"""SELECT DISTINCT c.* FROM chunks c
+            JOIN chunk_events ce ON ce.chunk_id=c.chunk_id AND ce.namespace_id=c.namespace_id
+            WHERE c.namespace_id=? AND ce.event_id IN ({placeholders})
+            ORDER BY c.session_id, c.ordinal LIMIT ?""",
+            (namespace_id, *sorted(wanted), limit),
+        ).fetchall()
+        return [{**dict(row), "event_ids": json.loads(row["event_ids_json"]), "event_dates": json.loads(row["event_dates_json"])} for row in rows]
 
     def list_evidence(self, namespace_id: str, limit: int = 100, offset: int = 0) -> list[dict[str, Any]]:
         rows = self.db.execute(
@@ -1075,17 +1143,14 @@ class Repository:
         embedding: list[float] | None,
     ) -> tuple[str | None, str, str | None]:
         item = candidate.candidate
-        # Phase 2/3: evidence is optional — use the ingested event as fallback source
-        if item.evidence:
-            source = self.db.execute(
-                "SELECT namespace_id, created_at, occurred_at, payload_json FROM events WHERE id=? AND namespace_id=?",
-                (str(item.evidence[0].event_id), namespace_id),
-            ).fetchone()
-        else:
-            source = self.db.execute(
-                "SELECT namespace_id, created_at, occurred_at, payload_json FROM events WHERE id=? AND namespace_id=?",
-                (str(event["id"]), namespace_id),
-            ).fetchone()
+        # Persisted memories must have real source evidence.  The processor
+        # already validates the span; this protects direct repository callers.
+        if not item.evidence:
+            raise CandidateRejected("missing_source_evidence")
+        source = self.db.execute(
+            "SELECT namespace_id, created_at, occurred_at, payload_json FROM events WHERE id=? AND namespace_id=?",
+            (str(item.evidence[0].event_id), namespace_id),
+        ).fetchone()
         if not source:
             raise ValueError("evidence event is not in the requested namespace")
         if source["created_at"] > iso():
@@ -1128,25 +1193,23 @@ class Repository:
                 return memory_id, "IGNORE", None
             status = "active"
         elif current:
-            # Any other conflicting insert without explicit intent is treated as ignore (no duplicate)
+            # Different wording alone is not proof that a fact changed.  Keep
+            # the existing version unless v2 explicitly marks an update or the
+            # same canonical identity is backed by a newer source event.
             if item.statement == current["statement"]:
                 return memory_id, "REINFORCE", current["id"]
-            # For distinct statement with no intent, treat as update (history)
-            action, status = "UPDATE", "active"
-            if not item.evidence and current:
-                action = "UPDATE"
+            if source["occurred_at"] and current["valid_from"] and str(source["occurred_at"]) > str(current["valid_from"]):
+                action, status = "UPDATE", "active"
+            else:
+                return memory_id, "IGNORE", None
         else:
             action, status = "INSERT", "active"
         version = current["version"] + 1 if current else 1
         if current and status == "active":
             self.db.execute("UPDATE memory_versions SET status='superseded', valid_to=? WHERE id=? AND namespace_id=?", (iso(), current["id"], namespace_id))
             self.db.execute("DELETE FROM memory_fts WHERE memory_version_id=? AND namespace_id=?", (current["id"], namespace_id))
-        # Evidence fields are optional — allow NULL
-        if item.evidence:
-            span = item.evidence[0]
-            src_id, start_off, end_off, excerpt = str(span.event_id), span.start_offset, span.end_offset, span.excerpt
-        else:
-            src_id, start_off, end_off, excerpt = str(event["id"]), None, None, item.statement[:500]
+        span = item.evidence[0]
+        src_id, start_off, end_off, excerpt = str(span.event_id), span.start_offset, span.end_offset, span.excerpt
         version_id = str(uuid.uuid4())
         self.db.execute(
             """INSERT INTO memory_versions
@@ -1345,13 +1408,16 @@ class Repository:
             return {}
         # Build event->memory version map
         top_chunks = sorted(chunk_scores.items(), key=lambda x: -x[1])[: limit * 2]
-        # For each chunk, find memory versions whose source_event overlaps
+        # Resolve chunk -> event through the normalized mapping, avoiding a
+        # Python scan of all chunks for every query.
+        top_chunk_ids = [chunk_id for chunk_id, _ in top_chunks]
+        placeholders = ",".join("?" for _ in top_chunk_ids)
         chunk_event_map: dict[str, list[str]] = {}
-        for chunk_id, _ in top_chunks:
-            for r in chunk_rows:
-                if str(r["chunk_id"]) == chunk_id:
-                    chunk_event_map[chunk_id] = json.loads(r["event_ids_json"])
-                    break
+        for row in self.db.execute(
+            f"SELECT chunk_id, event_id FROM chunk_events WHERE namespace_id=? AND chunk_id IN ({placeholders})",
+            (namespace_id, *top_chunk_ids),
+        ).fetchall():
+            chunk_event_map.setdefault(str(row["chunk_id"]), []).append(str(row["event_id"]))
         memory_chunk_scores: dict[str, float] = {}
         for chunk_id, cscore in top_chunks:
             for event_id in chunk_event_map.get(chunk_id, []):
@@ -1384,9 +1450,8 @@ class Repository:
             chunk_texts[str(row["chunk_id"])] = str(row["contextual_text"] or row["raw_text"] or "")
         # Build passages: memory statement + contextual chunk
         ranker_model = _RETRIEVAL_CFG.reranker_model
-        try:
-            ranker = Ranker(model_name=ranker_model)
-        except Exception:
+        ranker = _cached_reranker(ranker_model)
+        if ranker is None:
             return results
         max_candidates = _RETRIEVAL_CFG.reranker_max_candidates
         max_chars = _RETRIEVAL_CFG.reranker_max_chars
@@ -1397,7 +1462,10 @@ class Repository:
         for hit in candidates:
             extra = ""
             for event_id in hit.source_event_ids[:2]:
-                for row in self.db.execute("SELECT chunk_id FROM chunks WHERE namespace_id=? AND event_ids_json LIKE ?", (namespace_id, f"%{event_id}%")).fetchall():
+                for row in self.db.execute(
+                    "SELECT chunk_id FROM chunk_events WHERE namespace_id=? AND event_id=? LIMIT 1",
+                    (namespace_id, str(event_id)),
+                ).fetchall():
                     ctx = chunk_texts.get(str(row["chunk_id"]), "")
                     if ctx:
                         extra = ctx[:300]
@@ -1668,7 +1736,10 @@ class Repository:
                 # Use source_event_ids to derive chunk sessions
                 chunk_sessions_for_result: list[str] = []
                 for eid in r.source_event_ids[:2]:
-                    for crow in self.db.execute("SELECT chunk_id FROM chunks WHERE namespace_id=? AND event_ids_json LIKE ?", (namespace_id, f"%{eid}%")).fetchall():
+                    for crow in self.db.execute(
+                        "SELECT chunk_id FROM chunk_events WHERE namespace_id=? AND event_id=? LIMIT 1",
+                        (namespace_id, str(eid)),
+                    ).fetchall():
                         sid = chunk_session.get(str(crow["chunk_id"]), "")
                         if sid:
                             chunk_sessions_for_result.append(sid)

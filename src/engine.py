@@ -111,7 +111,7 @@ class TermyteDB:
             )
 
         # Index source-grounded chunks before extraction.
-        self.repository.rebuild_chunks(namespace_id)
+        self.repository.rebuild_chunks(namespace_id, event_ids=new_event_ids)
 
         # Durability: enqueue jobs before extraction so failures remain retryable
         job_ids: dict[str, str] = {}
@@ -174,7 +174,7 @@ class TermyteDB:
         sessions = [] if memories else self.search_sessions(namespace_id, query, limit)
         return {"memories": memories, "chunks": packed["memories"], "text": packed["text"], "token_count": packed["token_count"], "sessions": sessions}
 
-    def build_answer_context(self, namespace_id: str, query: str, limit: int = 6, token_budget: int = 3000) -> dict[str, Any]:
+    def build_answer_context(self, namespace_id: str, query: str, limit: int = 6, token_budget: int = 1200) -> dict[str, Any]:
         memories = self.search(namespace_id, query, limit)
         from .retrieval.context import pack_evidence
 

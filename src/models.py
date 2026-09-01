@@ -171,6 +171,7 @@ class SimpleExtractionResponse(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
+    schema_version: Literal["extraction-v2"] | None = None
     memory: list[str] = Field(default_factory=list, max_length=50)
     memories: list[dict[str, Any]] = Field(default_factory=list, max_length=50)
 
@@ -181,6 +182,14 @@ class ExtractionRequest(BaseModel):
     namespace_id: str = Field(min_length=1)
     events: list[UUID] = Field(min_length=1, max_length=1000)
     evidence_text: dict[UUID, str]
+    # Prompt-local labels keep provider output small and prevent it from
+    # fabricating database UUIDs.  The processor resolves them before storage.
+    event_labels: dict[str, UUID] = Field(default_factory=dict)
+    chunk_labels: dict[str, str] = Field(default_factory=dict)
+    # The provider never needs to choose a chunk.  Once it cites an event, the
+    # engine attaches the event's trusted source chunk itself.
+    event_chunk_labels: dict[UUID, str] = Field(default_factory=dict)
+    event_roles: dict[UUID, Literal["user", "assistant"]] = Field(default_factory=dict)
     existing_memories: list[dict[str, Any]] = Field(default_factory=list, max_length=20)
     stage: ExtractionStage = "facts"
 

@@ -31,7 +31,7 @@ IGNORED_KEYS = {
 }
 
 
-def payload_text(payload: dict[str, Any], event_type: str | None = None) -> str:
+def payload_text(payload: dict[str, Any], event_type: str | None = None, *, include_roles: bool = False) -> str:
     """Project a conversational payload into stable extraction text.
 
     The processor and rule extractor both use this function, so evidence
@@ -57,7 +57,7 @@ def payload_text(payload: dict[str, Any], event_type: str | None = None) -> str:
         if isinstance(content, str):
             text = clean(content)
             if text:
-                parts.append(text)
+                parts.append(f"{role}: {text}" if include_roles and isinstance(role, str) else text)
         elif content is not None:
             visit(content)
 

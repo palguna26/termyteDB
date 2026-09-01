@@ -70,7 +70,7 @@ class SimpleResultProvider:
         )
 
 
-def test_batch_is_one_extraction_call_and_one_memory_embedding_batch(tmp_path):
+def test_batch_is_one_extraction_call_and_indexes_chunks_and_memories(tmp_path):
     provider = RecordingProvider()
     embedding = RecordingEmbedding()
     db = TermyteDB(tmp_path / "batch.sqlite", extraction_provider=provider, embedding_provider=embedding)
@@ -96,8 +96,8 @@ def test_batch_is_one_extraction_call_and_one_memory_embedding_batch(tmp_path):
 
     assert len(provider.requests) == 1
     assert len(provider.requests[0].events) == 2
-    assert len(embedding.batches) == 1
-    assert len(embedding.batches[0]) == result.accepted == 2
+    assert len(embedding.batches) == 2
+    assert len(embedding.batches[-1]) == result.accepted == 2
     assert len(db.memories("batch")) == 2
     assert db.database.execute("SELECT COUNT(*) FROM processing_jobs").fetchone()[0] == 0
     db.close()
@@ -114,14 +114,14 @@ def test_single_extraction_call_stays_single_when_legacy_multistage_env_is_set(t
     db.close()
 
 
-def test_simple_memory_candidate_without_llm_offsets_reaches_storage_and_search(tmp_path):
+def test_legacy_ungrounded_candidate_is_rejected(tmp_path):
     db = TermyteDB(tmp_path / "simple.sqlite", extraction_provider=SimpleResultProvider(), embedding_provider=RecordingEmbedding())
 
     result = db.ingest({"namespace_id": "simple", "idempotency_key": "one", "type": "conversation", "payload": {"text": "I prefer SQLite for local storage."}})
 
-    assert result.accepted == 1
-    assert [memory.statement for memory in db.memories("simple")] == ["User prefers SQLite for local storage."]
-    assert db.search("simple", "Which database do I prefer?", limit=1)[0].statement == "User prefers SQLite for local storage."
+    assert result.accepted == 0
+    assert result.rejected == 1
+    assert db.memories("simple") == []
     db.close()
 
 

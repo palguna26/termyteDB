@@ -75,6 +75,11 @@ class Processor:
         included: dict[UUID, str],
         existing_memories: list[dict[str, Any]],
         deadline: float,
+        *,
+        event_labels: dict[str, UUID] | None = None,
+        chunk_labels: dict[str, str] | None = None,
+        event_chunk_labels: dict[UUID, str] | None = None,
+        event_roles: dict[UUID, str] | None = None,
     ) -> tuple[list[Any], list[Any], dict[str, Any]]:
         stages = _get_extraction_stages()
         max_calls = _get_max_calls()
@@ -93,6 +98,10 @@ class Processor:
                 namespace_id=namespace_id,
                 events=events,
                 evidence_text=included,
+                event_labels=event_labels or {},
+                chunk_labels=chunk_labels or {},
+                event_chunk_labels=event_chunk_labels or {},
+                event_roles=event_roles or {},  # type: ignore[arg-type]
                 existing_memories=existing_memories,
                 stage=stage,  # type: ignore[arg-type]
             )
@@ -232,7 +241,7 @@ class Processor:
 
         for event in events:
             event_id = UUID(event["id"])
-            included[event_id] = payload_text(json.loads(event["payload_json"]), event["type"])
+            included[event_id] = payload_text(json.loads(event["payload_json"]), event["type"], include_roles=True)
             current_events[str(event_id)] = event
             if event["episode_id"]:
                 episode_ids.add(str(event["episode_id"]))
@@ -246,12 +255,31 @@ class Processor:
                 included.setdefault(UUID(event_key), source)
 
         input_snapshot = {str(key): value for key, value in included.items()}
-        existing_memories = self.repository.related_memory_context(namespace_id, "\n".join(input_snapshot.values()))
+        # Retrieval during ingestion is only useful for the explicit reconciliation
+        # call.  Skipping it avoids a remote embedding + rerank on every batch.
+        existing_memories = self.repository.related_memory_context(namespace_id, "\n".join(input_snapshot.values())) if _is_reconciliation_enabled() else []
         existing_by_ref = {str(item["ref"]): str(item["memory_id"]) for item in existing_memories}
 
         # Multi-pass extraction
+        event_labels = {f"e{index + 1}": event_id for index, event_id in enumerate(included)}
+        event_roles: dict[UUID, str] = {}
+        for event_id, event in current_events.items():
+            payload = json.loads(event["payload_json"])
+            messages = payload.get("messages", []) if isinstance(payload, dict) else []
+            role = messages[0].get("role") if isinstance(messages, list) and messages and isinstance(messages[0], dict) else None
+            event_roles[UUID(event_id)] = role if role in {"user", "assistant"} else "user"
+        chunk_labels: dict[str, str] = {}
+        event_chunk_labels: dict[UUID, str] = {}
+        label_index = 1
+        for event_id in included:
+            for chunk in self.repository.chunks_for_events(namespace_id, [str(event_id)], limit=1):
+                label = f"c{label_index}"
+                chunk_labels[label] = str(chunk["chunk_id"])
+                event_chunk_labels[event_id] = label
+                label_index += 1
         all_candidates, provider_results, meta = self._collect_multi_pass(
-            provider, namespace_id, [UUID(eid) for eid in event_ids], included, existing_memories, deadline
+            provider, namespace_id, [UUID(eid) for eid in event_ids], included, existing_memories, deadline,
+            event_labels=event_labels, chunk_labels=chunk_labels, event_chunk_labels=event_chunk_labels, event_roles=event_roles,
         )
         # LLM reconciliation (separate call)
         all_candidates = self._apply_reconciliation(provider, namespace_id, existing_memories, all_candidates, deadline)
@@ -302,6 +330,7 @@ class Processor:
                 event_session_map[str(ev["id"])] = sid
         grounded_candidates: list[Any] = []
         rejected_grounding: list[Any] = []
+        grounded_v2 = any(pr.response.prompt_version.startswith("grounded-v2") for pr in provider_results)
         for candidate in all_candidates:
             chunk_ids = list(getattr(candidate, "source_chunk_ids", []) or [])
             if chunk_ids:
@@ -324,6 +353,9 @@ class Processor:
                     candidate = candidate.model_copy(update={"source_chunk_ids": repaired})
                 grounded_candidates.append(candidate)
             else:
+                if grounded_v2:
+                    rejected_grounding.append(candidate)
+                    continue
                 grounded_candidates.append(candidate)
         # Record rejected grounding as decisions later; for now exclude them
         all_candidates = grounded_candidates
@@ -400,14 +432,21 @@ class Processor:
                         candidate = candidate.model_copy(update={"intent": "ignore"})
                     if action not in allowed_intents:
                         raise CandidateRejected("invalid_intent")
-                    validated = validate_candidate(namespace_id, candidate, included, included_chunks=valid_chunks_for_validation)
+                    validated = validate_candidate(
+                        namespace_id,
+                        candidate,
+                        included,
+                        included_chunks=valid_chunks_for_validation,
+                        require_evidence=True,
+                    )
                     if validated.fingerprint in fingerprints:
                         raise CandidateRejected("duplicate_candidate")
                     fingerprints.add(validated.fingerprint)
-                    if candidate.evidence:
-                        source_event = current_events.get(str(candidate.evidence[0].event_id), events[0])
-                    else:
-                        source_event = events[0]
+                    if not candidate.evidence:
+                        raise CandidateRejected("missing_source_evidence")
+                    source_event = current_events.get(str(candidate.evidence[0].event_id))
+                    if source_event is None:
+                        raise CandidateRejected("evidence_not_in_ingestion_batch")
                     validated_candidates.append((candidate, validated, source_event))
                 except CandidateRejected as exc:
                     rejected += 1
