@@ -681,6 +681,28 @@ class OpenRouterExtractionProvider:
                     raise last_exc from exc
                 _cancellable_sleep(sleep_s, cancellation, started, timeout_seconds)
                 continue
+            except Exception as exc:
+                # IncompleteRead and other transport errors (connection reset etc.)
+                msg = str(exc)
+                is_transport = (
+                    "IncompleteRead" in type(exc).__name__
+                    or "IncompleteRead" in msg
+                    or "Connection reset" in msg
+                    or "transport" in msg.lower()
+                    or "connection" in msg.lower()
+                )
+                if not is_transport:
+                    raise
+                last_exc = ProviderError("OpenRouter request failed", retryable=True, error_class="transport_error")
+                if attempt >= max_retries:
+                    raise last_exc from exc
+                sleep_s = _retry_sleep(attempt, None)
+                elapsed2 = time.perf_counter() - started
+                remaining2 = timeout_seconds - elapsed2
+                if sleep_s > remaining2:
+                    raise last_exc from exc
+                _cancellable_sleep(sleep_s, cancellation, started, timeout_seconds)
+                continue
         if payload is None or raw_bytes is None:
             assert last_exc is not None
             raise last_exc  # type: ignore[misc]
@@ -774,6 +796,26 @@ class OpenRouterExtractionProvider:
                 _cancellable_sleep(sleep_s, cancellation, started, timeout_seconds)
                 continue
             except (TimeoutError, URLError, OSError) as exc:
+                last_exc = ProviderError("OpenRouter request failed", retryable=True, error_class="transport_error")
+                if attempt >= max_retries:
+                    raise last_exc from exc
+                sleep_s = _retry_sleep(attempt, None)
+                elapsed2 = time.perf_counter() - started
+                remaining2 = timeout_seconds - elapsed2
+                if sleep_s > remaining2:
+                    raise last_exc from exc
+                _cancellable_sleep(sleep_s, cancellation, started, timeout_seconds)
+                continue
+            except Exception as exc:
+                msg = str(exc)
+                is_transport = (
+                    "IncompleteRead" in type(exc).__name__
+                    or "IncompleteRead" in msg
+                    or "Connection reset" in msg
+                    or "transport" in msg.lower()
+                )
+                if not is_transport:
+                    raise
                 last_exc = ProviderError("OpenRouter request failed", retryable=True, error_class="transport_error")
                 if attempt >= max_retries:
                     raise last_exc from exc

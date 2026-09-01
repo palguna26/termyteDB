@@ -65,6 +65,15 @@ class RetrievalSettings:
     reranker_threshold: float = 0.25
     reranker_model: str = "ms-marco-MiniLM-L-12-v2"
     default_search_limit: int = 10
+    # Phase 3: hybrid chunk retrieval + reranking
+    chunk_vector_weight: float = 0.6
+    chunk_lexical_weight: float = 0.4
+    reranker_enabled: bool = os.environ.get("TERMYTEDB_RERANKER_ENABLED", "1").strip().lower() not in {"0", "false", "no", "off"}
+    reranker_max_candidates: int = int(os.environ.get("TERMYTEDB_RERANKER_MAX_CANDIDATES", "30") or 30)
+    reranker_max_chars: int = int(os.environ.get("TERMYTEDB_RERANKER_MAX_CHARS", "600") or 600)
+    diversity_max_per_session: int = 2
+    fts_weight_identifiers: float = 1.5
+    vector_weight_conceptual: float = 1.5
 
 
 @dataclass(frozen=True)

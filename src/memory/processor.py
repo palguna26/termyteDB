@@ -277,6 +277,59 @@ class Processor:
             total_output = None
             total_latency = 0
 
+        # Phase 2: chunk grounding — scope to extraction batch, reject ungrounded.
+        # Only chunks covering events sent to this extraction are valid.
+        # Build batch-scoped valid chunk set: chunks whose event_ids overlap included events
+        included_event_ids = {str(eid) for eid in included.keys()} | {str(ev["id"]) for ev in events}
+        batch_valid_chunk_ids: set[str] = set()
+        chunk_session = self.repository.chunk_session_map(namespace_id)
+        for row in self.repository.db.execute("SELECT chunk_id, event_ids_json FROM chunks WHERE namespace_id=?", (namespace_id,)).fetchall():
+            try:
+                cids = set(json.loads(row["event_ids_json"]))
+            except Exception:
+                cids = set()
+            if cids & included_event_ids:
+                batch_valid_chunk_ids.add(str(row["chunk_id"]))
+        # Fallback if no chunks yet (e.g., legacy DB): allow ungrounded but don't accept cross-session forged IDs
+        # For scoping, we use batch_valid if non-empty, otherwise all valid
+        valid_chunk_ids = batch_valid_chunk_ids if batch_valid_chunk_ids else self.repository.chunk_ids_for_namespace(namespace_id)
+        # For strict grounding, we require batch scoping when chunks exist
+        scoping_ids = batch_valid_chunk_ids if batch_valid_chunk_ids else valid_chunk_ids
+        event_session_map: dict[str, str] = {}
+        for ev in events:
+            sid = str(ev["session_id"] or ev["stream_id"] or "")
+            if sid:
+                event_session_map[str(ev["id"])] = sid
+        grounded_candidates: list[Any] = []
+        rejected_grounding: list[Any] = []
+        for candidate in all_candidates:
+            chunk_ids = list(getattr(candidate, "source_chunk_ids", []) or [])
+            if chunk_ids:
+                # Scoped repair: keep only batch-covering chunk IDs
+                repaired = [cid for cid in chunk_ids if cid in scoping_ids]
+                if not repaired and chunk_ids:
+                    log(self.logger, logging.WARNING, "processing.unknown_source_chunk_id", namespace_id=namespace_id, chunk_ids=chunk_ids)
+                    # Reject: all references are fabricated or stale/cross-session
+                    rejected_grounding.append(candidate)
+                    continue
+                # Enforce session attachment: repaired chunk must belong to a session in this batch
+                if repaired:
+                    batch_sessions = set(event_session_map.values())
+                    # At least one repaired chunk must belong to a batch session
+                    chunk_sessions = {chunk_session.get(cid, "") for cid in repaired}
+                    if batch_sessions and chunk_sessions.isdisjoint(batch_sessions) and "" not in chunk_sessions:
+                        log(self.logger, logging.WARNING, "processing.cross_session_chunk_id", namespace_id=namespace_id, chunk_ids=repaired)
+                        rejected_grounding.append(candidate)
+                        continue
+                    candidate = candidate.model_copy(update={"source_chunk_ids": repaired})
+                grounded_candidates.append(candidate)
+            else:
+                grounded_candidates.append(candidate)
+        # Record rejected grounding as decisions later; for now exclude them
+        all_candidates = grounded_candidates
+        # Stash rejected for later recording
+        _rejected_grounding = rejected_grounding
+
         # Resolve refs to IDs (structural integrity)
         resolved_candidates = []
         for candidate in all_candidates:
@@ -322,9 +375,18 @@ class Processor:
         )
 
         accepted = rejected = 0
+        # Pre-record grounding rejections (all chunk IDs unknown/cross-session)
+        for _rg in _rejected_grounding:
+            rejected += 1
+            try:
+                self.repository.record_decision(namespace_id, run_id, _rg, self._safe_fingerprint(_rg), "rejected", "unknown_source_chunk_id", "REJECT")
+            except Exception:
+                pass
         try:
             fingerprints: set[str] = set()
             validated_candidates: list[tuple[Any, Any, Any]] = []
+            # Collect valid chunk IDs for validation — scoped to batch
+            valid_chunks_for_validation: set[str] | None = scoping_ids if scoping_ids else None
             for candidate in resolved_candidates:
                 try:
                     if candidate.existing_memory_ref is not None and candidate.existing_memory_id is None:
@@ -338,7 +400,7 @@ class Processor:
                         candidate = candidate.model_copy(update={"intent": "ignore"})
                     if action not in allowed_intents:
                         raise CandidateRejected("invalid_intent")
-                    validated = validate_candidate(namespace_id, candidate, included)
+                    validated = validate_candidate(namespace_id, candidate, included, included_chunks=valid_chunks_for_validation)
                     if validated.fingerprint in fingerprints:
                         raise CandidateRejected("duplicate_candidate")
                     fingerprints.add(validated.fingerprint)
@@ -453,6 +515,47 @@ class Processor:
                 )
                 # Reconciliation
                 all_candidates = self._apply_reconciliation(provider, namespace_id, existing_memories, all_candidates, deadline)
+                # Phase 2: chunk grounding for batch — scoped to batch events, reject ungrounded
+                included_event_ids_batch = {str(eid) for eid in included.keys()}
+                batch_scoped_chunk_ids: set[str] = set()
+                for brow in self.repository.db.execute("SELECT chunk_id, event_ids_json FROM chunks WHERE namespace_id=?", (namespace_id,)).fetchall():
+                    try:
+                        bcids = set(json.loads(brow["event_ids_json"]))
+                    except Exception:
+                        bcids = set()
+                    if bcids & included_event_ids_batch:
+                        batch_scoped_chunk_ids.add(str(brow["chunk_id"]))
+                if batch_scoped_chunk_ids:
+                    scoping_ids_batch = batch_scoped_chunk_ids
+                else:
+                    _all_chunk_ids = self.repository.chunk_ids_for_namespace(namespace_id)
+                    scoping_ids_batch = _all_chunk_ids if _all_chunk_ids else set()
+                # Need chunk session map for cross-session check
+                chunk_session_batch = self.repository.chunk_session_map(namespace_id)
+                batch_sessions_set: set[str] = set()
+                for _jid, _ev in batch:
+                    bs = str(_ev["session_id"] or _ev["stream_id"] or "")
+                    if bs:
+                        batch_sessions_set.add(bs)
+                repaired_batch: list[Any] = []
+                rejected_batch_grounding: list[Any] = []
+                for candidate in all_candidates:
+                    chunk_ids = list(getattr(candidate, "source_chunk_ids", []) or [])
+                    if chunk_ids:
+                        repaired = [cid for cid in chunk_ids if cid in scoping_ids_batch]
+                        if not repaired and chunk_ids:
+                            rejected_batch_grounding.append(candidate)
+                            continue
+                        if repaired:
+                            repaired_sessions = {chunk_session_batch.get(cid, "") for cid in repaired}
+                            if batch_sessions_set and repaired_sessions.isdisjoint(batch_sessions_set) and "" not in repaired_sessions:
+                                rejected_batch_grounding.append(candidate)
+                                continue
+                            if repaired != chunk_ids:
+                                candidate = candidate.model_copy(update={"source_chunk_ids": repaired})
+                    repaired_batch.append(candidate)
+                all_candidates = repaired_batch
+                _rejected_batch_grounding = rejected_batch_grounding
                 for job, _event in batch:
                     if not self.repository.heartbeat_job(namespace_id, job["id"], lease_seconds, str(job["lease_token"])):
                         raise RuntimeError("job lease is no longer active")
@@ -508,8 +611,18 @@ class Processor:
                         "estimated_cost_usd": self._estimated_cost(total_input if total_input else None, total_output if total_output else None),
                     },
                 )
+                # Count and record batch grounding rejections
+                batch_rejected_grounding = len(_rejected_batch_grounding)
+                for _rgb in _rejected_batch_grounding:
+                    try:
+                        self.repository.record_decision(namespace_id, run_id, _rgb, self._safe_fingerprint(_rgb), "rejected", "unknown_source_chunk_id", "REJECT")
+                    except Exception:
+                        pass
+                rejected += batch_rejected_grounding
+                batch_rejected += batch_rejected_grounding
                 fingerprints: set[str] = set()
                 validated_candidates: list[tuple[Any, Any, Any, Any]] = []
+                valid_chunks_batch_set: set[str] | None = scoping_ids_batch if scoping_ids_batch else None
                 for candidate in resolved_candidates:
                     try:
                         if candidate.existing_memory_ref is not None and candidate.existing_memory_id is None:
@@ -521,7 +634,7 @@ class Processor:
                             candidate = candidate.model_copy(update={"intent": "ignore"})
                         if action not in allowed_intents:
                             raise CandidateRejected("invalid_intent")
-                        validated = validate_candidate(namespace_id, candidate, included)
+                        validated = validate_candidate(namespace_id, candidate, included, included_chunks=valid_chunks_batch_set)
                         if validated.fingerprint in fingerprints:
                             raise CandidateRejected("duplicate_candidate")
                         fingerprints.add(validated.fingerprint)

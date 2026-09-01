@@ -525,6 +525,18 @@ class Repository:
                     pass
         return len(chunks)
 
+    def chunks_for_namespace(self, namespace_id: str, limit: int = 1000) -> list[dict[str, Any]]:
+        result = []
+        for row in self.db.execute("SELECT * FROM chunks WHERE namespace_id=? ORDER BY session_id, ordinal LIMIT ?", (namespace_id, limit)).fetchall():
+            result.append({**dict(row), "event_ids": json.loads(row["event_ids_json"]), "event_dates": json.loads(row["event_dates_json"])})
+        return result
+
+    def chunk_ids_for_namespace(self, namespace_id: str) -> set[str]:
+        return {str(row["chunk_id"]) for row in self.db.execute("SELECT chunk_id FROM chunks WHERE namespace_id=?", (namespace_id,)).fetchall()}
+
+    def chunk_session_map(self, namespace_id: str) -> dict[str, str]:
+        return {str(row["chunk_id"]): str(row["session_id"]) for row in self.db.execute("SELECT chunk_id, session_id FROM chunks WHERE namespace_id=?", (namespace_id,)).fetchall()}
+
     def chunks_for_events(self, namespace_id: str, event_ids: list[str], limit: int = 2) -> list[dict[str, Any]]:
         wanted = set(event_ids)
         if not wanted:
@@ -1268,11 +1280,152 @@ class Repository:
             )
         return result
 
+    def _query_weights(self, query: str) -> dict[str, float]:
+        """Deterministic query-aware weights (no LLM call).
+
+        - identifiers/names/codes/quoted text -> increase FTS weight
+        - conceptual questions -> increase dense-vector weight
+        - latest/current/now/newest -> recency boost
+        - first/previous/before/original -> historical boost
+        - multi-session -> allow more independent evidence chunks
+        """
+        ql = query.casefold()
+        has_identifiers = bool(re.search(r'["\'][\w\s./:-]+["\']|\b[A-Z]{2,}\b|\b\w+_\w+\b|\b\d{2,}\b', query))
+        has_quoted = '"' in query or "'" in query
+        has_codes = bool(re.search(r"\b(code|id|version|v\d|http|api|key)\b", ql))
+        is_conceptual = bool(re.search(r"\b(what|why|how|explain|describe|summarize|preference|feel|think)\b", ql))
+        is_latest = bool(re.search(r"\b(latest|current|now|newest|recent|today)\b", ql))
+        is_historical = bool(re.search(r"\b(first|earliest|initial|original|before|used to|previous|previously|former|formerly)\b", ql))
+        is_multi = bool(re.search(r"\b(both|all|each|every|multiple|across|between)\b", ql)) or query.count("?") > 1
+        fts_w = 1.0
+        vec_w = 1.0
+        if has_identifiers or has_quoted or has_codes:
+            fts_w = _RETRIEVAL_CFG.fts_weight_identifiers
+        if is_conceptual:
+            vec_w = _RETRIEVAL_CFG.vector_weight_conceptual
+        return {"fts": fts_w, "vector": vec_w, "is_latest": float(is_latest), "is_historical": float(is_historical), "is_multi": float(is_multi)}
+
+    def _chunk_hits(self, namespace_id: str, query: str, query_vector: list[float] | None, limit: int = 20) -> dict[str, float]:
+        """Score chunks via lexical + dense (raw + contextual) and map to memory versions."""
+        chunk_rows = self.db.execute("SELECT chunk_id, raw_text, contextual_text, event_ids_json FROM chunks WHERE namespace_id=?", (namespace_id,)).fetchall()
+        if not chunk_rows:
+            return {}
+        terms = [t.casefold() for t in re.findall(r"[\w./:-]+", query) if len(t) > 1 and t.casefold() not in SEARCH_STOP_WORDS]
+        # Batch fetch chunk embeddings
+        chunk_vectors: dict[str, list[bytes]] = {}
+        if query_vector is not None:
+            try:
+                for row in self.db.execute("SELECT chunk_id, vector FROM chunk_embeddings WHERE namespace_id=? AND provider=?", (namespace_id, self.embedding.name)).fetchall():
+                    chunk_vectors.setdefault(str(row["chunk_id"]), []).append(bytes(row["vector"]))
+            except Exception:
+                pass
+        chunk_scores: dict[str, float] = {}
+        for row in chunk_rows:
+            lexical = 0.0
+            if terms:
+                text = (str(row["raw_text"] or "") + " " + str(row["contextual_text"] or "")).casefold()
+                lexical = sum(t in text for t in terms) / max(1, len(terms))
+            dense = 0.0
+            if query_vector is not None and str(row["chunk_id"]) in chunk_vectors:
+                import array as _array
+
+                from ..retrieval.embedding import cosine as _cosine
+
+                for vec_bytes in chunk_vectors[str(row["chunk_id"])]:
+                    try:
+                        vec = list(_array.array("f", vec_bytes))
+                        dense = max(dense, _cosine(query_vector, vec))
+                    except Exception:
+                        continue
+            score = _RETRIEVAL_CFG.chunk_vector_weight * dense + _RETRIEVAL_CFG.chunk_lexical_weight * lexical
+            if score > 0.15:
+                chunk_scores[str(row["chunk_id"])] = score
+        # Map chunk scores to memory version IDs via event overlap
+        if not chunk_scores:
+            return {}
+        # Build event->memory version map
+        top_chunks = sorted(chunk_scores.items(), key=lambda x: -x[1])[: limit * 2]
+        # For each chunk, find memory versions whose source_event overlaps
+        chunk_event_map: dict[str, list[str]] = {}
+        for chunk_id, _ in top_chunks:
+            for r in chunk_rows:
+                if str(r["chunk_id"]) == chunk_id:
+                    chunk_event_map[chunk_id] = json.loads(r["event_ids_json"])
+                    break
+        memory_chunk_scores: dict[str, float] = {}
+        for chunk_id, cscore in top_chunks:
+            for event_id in chunk_event_map.get(chunk_id, []):
+                rows = self.db.execute(
+                    "SELECT v.id AS version_id FROM memory_versions v JOIN evidence_refs r ON r.memory_version_id=v.id WHERE v.namespace_id=? AND r.event_id=?", (namespace_id, event_id)
+                ).fetchall()
+                for vrow in rows:
+                    vid = str(vrow["version_id"])
+                    memory_chunk_scores[vid] = max(memory_chunk_scores.get(vid, 0.0), cscore)
+                # Also check source_event_id
+                rows2 = self.db.execute("SELECT id AS version_id FROM memory_versions WHERE namespace_id=? AND source_event_id=?", (namespace_id, event_id)).fetchall()
+                for vrow in rows2:
+                    vid = str(vrow["version_id"])
+                    memory_chunk_scores[vid] = max(memory_chunk_scores.get(vid, 0.0), cscore)
+        return memory_chunk_scores
+
+    def _rerank_candidates(
+        self, query: str, results: list[SearchResult], namespace_id: str
+    ) -> list[SearchResult]:
+        """Cross-encoder rerank using question + memory + contextual chunk text. Configurable via FlashRank."""
+        if not _RETRIEVAL_CFG.reranker_enabled or not results:
+            return results
+        try:
+            from flashrank import Ranker, RerankRequest  # type: ignore[import-untyped]
+        except ImportError:
+            return results
+        # Build chunk text map for richer passages
+        chunk_texts: dict[str, str] = {}
+        for row in self.db.execute("SELECT chunk_id, contextual_text, raw_text FROM chunks WHERE namespace_id=?", (namespace_id,)).fetchall():
+            chunk_texts[str(row["chunk_id"])] = str(row["contextual_text"] or row["raw_text"] or "")
+        # Build passages: memory statement + contextual chunk
+        ranker_model = _RETRIEVAL_CFG.reranker_model
+        try:
+            ranker = Ranker(model_name=ranker_model)
+        except Exception:
+            return results
+        max_candidates = _RETRIEVAL_CFG.reranker_max_candidates
+        max_chars = _RETRIEVAL_CFG.reranker_max_chars
+        candidates = results[:max_candidates]
+        tail = results[max_candidates:]
+        # Map chunk contexts to each result via source events
+        passages = []
+        for hit in candidates:
+            extra = ""
+            for event_id in hit.source_event_ids[:2]:
+                for row in self.db.execute("SELECT chunk_id FROM chunks WHERE namespace_id=? AND event_ids_json LIKE ?", (namespace_id, f"%{event_id}%")).fetchall():
+                    ctx = chunk_texts.get(str(row["chunk_id"]), "")
+                    if ctx:
+                        extra = ctx[:300]
+                        break
+                if extra:
+                    break
+            text = hit.statement if not extra else f"{hit.statement} | {extra}"
+            passages.append({"id": str(hit.memory_version_id), "text": text[:max_chars]})
+        try:
+            reranked_raw = ranker.rerank(RerankRequest(query=query, passages=passages))
+        except Exception:
+            return results
+        score_by_id = {str(entry["id"]): float(entry.get("score", 0.0)) for entry in reranked_raw}
+        # Apply reranker scores, keep threshold filtering for abstention only at API layer
+        reranked = sorted(candidates, key=lambda h: (-score_by_id.get(str(h.memory_version_id), 0.0), -h.score))
+        # Update component_scores with reranker
+        for hit in reranked:
+            hit.component_scores["reranker"] = score_by_id.get(str(hit.memory_version_id), 0.0)
+        return reranked + tail
+
     def search(self, namespace_id: str, query: str, limit: int, historical: bool = False, *, internal: bool = False) -> list[SearchResult]:
         # Each term becomes one SQL/FTS expression. SQLite has a hard maximum
         # expression depth, so cap user and internal transcript queries alike.
         terms = list(dict.fromkeys(term.casefold() for term in re.findall(r"[\w./:-]+", query) if len(term) > 1 and term.casefold() not in SEARCH_STOP_WORDS))[:64]
-        prefer_oldest = historical and bool(re.search(r"\b(first|earliest|initial|original|before|used to|previous|previously|former|formerly)\b", query, re.I))
+        qweights = self._query_weights(query)
+        prefer_oldest = historical and bool(qweights["is_historical"]) or bool(re.search(r"\b(first|earliest|initial|original|before|used to|previous|previously|former|formerly)\b", query, re.I))
+        prefer_latest = bool(qweights["is_latest"])
+        is_multi = bool(qweights["is_multi"]) or len(re.findall(r"\b(session|conversation)\b", query.casefold())) > 1
         lexical: dict[str, float] = {}
         lexical_rank: dict[str, int] = {}
         if terms:
@@ -1284,12 +1437,12 @@ class Repository:
                     FROM memory_versions WHERE namespace_id=? AND ("""
                     + " OR ".join("lower(statement) LIKE ?" for _ in terms)
                     + ") ORDER BY score, recorded_at DESC, id LIMIT ?",
-                    (f"%{query.casefold()}%", namespace_id, *(f"%{term}%" for term in terms), max(limit * 5, 20)),
+                    (f"%{query.casefold()}%", namespace_id, *(f"%{term}%" for term in terms), max(limit * 5, 50)),
                 ).fetchall()
             else:
                 lexical_rows = self.db.execute(
                     "SELECT memory_version_id, bm25(memory_fts) AS score FROM memory_fts WHERE namespace_id=? AND memory_fts MATCH ? ORDER BY score LIMIT ?",
-                    (namespace_id, match, max(limit * 5, 20)),
+                    (namespace_id, match, max(limit * 5, 50)),
                 ).fetchall()
             lexical_rank = {str(row["memory_version_id"]): index for index, row in enumerate(lexical_rows, start=1)}
             lexical = {memory_id: 1.0 / (1.0 + 0.08 * (rank - 1)) for memory_id, rank in lexical_rank.items()}
@@ -1299,7 +1452,7 @@ class Repository:
         query_vector: list[float] | None = None
         try:
             query_vector = self.embedding.embed(query)
-            indexed_rows = self.vector_index.search(namespace_id, query_vector, max(limit * 5, 20))
+            indexed_rows = self.vector_index.search(namespace_id, query_vector, max(limit * 5, 50))
             if indexed_rows:
                 ordered_vector = [(memory_id, score) for memory_id, score in indexed_rows if score >= 0.6]
                 vector_rank = {memory_id: index for index, (memory_id, score) in enumerate(ordered_vector, start=1)}
@@ -1330,10 +1483,22 @@ class Repository:
                     vector = {}
                     vector_rank = {}
 
+        # Phase 3: contextual chunk embeddings stream (third hybrid channel)
+        chunk_scores: dict[str, float] = {}
+        chunk_rank: dict[str, int] = {}
+        try:
+            chunk_scores = self._chunk_hits(namespace_id, query, query_vector, limit=max(limit * 3, 30))
+            if chunk_scores:
+                ordered_chunks = sorted(chunk_scores.items(), key=lambda x: (-x[1], x[0]))
+                chunk_rank = {vid: idx for idx, (vid, _) in enumerate(ordered_chunks, start=1)}
+        except Exception:
+            chunk_scores = {}
+            chunk_rank = {}
+
         # Keep semantic hits above the search floor in the candidate pool. The
         # reranker and evidence scores decide the final order; dropping 0.60-
         # 0.70 matches here loses paraphrased temporal and preference answers.
-        candidate_ids = set(lexical) | {memory_id for memory_id, score in vector.items() if score >= 0.6}
+        candidate_ids = set(lexical) | {memory_id for memory_id, score in vector.items() if score >= 0.6} | set(chunk_scores.keys())
         alias_rank: dict[str, int] = {}
         alias_terms = [term for term in terms if len(term) > 2]
         if alias_terms:
@@ -1371,52 +1536,70 @@ class Repository:
         def score_row(row: sqlite3.Row) -> float:
             version_id = str(row["version_id"])
             k = _RETRIEVAL_CFG.rrf_k
-            lexical_rrf = 1.0 / (k + lexical_rank[version_id]) if version_id in lexical_rank else 0.0
-            vector_rrf = 1.0 / (k + vector_rank[version_id]) if version_id in vector_rank else 0.0
+            # Query-aware weights: boost FTS for identifiers, vector for conceptual
+            fts_w = qweights["fts"]
+            vec_w = qweights["vector"]
+            lexical_rrf = (1.0 / (k + lexical_rank[version_id]) * fts_w) if version_id in lexical_rank else 0.0
+            vector_rrf = (1.0 / (k + vector_rank[version_id]) * vec_w) if version_id in vector_rank else 0.0
             alias_rrf = 1.0 / (k + alias_rank[version_id]) if version_id in alias_rank else 0.0
-            channel_count = sum((version_id in lexical_rank, version_id in vector_rank, version_id in alias_rank))
-            fused = k * (lexical_rrf + vector_rrf + alias_rrf) / max(1, channel_count)
+            chunk_rrf = 1.0 / (k + chunk_rank[version_id]) if version_id in chunk_rank else 0.0
+            active_channels = sum((version_id in lexical_rank, version_id in vector_rank, version_id in alias_rank, version_id in chunk_rank))
+            # Weighted fusion
+            raw_fused = lexical_rrf + vector_rrf + alias_rrf + chunk_rrf
+            fused = k * raw_fused / max(1, active_channels)
+            # Multi-channel bonus: memories that appear in multiple streams get small boost
+            if active_channels >= 2:
+                fused += 0.02 * (active_channels - 1)
             exact = 0.08 if query.casefold() in str(row["statement"]).casefold() else 0.0
             support = min(0.04, 0.01 * len(self._citations(namespace_id, version_id)))
             quality = 0.03 * float(row["confidence"]) + 0.02 * float(row["importance"])
             history = 0.0
             if historical and row["valid_to"] is not None:
                 history = 0.02 if prefer_oldest else 0.01
-            temporal = 0.0
+            # Temporal versioning: boost latest or historical based on query intent
+            temporal_boost = 0.0
+            if prefer_latest and row["valid_to"] is None and row["status"] == "active":
+                temporal_boost = 0.03
+            elif prefer_oldest and row["valid_to"] is not None:
+                temporal_boost = 0.02
+            year_match = 0.0
             if query_years:
                 valid_from = str(row["valid_from"] or "")
                 valid_to = str(row["valid_to"] or "")
                 if any(str(year) in valid_from or str(year) in valid_to for year in query_years):
-                    temporal = 0.05
+                    year_match = 0.05
             # Debt 3 fix: real temporal recency decay via TemporalBlock, not placeholder.
             recency = 0.0
             try:
                 if row["valid_from"]:
                     recency = temporal_recency_score(datetime.fromisoformat(str(row["valid_from"])))
+                    # Amplify recency for "latest" queries
+                    if prefer_latest:
+                        recency *= 1.5
             except Exception:
                 recency = 0.0
-            return min(1.0, fused + exact + support + quality + history + temporal + recency)
+            chunk_signal = chunk_scores.get(version_id, 0.0) * 0.05
+            return min(1.0, fused + exact + support + quality + history + temporal_boost + year_match + recency + chunk_signal)
 
         # Primary sort by score, secondary by valid_from. Historical queries that
         # ask for "first" or "before" should prefer older evidence instead of the
         # default newest-first tie break.
         rows_by_recency = sorted(rows, key=lambda row: row["valid_from"] or "", reverse=not prefer_oldest)
-        ranked = sorted(rows_by_recency, key=lambda row: -score_row(row))[:limit]
+        # Fuse top 50-100 candidates then rerank. Keep larger pool for reranker.
+        ranked = sorted(rows_by_recency, key=lambda row: -score_row(row))
         query_terms = set(terms)
         results: list[SearchResult] = []
         for row in ranked:
             citations = self._citations(namespace_id, row["version_id"])
             lexical_score = round(lexical.get(row["version_id"], 0.0), 6)
             vector_score = round(vector.get(row["version_id"], 0.0), 6)
+            chunk_score = round(chunk_scores.get(str(row["version_id"]), 0.0), 6)
             final_score = round(score_row(row), 6)
             source_ids = [c.event_id for c in citations]
             sid = row["source_event_id"]
             excerpt_val = row["evidence_excerpt"]
             if sid and uuid.UUID(sid) not in source_ids:
                 source_ids.append(uuid.UUID(sid))
-            # Hybrid fetch: FTS + Vector already merged via RRF. Optional
-            # reranker (FlashRank) runs on the fetched top-N before slicing to limit.
-            # Keep deterministic without LLM by default; rerank is additive.
             results.append(
                 SearchResult(
                     memory_id=uuid.UUID(row["id"]),
@@ -1436,7 +1619,12 @@ class Repository:
                         "lexical_rank": float(lexical_rank.get(str(row["version_id"]), 0)),
                         "vector_rank": float(vector_rank.get(str(row["version_id"]), 0)),
                         "alias_rank": float(alias_rank.get(str(row["version_id"]), 0)),
+                        "chunk_score": chunk_score,
+                        "chunk_rank": float(chunk_rank.get(str(row["version_id"]), 0)),
                         "exact_match": float(query.casefold() in str(row["statement"]).casefold()),
+                        "temporal_boost": float(0.03 if prefer_latest and row["valid_to"] is None else 0.0),
+                        "recency": round(temporal_recency_score(datetime.fromisoformat(str(row["valid_from"]))) if row["valid_from"] else 0.0, 6) if row["valid_from"] else 0.0,
+                        "reranker": 0.0,
                         "graph_proximity": 0.0,
                         "session_summary": 0.0,
                     },
@@ -1446,9 +1634,82 @@ class Repository:
                     evidence_excerpt=excerpt_val,
                 )
             )
-        # Post-fetch rerank: if caller wants relevance-ordered top-K, they can
-        # enable FlashRank via RETRIEVAL flag without changing fused scores.
-        results = sorted(results, key=lambda r: -r.score)[:limit]
+        # Phase 3c: Rerank chunks (not whole raw sessions, not only memory titles)
+        # Use FlashRank if available; configurable via RETRIEVAL settings
+        results = self._rerank_candidates(query, results, namespace_id)
+        # Re-sort by final score (reranker may have reordered)
+        results = sorted(results, key=lambda r: (r.component_scores.get("reranker", 0.0), r.score), reverse=True)
+        # Phase 3c: diversity + dedup — no more than 2 chunks from one session unless multi-session
+        # Deduplicate equivalent memories/chunks by statement
+        seen_statements: set[str] = set()
+        deduped: list[SearchResult] = []
+        for r in results:
+            key = r.statement.strip().casefold()
+            if key in seen_statements:
+                continue
+            seen_statements.add(key)
+            deduped.append(r)
+        results = deduped
+        # Diversity: limit emitted chunks per session, not memories
+        if not is_multi:
+            max_chunks_per_session = _RETRIEVAL_CFG.diversity_max_per_session
+            # Track chunk counts per session (2 chunks per memory * 2 memories = 4 chunks would exceed cap)
+            chunk_session_counts: dict[str, int] = {}
+            event_session: dict[str, str] = {}
+            for row in self.db.execute("SELECT id, COALESCE(stream_id, session_id, id) AS sid FROM events WHERE namespace_id=?", (namespace_id,)).fetchall():
+                event_session[str(row["id"])] = str(row["sid"])
+            # Also build chunk_id -> session map
+            chunk_session: dict[str, str] = {}
+            for row in self.db.execute("SELECT chunk_id, session_id FROM chunks WHERE namespace_id=?", (namespace_id,)).fetchall():
+                chunk_session[str(row["chunk_id"])] = str(row["session_id"])
+            diverse: list[SearchResult] = []
+            for r in results:
+                # Count how many chunks this result would emit (from chunks_for_events, up to 2)
+                # Use source_event_ids to derive chunk sessions
+                chunk_sessions_for_result: list[str] = []
+                for eid in r.source_event_ids[:2]:
+                    for crow in self.db.execute("SELECT chunk_id FROM chunks WHERE namespace_id=? AND event_ids_json LIKE ?", (namespace_id, f"%{eid}%")).fetchall():
+                        sid = chunk_session.get(str(crow["chunk_id"]), "")
+                        if sid:
+                            chunk_sessions_for_result.append(sid)
+                            break
+                if not chunk_sessions_for_result:
+                    # Fallback to event session
+                    for eid in r.source_event_ids:
+                        sid = event_session.get(str(eid), "")
+                        if sid:
+                            chunk_sessions_for_result.append(sid)
+                            break
+                # If any session would exceed chunk cap, skip this memory
+                would_exceed = False
+                for sid in chunk_sessions_for_result:
+                    # Each result emits up to len(chunk_sessions_for_result) chunks (1-2)
+                    would_be = chunk_session_counts.get(sid, 0) + len(chunk_sessions_for_result)
+                    if would_be > max_chunks_per_session and sid:
+                        # But if this is the only session with results, allow overflow by 1 to avoid empty
+                        if len(diverse) == 0:
+                            break
+                        would_exceed = True
+                        break
+                if would_exceed:
+                    continue
+                for sid in chunk_sessions_for_result:
+                    if sid:
+                        chunk_session_counts[sid] = chunk_session_counts.get(sid, 0) + 1
+                # Also handle case where no chunk sessions found - count by event session once
+                if not chunk_sessions_for_result:
+                    primary = ""
+                    for eid in r.source_event_ids:
+                        primary = event_session.get(str(eid), "")
+                        if primary:
+                            break
+                    if primary and chunk_session_counts.get(primary, 0) >= max_chunks_per_session:
+                        continue
+                    if primary:
+                        chunk_session_counts[primary] = chunk_session_counts.get(primary, 0) + 1
+                diverse.append(r)
+            results = diverse
+        results = results[:limit]
         if not internal:
             self.record_retrieval(namespace_id, [str(item.memory_id) for item in results], successful=bool(results))
         return results
@@ -1504,6 +1765,131 @@ class Repository:
             )
             for row in rows
         ]
+
+    def expand_relationships(
+        self,
+        namespace_id: str,
+        seed_memory_version_ids: list[str],
+        query: str = "",
+        max_hops: int = 1,
+        max_results: int = 5,
+        token_budget: int = 500,
+    ) -> list[dict[str, Any]]:
+        """Bounded relationship expansion after high-confidence hit.
+
+        1. resolve linked entities from seed memories
+        2. traverse one hop (default) and at most two for multi-session questions
+        3. filter by allowed relation types and valid time range
+        4. include only expanded evidence with source chunks
+        Never traverses full namespace graph.
+        """
+        if not seed_memory_version_ids:
+            return []
+        # Determine hops: at most 2 for multi-session
+        is_multi = bool(__import__("re").search(r"\b(both|all|each|every|multiple|across|between|multi.session)\b", query.casefold())) if query else False
+        hops = max(1, min(max_hops, 2 if is_multi else 1))
+        allowed_predicates = {"contains", "updates", "expresses", "related", "extends", "derives"}
+        expanded: list[dict[str, Any]] = []
+        seen_versions: set[str] = set(seed_memory_version_ids)
+        # Resolve entities linked to seed memory versions
+        seed_entities: set[str] = set()
+        for vid in seed_memory_version_ids[:3]:  # limit seed fanout
+            for row in self.db.execute(
+                "SELECT subject_entity_id, object_entity_id FROM relationships WHERE namespace_id=? AND memory_version_id=? AND status='active'",
+                (namespace_id, vid),
+            ).fetchall():
+                seed_entities.add(str(row["subject_entity_id"]))
+                seed_entities.add(str(row["object_entity_id"]))
+        if not seed_entities:
+            return []
+        frontier = list(seed_entities)
+        for _ in range(hops):
+            if not frontier or len(expanded) >= max_results:
+                break
+            placeholders = ",".join("?" for _ in frontier)
+            predicate_placeholders = ",".join("?" for _ in allowed_predicates)
+            # Build NOT IN clause for seen_versions; SQLite cannot have UNION inside IN list
+            if seen_versions:
+                not_in_clause = f"AND r.memory_version_id NOT IN ({','.join('?' for _ in seen_versions)})"
+                not_in_params: list[Any] = list(seen_versions)
+            else:
+                not_in_clause = ""
+                not_in_params = []
+            try:
+                rows = self.db.execute(
+                    f"""SELECT r.*, s.label AS subject_label, o.label AS object_label
+                        FROM relationships r JOIN entities s ON s.id=r.subject_entity_id JOIN entities o ON o.id=r.object_entity_id
+                        WHERE r.namespace_id=? AND r.status='active' AND r.predicate IN ({predicate_placeholders})
+                          AND (r.subject_entity_id IN ({placeholders}) OR r.object_entity_id IN ({placeholders}))
+                          AND r.memory_version_id IS NOT NULL
+                          {not_in_clause}
+                        ORDER BY r.confidence DESC LIMIT ?""",
+                    (namespace_id, *allowed_predicates, *frontier, *frontier, *not_in_params, max_results - len(expanded)),
+                ).fetchall() if seed_entities else []
+            except sqlite3.OperationalError:
+                # Fallback without predicate filter if schema differs
+                rows = self.db.execute(
+                    f"""SELECT r.*, s.label AS subject_label, o.label AS object_label
+                        FROM relationships r JOIN entities s ON s.id=r.subject_entity_id JOIN entities o ON o.id=r.object_entity_id
+                        WHERE r.namespace_id=? AND r.status='active'
+                          AND (r.subject_entity_id IN ({placeholders}) OR r.object_entity_id IN ({placeholders}))
+                        LIMIT ?""",
+                    (namespace_id, *frontier, *frontier, max_results - len(expanded)),
+                ).fetchall() if seed_entities else []
+            next_frontier: list[str] = []
+            for row in rows:
+                vid = str(row["memory_version_id"] or "")
+                if not vid or vid in seen_versions:
+                    continue
+                if row["predicate"] not in allowed_predicates:
+                    continue
+                # Only include if source chunk exists for this memory's evidence
+                # Correlate candidate version's evidence/source event with a chunk
+                v_source_event = self.db.execute(
+                    "SELECT source_event_id FROM memory_versions WHERE id=? AND namespace_id=?",
+                    (vid, namespace_id),
+                ).fetchone()
+                source_event_id = str(v_source_event["source_event_id"]) if v_source_event and v_source_event["source_event_id"] else None
+                # Check evidence_refs first, then source_event_id
+                evidence_event_ids: list[str] = []
+                if source_event_id:
+                    evidence_event_ids.append(source_event_id)
+                for er in self.db.execute("SELECT event_id FROM evidence_refs WHERE memory_version_id=? AND namespace_id=?", (vid, namespace_id)).fetchall():
+                    evidence_event_ids.append(str(er["event_id"]))
+                has_chunk = False
+                for eid in evidence_event_ids:
+                    exists = self.db.execute(
+                        "SELECT 1 FROM chunks WHERE namespace_id=? AND event_ids_json LIKE ? LIMIT 1",
+                        (namespace_id, f"%{eid}%"),
+                    ).fetchone()
+                    if exists:
+                        has_chunk = True
+                        break
+                if not has_chunk:
+                    continue
+                seen_versions.add(vid)
+                # Fetch memory version for evidence
+                vrow = self.db.execute(
+                    "SELECT m.id, v.statement, v.source_event_id, v.evidence_excerpt, v.valid_from, v.valid_until, v.recorded_at FROM memory_versions v JOIN memories m ON m.id=v.memory_id WHERE v.id=? AND v.namespace_id=?",
+                    (vid, namespace_id),
+                ).fetchone()
+                if not vrow:
+                    continue
+                item: dict[str, Any] = dict(row)
+                item["statement"] = vrow["statement"]
+                item["source_event_id"] = vrow["source_event_id"]
+                item["memory_id"] = vrow["id"]
+                item["memory_version_id"] = vid
+                # Token guard
+                if sum(len(str(e.get("statement", "")).split()) for e in expanded) + len(str(vrow["statement"]).split()) > token_budget:
+                    break
+                expanded.append(item)
+                # Expand frontier
+                other = str(row["object_entity_id"]) if str(row["subject_entity_id"]) in frontier else str(row["subject_entity_id"])
+                if other not in seen_versions:
+                    next_frontier.append(other)
+            frontier = next_frontier
+        return expanded[:max_results]
 
     def memory_count(self, namespace_id: str) -> int:
         return int(self.db.execute("SELECT COUNT(*) FROM memories WHERE namespace_id=?", (namespace_id,)).fetchone()[0])

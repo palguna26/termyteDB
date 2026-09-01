@@ -992,29 +992,124 @@ class OpenRouterBudget:
                 raise BudgetExceeded(f"budget ${self.cap_usd:.2f} exceeded (${self.spent_usd:.4f} spent)")
 
 
-def openrouter_chat(model: str, messages: list[dict[str, str]], budget: OpenRouterBudget | None, *, max_retries: int = 4) -> dict[str, Any]:
+def _parse_retry_after_header(value: str | None) -> float | None:
+    if not value:
+        return None
+    value = str(value).strip()
+    try:
+        return max(0.0, float(value))
+    except ValueError:
+        pass
+    try:
+        from email.utils import parsedate_to_datetime
+
+        dt = parsedate_to_datetime(value)
+        if dt is not None:
+            from datetime import timezone
+
+            delta = (dt - datetime.now(timezone.utc)).total_seconds()
+            return max(0.0, delta)
+    except Exception:
+        return None
+    return None
+
+
+def _is_retryable_openrouter_error(exc: Exception) -> tuple[bool, float | None]:
+    msg = str(exc)
+    retry_after: float | None = None
+    # Parse Retry-After from message if present
+    if "retry_after=" in msg:
+        try:
+            retry_after = float(msg.split("retry_after=")[1].split()[0].strip().strip(","))
+        except Exception:
+            retry_after = None
+    # IncompleteRead and transport errors
+    if "IncompleteRead" in type(exc).__name__ or "IncompleteRead" in msg:
+        return True, retry_after
+    if isinstance(exc, OSError) or "Connection reset" in msg or "transport" in msg.lower():
+        return True, retry_after
+    # HTTP status codes
+    for code in ("408", "429", "500", "502", "503", "504"):
+        if f"HTTP {code}" in msg or f" {code} " in msg:
+            # Check for Retry-After header embedded in error
+            return True, retry_after
+    # Timeout errors
+    if isinstance(exc, TimeoutError) or "timeout" in msg.lower() or "timed out" in msg.lower():
+        return True, retry_after
+    return False, retry_after
+
+
+def _retry_delay(attempt: int, retry_after: float | None) -> float:
+    if retry_after is not None:
+        return min(60.0, max(0.5, retry_after))
+    return min(30.0, 1.0 * (2**attempt)) + (hash(str(time.perf_counter())) % 100) / 1000.0
+
+
+def openrouter_chat(model: str, messages: list[dict[str, str]], budget: OpenRouterBudget | None, *, max_retries: int = 4, timeout: float = 90.0) -> dict[str, Any]:
     api_key = os.environ.get("OPENROUTER_API_KEY")
     if not api_key:
         raise ValueError("OPENROUTER_API_KEY is required for judged mode")
     payload = json.dumps({"model": model, "messages": messages}).encode()
     last_error: Exception | None = None
+    deadline = time.monotonic() + timeout * max_retries
     for attempt in range(max_retries):
+        # Check deadline
+        if time.monotonic() >= deadline:
+            raise RuntimeError(f"OpenRouter call deadline exceeded after {attempt} attempts: {last_error}")
         try:
+            from urllib.error import HTTPError as _HTTPError
+
             request = Request(
                 "https://openrouter.ai/api/v1/chat/completions",
                 data=payload,
                 headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
             )
-            with urlopen(request, timeout=90) as response:
+            with urlopen(request, timeout=timeout) as response:
+                # Handle Retry-After on success response headers (unlikely but defensive)
                 body = json.loads(response.read().decode())
-            usage = body.get("usage", {})
-            budget.charge(float(usage.get("cost", 0.0)))
+            # Check for HTTP error embedded in body
+            if isinstance(body, dict) and body.get("error"):
+                err = body["error"]
+                code = err.get("code", 500) if isinstance(err, dict) else 500
+                if code in (408, 429, 500, 502, 503, 504):
+                    raise RuntimeError(f"OpenRouter returned HTTP {code} response={err}")
+            usage = body.get("usage", {}) if isinstance(body, dict) else {}
+            if budget is not None:
+                budget.charge(float(usage.get("cost", 0.0)))
             return body["choices"][0]["message"]["content"]
         except BudgetExceeded:
             raise
         except Exception as exc:
             last_error = exc
-            time.sleep(min(2**attempt + attempt, 15))
+            # Invalid JSON / schema output is NOT retryable as transport failure
+            msg = str(exc)
+            if "invalid" in msg.lower() and "json" in msg.lower():
+                raise
+            retryable, retry_after = _is_retryable_openrouter_error(exc)
+            # Also check HTTPError specifically for status codes
+            try:
+                from urllib.error import HTTPError as _HTTPError2
+
+                if isinstance(exc, _HTTPError2):
+                    retry_after_raw = exc.headers.get("Retry-After") if hasattr(exc, "headers") and exc.headers else None
+                    parsed = _parse_retry_after_header(retry_after_raw)
+                    if parsed is not None:
+                        retry_after = parsed
+                    if exc.code in (408, 429, 500, 502, 503, 504):
+                        retryable = True
+            except Exception:
+                pass
+            if not retryable or attempt == max_retries - 1:
+                # Distinguish transport vs invalid output
+                if retryable:
+                    raise RuntimeError(f"OpenRouter call failed after {max_retries} attempts: {last_error}") from exc
+                raise RuntimeError(f"OpenRouter call failed after {max_retries} attempts: {last_error}") from exc
+            delay = _retry_delay(attempt, retry_after)
+            # Respect deadline
+            remaining = deadline - time.monotonic()
+            if delay > remaining:
+                raise RuntimeError(f"OpenRouter call deadline exceeded: {last_error}") from exc
+            time.sleep(delay)
     raise RuntimeError(f"OpenRouter call failed after {max_retries} attempts: {last_error}")
 
 
