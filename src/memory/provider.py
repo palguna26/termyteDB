@@ -14,6 +14,9 @@ from ..config.prompts import (
     build_extraction_prompt as _build_extraction_prompt,
 )
 from ..config.prompts import (
+    build_extraction_v3_prompt as _build_extraction_v3_prompt,
+)
+from ..config.prompts import (
     build_reconciliation_prompt as _build_reconciliation_prompt,
 )
 from ..config.prompts import (
@@ -26,6 +29,12 @@ from ..config.prompts import (
     extraction_response_format as _extraction_response_format,
 )
 from ..config.prompts import (
+    extraction_response_format_v3 as _extraction_response_format_v3,
+)
+from ..config.prompts import (
+    get_extraction_schema as _get_extraction_schema,
+)
+from ..config.prompts import (
     reconciliation_response_format as _reconciliation_response_format,
 )
 
@@ -33,8 +42,10 @@ from ..config.prompts import (
 # import build_extraction_prompt` continue to work while config is source of truth.
 from ..models import (
     ExtractionCandidate,
+    ExtractionMemoryV3,
     ExtractionRequest,
     ExtractionResponse,
+    ExtractionResponseV3,
     ReconciliationRequest,
     ReconciliationResponse,
     SimpleExtractionResponse,
@@ -140,6 +151,9 @@ def clean_json_response(value: str) -> str:
 
 def extraction_response_format() -> dict[str, object]:
     """Backward-compat wrapper - canonical implementation lives in `config.prompts`."""
+    # Dispatch based on env schema
+    if _get_extraction_schema() == "v3":
+        return _extraction_response_format_v3()
     return _extraction_response_format()
 
 
@@ -148,10 +162,124 @@ def build_extraction_prompt(request: ExtractionRequest) -> str:
     return _build_extraction_prompt(request)
 
 
+def build_extraction_v3_prompt(request: ExtractionRequest) -> str:
+    return _build_extraction_v3_prompt(request)
+
+
 def _simple_subject(statement: str) -> str:
     words = [word.strip(".,:;!?()[]{}\"'").casefold() for word in statement.split()]
     words = [word for word in words if word]
     return " ".join(words[:6]) or "memory"
+
+
+def _v3_type_to_kind(t: str) -> str:
+    mapping = {
+        "profile": "fact",
+        "preference": "fact",
+        "event": "fact",
+        "assistant_knowledge": "fact",
+        "decision": "decision",
+        "task": "task_state",
+        "correction": "correction",
+        "fact": "fact",
+    }
+    return mapping.get(t, "fact")
+
+
+def _v3_lifecycle_to_durability(l: str) -> str:
+    if l == "task":
+        return "task"
+    return "permanent"
+
+
+def _v3_importance_to_float(v: int) -> float:
+    return max(0.0, min(1.0, v / 5.0))
+
+
+def _normalize_state_key(value: str | None) -> str | None:
+    if not value:
+        return None
+    normalized = " ".join(value.strip().split()).casefold()
+    # must contain dot per pattern; ensure normalized matches pattern
+    if "." not in normalized:
+        return None
+    return normalized
+
+
+def _v3_response_to_extraction(value: Any, request: ExtractionRequest | None = None) -> ExtractionResponse:
+    """Convert extraction-v3 JSON into storage candidates with deterministic mapping."""
+    try:
+        parsed = ExtractionResponseV3.model_validate(value)
+    except Exception:
+        # Fallback to simple if validation fails (non-strict tolerance)
+        # Try tolerant parsing: ignore unknown fields
+        try:
+            # Manual tolerant parse
+            raw_mems = value.get("memories", []) if isinstance(value, dict) else []
+            candidates_tolerant: list[ExtractionCandidate] = []
+            for fields in raw_mems:
+                if not isinstance(fields, dict):
+                    continue
+                statement = " ".join(str(fields.get("statement", "")).split())
+                source_events = fields.get("source_events") or []
+                if not statement or not source_events:
+                    continue
+                t = str(fields.get("type", "fact"))
+                imp = int(fields.get("importance", 3))
+                life = str(fields.get("lifecycle", "stable"))
+                sk = _normalize_state_key(fields.get("state_key"))
+                kind = _v3_type_to_kind(t)
+                subject = sk if sk and life == "current" else _simple_subject(statement)
+                if sk and life == "current":
+                    subject = sk
+                try:
+                    candidates_tolerant.append(
+                        ExtractionCandidate(
+                            kind=kind,  # type: ignore[arg-type]
+                            subject=subject,
+                            statement=statement,
+                            evidence=[],
+                            confidence=0.9,
+                            importance=_v3_importance_to_float(max(1, min(5, imp))),
+                            durability=_v3_lifecycle_to_durability(life),  # type: ignore[arg-type]
+                            v3_type=t,  # type: ignore[arg-type]
+                            v3_lifecycle=life,  # type: ignore[arg-type]
+                            v3_state_key=sk,
+                            v3_source_labels=[str(x) for x in source_events],
+                            v3_importance_int=max(1, min(5, imp)),
+                        )
+                    )
+                except Exception:
+                    continue
+            return ExtractionResponse(schema_version="extraction-v1", prompt_version="extraction-v3-tolerant", candidates=candidates_tolerant)
+        except Exception:
+            raise
+    candidates: list[ExtractionCandidate] = []
+    for mem in parsed.memories:
+        kind = _v3_type_to_kind(mem.type)
+        subject = _normalize_state_key(mem.state_key) if mem.state_key and mem.lifecycle == "current" else _simple_subject(mem.statement)
+        if mem.state_key and mem.lifecycle == "current":
+            subject = _normalize_state_key(mem.state_key) or _simple_subject(mem.statement)
+        try:
+            candidates.append(
+                ExtractionCandidate(
+                    kind=kind,  # type: ignore[arg-type]
+                    subject=subject,
+                    statement=mem.statement,
+                    evidence=[],
+                    confidence=0.9,
+                    importance=_v3_importance_to_float(mem.importance),
+                    durability=_v3_lifecycle_to_durability(mem.lifecycle),  # type: ignore[arg-type]
+                    v3_type=mem.type,
+                    v3_lifecycle=mem.lifecycle,
+                    v3_state_key=_normalize_state_key(mem.state_key),
+                    v3_source_labels=list(mem.source_events),
+                    v3_importance_int=mem.importance,
+                )
+            )
+        except Exception:
+            continue
+    return ExtractionResponse(schema_version="extraction-v1", prompt_version="extraction-v3", candidates=candidates)
 
 
 def _simple_response_to_extraction(value: Any, request: ExtractionRequest | None = None) -> ExtractionResponse:
@@ -160,6 +288,8 @@ def _simple_response_to_extraction(value: Any, request: ExtractionRequest | None
     Source event links are assigned by the processor.  We intentionally do not
     ask the LLM to fabricate IDs, offsets, excerpts, or database actions.
     """
+    if isinstance(value, dict) and value.get("schema_version") == "extraction-v3":
+        return _v3_response_to_extraction(value, request)
     if isinstance(value, dict) and value.get("schema_version") == "extraction-v1":
         return ExtractionResponse.model_validate(value)
     if isinstance(value, dict) and value.get("schema_version") == "extraction-v2":
@@ -346,8 +476,9 @@ class FakeExtractionProvider:
     name = "fake"
     model = "fake-v1"
 
-    def __init__(self, response: ExtractionResponse | None = None, reconciliation_response: ReconciliationResponse | None = None):
+    def __init__(self, response: ExtractionResponse | None = None, reconciliation_response: ReconciliationResponse | None = None, v3_response: ExtractionResponseV3 | None = None):
         self.response = response
+        self.v3_response = v3_response
         self.reconciliation_response = reconciliation_response
         # For multi-pass testing: allow per-stage canned responses
         self.stage_responses: dict[str, ExtractionResponse] = {}
@@ -365,8 +496,26 @@ class FakeExtractionProvider:
         if cancellation and cancellation():
             raise ProviderError("extraction cancelled", retryable=True, error_class="cancelled")
         started = time.perf_counter()
-        response = self.response
         stage = getattr(request, "stage", "facts") or "facts"
+        is_v3 = getattr(request, "extraction_schema", "v2") == "v3"
+        response = self.response
+        # v3 injected response handling
+        if is_v3 and self.v3_response is not None and response is None:
+            # Convert v3 response via helper to ExtractionResponse with v3 metadata
+            response = _v3_response_to_extraction(self.v3_response.model_dump(mode="json"), request)
+            prompt_version = "fake-v3"
+            raw = json.dumps(self.v3_response.model_dump(mode="json"), sort_keys=True, separators=(",", ":"))
+            return ProviderResult(
+                response=response,
+                provider_name=self.name,
+                model_name=self.model,
+                prompt_version=prompt_version,
+                raw_response_hash=hashlib.sha256(raw.encode()).hexdigest(),
+                input_tokens=len(json.dumps(request.model_dump(mode="json"), sort_keys=True).split()),
+                output_tokens=len(raw.split()),
+                latency_ms=int((time.perf_counter() - started) * 1000),
+                stage=stage,
+            )
         if response is None and stage in self.stage_responses:
             response = self.stage_responses[stage]
         if response is None:
@@ -374,7 +523,12 @@ class FakeExtractionProvider:
             from .extractor import extract as rule_extract
 
             candidates = []
+            # Build reverse label map for v3 source_events
+            reverse_labels = {str(v): k for k, v in (request.event_labels or {}).items()}
             for event_id, text in request.evidence_text.items():
+                # For v3, only process extractable events; skip context-only if schema v3
+                if is_v3 and request.extractable_event_ids and event_id not in request.extractable_event_ids:
+                    continue
                 for item in rule_extract({"text": text}):
                     c = rule_candidate_to_contract(item, event_id, text)
                     # Tag with source stage for tracing
@@ -382,11 +536,32 @@ class FakeExtractionProvider:
                         c = c.model_copy(update={"source_stage": stage})  # type: ignore[arg-type]
                     except Exception:
                         pass
+                    if is_v3:
+                        # Enrich with v3 metadata preserving labels
+                        label = reverse_labels.get(str(event_id), "")
+                        v3_type = "preference" if "prefer" in c.statement.casefold() else ("decision" if c.kind == "decision" else "fact")
+                        v3_lifecycle = "current" if "prefer" in c.statement.casefold() or "currently" in c.statement.casefold() else "stable"
+                        state_key = "user.preference.general" if v3_type == "preference" and v3_lifecycle == "current" else None
+                        try:
+                            c = c.model_copy(update={
+                                "v3_type": v3_type,  # type: ignore[arg-type]
+                                "v3_lifecycle": v3_lifecycle,  # type: ignore[arg-type]
+                                "v3_state_key": state_key,
+                                "v3_source_labels": [label] if label else [],
+                                "v3_importance_int": 5 if v3_type == "preference" else 4,
+                                "importance": _v3_importance_to_float(5 if v3_type == "preference" else 4),
+                                "durability": _v3_lifecycle_to_durability(v3_lifecycle),  # type: ignore[arg-type]
+                            })
+                        except Exception:
+                            pass
                     candidates.append(c)
             if request.existing_memories:
                 candidates = self._reconcile_candidates(candidates, request.existing_memories)
             # Prompt version encodes stage for tracing
-            prompt_version = f"fake-v1-{stage}" if stage != "facts" else "fake-v1"
+            if is_v3:
+                prompt_version = "fake-v3"
+            else:
+                prompt_version = f"fake-v1-{stage}" if stage != "facts" else "fake-v1"
             response = ExtractionResponse(schema_version="extraction-v1", prompt_version=prompt_version, candidates=candidates)
         else:
             # Ensure candidates carry source_stage if not set
@@ -650,15 +825,18 @@ class OpenRouterExtractionProvider:
             temperature = float(os.environ.get("TERMYTEDB_EXTRACTION_TEMPERATURE", "0"))
         except ValueError:
             temperature = 0.0
+        is_v3 = getattr(request, "extraction_schema", "v2") == "v3"
+        system_content = "Return only valid JSON matching the supplied extraction-v3 schema." if is_v3 else "Return only valid JSON matching the supplied memory-list schema."
+        response_fmt = _extraction_response_format_v3() if is_v3 else _extraction_response_format()
         body = {
             "model": self.model,
             "messages": [
-                {"role": "system", "content": "Return only valid JSON matching the supplied memory-list schema."},
+                {"role": "system", "content": system_content},
                 {"role": "user", "content": prompt},
             ],
             "temperature": temperature,
             "max_tokens": 2500,
-            "response_format": extraction_response_format(),
+            "response_format": response_fmt,
             "plugins": [{"id": "response-healing"}],
         }
         started = time.perf_counter()

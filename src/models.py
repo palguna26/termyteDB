@@ -57,6 +57,9 @@ ReconciliationIntent = Literal["insert", "reinforce", "update", "supersede", "di
 ReconciliationAction = Literal["insert", "reinforce", "update", "supersede", "dispute", "contradiction", "ignore"]
 Durability = Literal["permanent", "session", "task"]
 
+MemoryTypeV3 = Literal["profile", "preference", "event", "assistant_knowledge", "decision", "task", "correction", "fact"]
+LifecycleV3 = Literal["stable", "current", "historical", "instruction", "task"]
+
 ExtractionStage = Literal[
     "facts",
     "preferences",
@@ -151,6 +154,12 @@ class ExtractionCandidate(BaseModel):
     event_dates: list[datetime] = Field(default_factory=list, max_length=20)
     entities: list[str] = Field(default_factory=list, max_length=20)
     relation: Literal["insert", "reinforce", "update", "supersede", "dispute", "extends", "derives", "ignore"] | None = None
+    # v3 migration fields (optional, for typed extraction)
+    v3_type: MemoryTypeV3 | None = None
+    v3_lifecycle: LifecycleV3 | None = None
+    v3_state_key: str | None = None
+    v3_source_labels: list[str] = Field(default_factory=list, max_length=8)
+    v3_importance_int: int | None = Field(default=None, ge=1, le=5)
 
 
 class ExtractionResponse(BaseModel):
@@ -176,6 +185,24 @@ class SimpleExtractionResponse(BaseModel):
     memories: list[dict[str, Any]] = Field(default_factory=list, max_length=50)
 
 
+class ExtractionMemoryV3(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    statement: str = Field(min_length=1, max_length=2000)
+    source_events: list[str] = Field(min_length=1, max_length=8)
+    type: MemoryTypeV3
+    importance: int = Field(ge=1, le=5)
+    lifecycle: LifecycleV3
+    state_key: str | None = Field(default=None, max_length=200, pattern=r"^[a-z0-9_.]+\.[a-z0-9_.]+$")
+
+
+class ExtractionResponseV3(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    schema_version: Literal["extraction-v3"] = "extraction-v3"
+    memories: list[ExtractionMemoryV3] = Field(default_factory=list, max_length=50)
+
+
 class ExtractionRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -192,6 +219,12 @@ class ExtractionRequest(BaseModel):
     event_roles: dict[UUID, Literal["user", "assistant"]] = Field(default_factory=dict)
     existing_memories: list[dict[str, Any]] = Field(default_factory=list, max_length=20)
     stage: ExtractionStage = "facts"
+    # v3: explicit split between context and extractable events
+    extractable_event_ids: list[UUID] = Field(default_factory=list)
+    context_event_ids: list[UUID] = Field(default_factory=list)
+    event_timestamps: dict[UUID, str] = Field(default_factory=dict)
+    event_session_ids: dict[UUID, str] = Field(default_factory=dict)
+    extraction_schema: Literal["v2", "v3"] = "v2"
 
 
 class ReconciliationDecision(BaseModel):

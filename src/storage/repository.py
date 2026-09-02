@@ -40,6 +40,15 @@ TRANSITION_MARKERS = (
     "deprecated",
     "stopped",
 )
+def _normalize_state_key(value: str | None) -> str | None:
+    if not value:
+        return None
+    normalized = " ".join(str(value).strip().split()).casefold()
+    if "." not in normalized:
+        return None
+    return normalized
+
+
 SEARCH_STOP_WORDS = {
     "a",
     "an",
@@ -141,6 +150,7 @@ class Repository:
         self.vector_index.ensure()
         self._ensure_extraction_runs_tracing_columns()
         self._ensure_chunk_event_index()
+        self._ensure_v3_columns()
         self._claimed_lease_tokens: dict[str, str] = {}
 
     def _ensure_extraction_runs_tracing_columns(self) -> None:
@@ -156,6 +166,34 @@ class Repository:
                 self.db.execute("ALTER TABLE extraction_runs ADD COLUMN existing_memory_count INTEGER")
             if "input_hash" not in cols:
                 pass
+        except Exception:
+            pass
+
+    def _ensure_v3_columns(self) -> None:
+        try:
+            cols = {row[1] for row in self.db.execute("PRAGMA table_info(memory_versions)").fetchall()}
+            if "state_key" not in cols:
+                self.db.execute("ALTER TABLE memory_versions ADD COLUMN state_key TEXT")
+            if "lifecycle" not in cols:
+                self.db.execute("ALTER TABLE memory_versions ADD COLUMN lifecycle TEXT")
+            if "observed_at" not in cols:
+                self.db.execute("ALTER TABLE memory_versions ADD COLUMN observed_at TEXT")
+            if "source_event_ids_json" not in cols:
+                self.db.execute("ALTER TABLE memory_versions ADD COLUMN source_event_ids_json TEXT")
+            if "event_dates_json" not in cols:
+                self.db.execute("ALTER TABLE memory_versions ADD COLUMN event_dates_json TEXT")
+            # extraction_decisions extra diagnostics for v3
+            dcols = {row[1] for row in self.db.execute("PRAGMA table_info(extraction_decisions)").fetchall()}
+            if "v3_type" not in dcols:
+                self.db.execute("ALTER TABLE extraction_decisions ADD COLUMN v3_type TEXT")
+            if "v3_lifecycle" not in dcols:
+                self.db.execute("ALTER TABLE extraction_decisions ADD COLUMN v3_lifecycle TEXT")
+            if "v3_state_key" not in dcols:
+                self.db.execute("ALTER TABLE extraction_decisions ADD COLUMN v3_state_key TEXT")
+            if "source_event_ids_json" not in dcols:
+                self.db.execute("ALTER TABLE extraction_decisions ADD COLUMN source_event_ids_json TEXT")
+            if "source_chunk_ids_json" not in dcols:
+                self.db.execute("ALTER TABLE extraction_decisions ADD COLUMN source_chunk_ids_json TEXT")
         except Exception:
             pass
 
@@ -511,6 +549,69 @@ class Repository:
             "estimated_extraction_cost_usd": float(
                 self.db.execute("SELECT COALESCE(SUM(estimated_cost_usd), 0) FROM extraction_runs WHERE namespace_id=?", (namespace_id,)).fetchone()[0]
             ),
+        }
+
+    def formation_metrics(self, namespace_id: str) -> dict[str, Any]:
+        """Phase 0 memory-formation metrics for benchmark diagnostics."""
+        total_decisions = int(self.db.execute("SELECT COUNT(*) FROM extraction_decisions WHERE namespace_id=?", (namespace_id,)).fetchone()[0])
+        accepted = int(self.db.execute("SELECT COUNT(*) FROM extraction_decisions WHERE namespace_id=? AND validation_status='accepted'", (namespace_id,)).fetchone()[0])
+        rejected = total_decisions - accepted
+        # "accepted" also includes IGNORE decisions, which do not produce a
+        # memory record.  Grounding must be measured only for persisted or
+        # reinforced records, and an absent JSON value must never be counted
+        # as evidence.
+        persisted = int(
+            self.db.execute(
+                """SELECT COUNT(*) FROM extraction_decisions
+                WHERE namespace_id=? AND validation_status='accepted'
+                  AND memory_version_id IS NOT NULL""",
+                (namespace_id,),
+            ).fetchone()[0]
+        )
+        grounded = int(
+            self.db.execute(
+                """SELECT COUNT(*) FROM extraction_decisions
+                WHERE namespace_id=? AND validation_status='accepted'
+                  AND memory_version_id IS NOT NULL
+                  AND source_event_ids_json IS NOT NULL
+                  AND source_event_ids_json != '[]'""",
+                (namespace_id,),
+            ).fetchone()[0]
+        )
+        grounded_rate = round(grounded / persisted, 3) if persisted else 0.0
+        # Records per session
+        mem_count = int(self.db.execute("SELECT COUNT(*) FROM memories WHERE namespace_id=?", (namespace_id,)).fetchone()[0])
+        session_count = int(self.db.execute("SELECT COUNT(DISTINCT session_id) FROM chunks WHERE namespace_id=?", (namespace_id,)).fetchone()[0] or 1)
+        records_per_session = round(mem_count / max(1, session_count), 2)
+        # Duplicate rate
+        dup = int(self.db.execute("SELECT COUNT(*) FROM extraction_decisions WHERE namespace_id=? AND rejection_reason='duplicate_candidate'", (namespace_id,)).fetchone()[0])
+        dup_rate = round(dup / max(1, total_decisions), 3)
+        # Type distribution
+        type_rows = self.db.execute("SELECT kind, COUNT(*) as cnt FROM memories WHERE namespace_id=? GROUP BY kind", (namespace_id,)).fetchall()
+        type_dist = {row["kind"]: int(row["cnt"]) for row in type_rows}
+        # v3 type distribution if available
+        try:
+            v3_rows = self.db.execute("SELECT v3_type, COUNT(*) as cnt FROM extraction_decisions WHERE namespace_id=? AND v3_type IS NOT NULL GROUP BY v3_type", (namespace_id,)).fetchall()
+            v3_dist = {row["v3_type"]: int(row["cnt"]) for row in v3_rows}
+            if v3_dist:
+                type_dist["v3"] = v3_dist
+        except Exception:
+            pass
+        # Unsupported/fabricated rejection rate
+        unsup = int(self.db.execute("SELECT COUNT(*) FROM extraction_decisions WHERE namespace_id=? AND rejection_reason IN ('unsupported_statement','unknown_source_chunk_id','unknown_source_label','context_only_source')", (namespace_id,)).fetchone()[0])
+        unsup_rate = round(unsup / max(1, total_decisions), 3)
+        # Answer-session extraction coverage placeholder (requires benchmark answer_session_ids, not available here)
+        return {
+            "grounded_record_rate": grounded_rate,
+            "records_per_session": records_per_session,
+            "duplicate_rate": dup_rate,
+            "type_distribution": type_dist,
+            "unsupported_rejection_rate": unsup_rate,
+            "total_decisions": total_decisions,
+            "accepted": accepted,
+            "rejected": rejected,
+            "persisted_records": persisted,
+            "grounded_records": grounded,
         }
 
     def get_event(self, namespace_id: str, event_id: str) -> dict[str, Any] | None:
@@ -1081,28 +1182,72 @@ class Repository:
         memory_id: str | None = None,
         version_id: str | None = None,
     ) -> None:
+        # Build v3 diagnostics if available
+        v3_type = getattr(candidate, "v3_type", None)
+        v3_lifecycle = getattr(candidate, "v3_lifecycle", None)
+        v3_state_key = getattr(candidate, "v3_state_key", None)
+        source_event_ids_json = None
+        source_chunk_ids_json = None
+        try:
+            if getattr(candidate, "evidence", None):
+                source_event_ids_json = json.dumps([str(sp.event_id) for sp in candidate.evidence])
+            if getattr(candidate, "source_chunk_ids", None):
+                source_chunk_ids_json = json.dumps(list(candidate.source_chunk_ids))
+        except Exception:
+            pass
         with self.db.connection:
-            self.db.execute(
-                """INSERT OR IGNORE INTO extraction_decisions
-                (id, run_id, namespace_id, candidate_fingerprint, kind, subject, statement,
-                 validation_status, rejection_reason, action, memory_id, memory_version_id, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (
-                    str(uuid.uuid4()),
-                    run_id,
-                    namespace_id,
-                    fingerprint,
-                    candidate.kind,
-                    redact_text(candidate.subject),
-                    redact_text(candidate.statement),
-                    validation_status,
-                    redact_text(reason) if reason else None,
-                    action,
-                    memory_id,
-                    version_id,
-                    iso(),
-                ),
-            )
+            # Try to include v3 columns if they exist (added via _ensure_v3_columns)
+            try:
+                self.db.execute(
+                    """INSERT OR IGNORE INTO extraction_decisions
+                    (id, run_id, namespace_id, candidate_fingerprint, kind, subject, statement,
+                     validation_status, rejection_reason, action, memory_id, memory_version_id, created_at,
+                     v3_type, v3_lifecycle, v3_state_key, source_event_ids_json, source_chunk_ids_json)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        str(uuid.uuid4()),
+                        run_id,
+                        namespace_id,
+                        fingerprint,
+                        candidate.kind,
+                        redact_text(candidate.subject),
+                        redact_text(candidate.statement),
+                        validation_status,
+                        redact_text(reason) if reason else None,
+                        action,
+                        memory_id,
+                        version_id,
+                        iso(),
+                        v3_type,
+                        v3_lifecycle,
+                        v3_state_key,
+                        source_event_ids_json,
+                        source_chunk_ids_json,
+                    ),
+                )
+            except Exception:
+                # Fallback for DBs without v3 columns (legacy)
+                self.db.execute(
+                    """INSERT OR IGNORE INTO extraction_decisions
+                    (id, run_id, namespace_id, candidate_fingerprint, kind, subject, statement,
+                     validation_status, rejection_reason, action, memory_id, memory_version_id, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        str(uuid.uuid4()),
+                        run_id,
+                        namespace_id,
+                        fingerprint,
+                        candidate.kind,
+                        redact_text(candidate.subject),
+                        redact_text(candidate.statement),
+                        validation_status,
+                        redact_text(reason) if reason else None,
+                        action,
+                        memory_id,
+                        version_id,
+                        iso(),
+                    ),
+                )
 
     def reconcile_candidate(
         self,
@@ -1155,9 +1300,19 @@ class Repository:
             raise ValueError("evidence event is not in the requested namespace")
         if source["created_at"] > iso():
             raise ValueError("evidence postdates derived version")
+        # A current state is one timeline.  Stable and historical records are
+        # separate observations, not updates to that timeline.  Give them a
+        # deterministic identity so they are retained and repeat ingestion
+        # reinforces the existing record instead of creating duplicates.
+        v3_lifecycle = getattr(item, "v3_lifecycle", None)
+        v3_state_key = _normalize_state_key(getattr(item, "v3_state_key", None))
+        memory_subject = item.subject
+        if v3_lifecycle in {"stable", "historical", "instruction", "task"}:
+            statement_key = hashlib.sha256(item.statement.casefold().encode("utf-8")).hexdigest()[:16]
+            memory_subject = f"{item.subject}::observation::{statement_key}"
         memory = self.db.execute(
             "SELECT * FROM memories WHERE namespace_id=? AND kind=? AND subject_key=?",
-            (namespace_id, item.kind, item.subject),
+            (namespace_id, item.kind, memory_subject),
         ).fetchone()
         memory_id = memory["id"] if memory else str(uuid.uuid4())
         if item.existing_memory_id is not None and (not memory or str(item.existing_memory_id) != memory_id):
@@ -1167,7 +1322,7 @@ class Repository:
         if not memory:
             self.db.execute(
                 "INSERT INTO memories(id, namespace_id, kind, subject_key, status, confidence, importance, created_at) VALUES (?, ?, ?, ?, 'active', ?, ?, ?)",
-                (memory_id, namespace_id, item.kind, item.subject, item.confidence, item.importance, iso()),
+                (memory_id, namespace_id, item.kind, memory_subject, item.confidence, item.importance, iso()),
             )
         current = self.db.execute(
             "SELECT * FROM memory_versions WHERE memory_id=? AND namespace_id=? ORDER BY version DESC LIMIT 1", (memory_id, namespace_id)
@@ -1182,12 +1337,40 @@ class Repository:
                     (str(uuid.uuid4()), current["id"], namespace_id, str(span.event_id), span.start_offset, span.end_offset, span.excerpt),
                 )
             return memory_id, "REINFORCE", current["id"]
+        # Compute the latest world-time observation before deciding whether a
+        # state can replace the current value.  Ingestion time is not a valid
+        # substitute: old transcripts may be imported after newer ones.
+        latest_source_time = source["occurred_at"]
+        for span in item.evidence[1:]:
+            row = self.db.execute(
+                "SELECT occurred_at FROM events WHERE id=? AND namespace_id=?",
+                (str(span.event_id), namespace_id),
+            ).fetchone()
+            if row and row["occurred_at"] and (not latest_source_time or str(row["occurred_at"]) > str(latest_source_time)):
+                latest_source_time = row["occurred_at"]
+
+        # Phase 2 safe current-state versioning for v3.
+        v3_current_update = False
+        if current and v3_lifecycle is not None:
+            # Non-current lifecycles have already received independent memory
+            # identities above.  Only `current` may replace a current value.
+            if v3_lifecycle == "current":
+                current_key = _normalize_state_key(current["state_key"])
+                current_time = current["observed_at"] or current["valid_from"]
+                if (
+                    not v3_state_key
+                    or current_key != v3_state_key
+                    or not latest_source_time
+                    or (current_time and str(latest_source_time) <= str(current_time))
+                ):
+                    return memory_id, "IGNORE", None
+                v3_current_update = True
         # Simplified reconciliation: only insert, reinforce, update, supersede, ignore
-        if current and item.intent in {"update", "supersede"}:
+        if current and (item.intent in {"update", "supersede"} or v3_current_update):
             explicit = item.confidence >= 0.85 or any(
                 marker in item.statement.casefold() or marker in span.excerpt.casefold() for span in item.evidence for marker in TRANSITION_MARKERS
-            ) or not item.evidence
-            action = "UPDATE" if item.intent == "update" else "SUPERSEDE"
+            ) or v3_current_update
+            action = "UPDATE" if v3_current_update or item.intent == "update" else "SUPERSEDE"
             if not explicit:
                 # Without explicit marker and low confidence, treat as ignore rather than dispute
                 return memory_id, "IGNORE", None
@@ -1206,10 +1389,28 @@ class Repository:
             action, status = "INSERT", "active"
         version = current["version"] + 1 if current else 1
         if current and status == "active":
-            self.db.execute("UPDATE memory_versions SET status='superseded', valid_to=? WHERE id=? AND namespace_id=?", (iso(), current["id"], namespace_id))
+            self.db.execute(
+                "UPDATE memory_versions SET status='superseded', valid_to=? WHERE id=? AND namespace_id=?",
+                (latest_source_time or iso(), current["id"], namespace_id),
+            )
             self.db.execute("DELETE FROM memory_fts WHERE memory_version_id=? AND namespace_id=?", (current["id"], namespace_id))
         span = item.evidence[0]
         src_id, start_off, end_off, excerpt = str(span.event_id), span.start_offset, span.end_offset, span.excerpt
+        # For multi-event records, observed_at should be latest source event time
+        latest_occurred = latest_source_time
+        if len(item.evidence) > 1:
+            try:
+                for sp in item.evidence[1:]:
+                    row2 = self.db.execute("SELECT occurred_at FROM events WHERE id=? AND namespace_id=?", (str(sp.event_id), namespace_id)).fetchone()
+                    if row2 and row2["occurred_at"]:
+                        if not latest_occurred or str(row2["occurred_at"]) > str(latest_occurred):
+                            latest_occurred = row2["occurred_at"]
+                            # also update src_id to latest for primary provenance when v3
+                            if getattr(item, "v3_lifecycle", None) == "current":
+                                src_id = str(sp.event_id)
+                                start_off, end_off, excerpt = sp.start_offset, sp.end_offset, sp.excerpt
+            except Exception:
+                pass
         version_id = str(uuid.uuid4())
         self.db.execute(
             """INSERT INTO memory_versions
@@ -1226,7 +1427,7 @@ class Repository:
                 excerpt,
                 version,
                 item.statement,
-                item.valid_from.astimezone(UTC).isoformat() if item.valid_from else source["occurred_at"],
+                item.valid_from.astimezone(UTC).isoformat() if item.valid_from else latest_occurred,
                 item.valid_until.astimezone(UTC).isoformat() if item.valid_until else None,
                 iso(),
                 status,
@@ -1240,6 +1441,24 @@ class Repository:
                 "INSERT INTO evidence_refs(id, memory_version_id, namespace_id, event_id, start_offset, end_offset, excerpt) VALUES (?, ?, ?, ?, ?, ?, ?)",
                 (str(uuid.uuid4()), version_id, namespace_id, str(ref.event_id), ref.start_offset, ref.end_offset, ref.excerpt),
             )
+        # Store v3 diagnostics and multi-event provenance
+        try:
+            state_key = getattr(item, "v3_state_key", None)
+            lifecycle = getattr(item, "v3_lifecycle", None)
+            source_ids_json = json.dumps([str(sp.event_id) for sp in item.evidence])
+            # event_dates from evidence events
+            event_dates = []
+            for sp in item.evidence:
+                r = self.db.execute("SELECT occurred_at FROM events WHERE id=? AND namespace_id=?", (str(sp.event_id), namespace_id)).fetchone()
+                if r and r["occurred_at"]:
+                    event_dates.append(str(r["occurred_at"]))
+            event_dates_json = json.dumps(event_dates)
+            self.db.execute(
+                "UPDATE memory_versions SET state_key=?, lifecycle=?, observed_at=?, source_event_ids_json=?, event_dates_json=? WHERE id=? AND namespace_id=?",
+                (v3_state_key, lifecycle, latest_occurred, source_ids_json, event_dates_json, version_id, namespace_id),
+            )
+        except Exception:
+            pass
         if status == "active":
             self.db.execute(
                 "UPDATE memories SET current_version_id=?, status='active', confidence=?, importance=? WHERE id=? AND namespace_id=?",
@@ -1255,7 +1474,7 @@ class Repository:
             episode_id=str(event["episode_id"]) if event["episode_id"] else None,
             memory_version_id=version_id,
             memory_id=memory_id,
-            subject_key=item.subject,
+            subject_key=memory_subject,
             statement=item.statement,
             predicate="updates" if previous_version_id else "contains",
             previous_version_id=previous_version_id,

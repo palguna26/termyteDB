@@ -95,7 +95,10 @@ def validate_candidate(
             if not semantic_support(statement, " ".join(evidence_excerpts), subject):
                 raise CandidateRejected("unsupported_statement")
         else:
-            if not semantic_support(statement, " ".join(evidence_excerpts), subject, threshold=0.35 if getattr(candidate, "source_stage", None) else 0.45):
+            # v3 uses more tolerant threshold due to richer paraphrasing and punctuation variance
+            is_v3 = getattr(candidate, "v3_type", None) is not None
+            thr = 0.25 if is_v3 else (0.35 if getattr(candidate, "source_stage", None) else 0.45)
+            if not semantic_support(statement, " ".join(evidence_excerpts), subject, threshold=thr):
                 raise CandidateRejected("unsupported_statement")
     normalized = candidate.model_copy(update={"subject": subject, "statement": statement})
     return ValidatedCandidate(normalized, candidate_fingerprint(normalized))

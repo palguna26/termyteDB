@@ -619,6 +619,8 @@ def _get_retrieval_limit(args: argparse.Namespace) -> int:
 
 def _run_manifest(args: argparse.Namespace, data_path: Path, dataset_sha256: str, canonical_mode: str) -> dict[str, Any]:
     retrieval_limit = _get_retrieval_limit(args)
+    import os as _os
+
     return {
         "mode": canonical_mode,
         "baseline": getattr(args, "baseline", "system"),
@@ -640,6 +642,9 @@ def _run_manifest(args: argparse.Namespace, data_path: Path, dataset_sha256: str
         "raw_session_fallback": bool(getattr(args, "raw_session_fallback", False)),
         "sample_retries": int(getattr(args, "sample_retries", 2)),
         "abstain_threshold": float(getattr(args, "abstain_threshold", 0.25)),
+        "extraction_schema": _os.environ.get("TERMYTEDB_EXTRACTION_SCHEMA", "v2"),
+        "workers": int(getattr(args, "workers", 4)),
+        "dataset_hash": dataset_sha256,
     }
 
 
@@ -761,6 +766,11 @@ def ingest_e2e(work_dir: Path, sample: Sample, args: argparse.Namespace) -> tupl
                 except Exception:
                     pass
 
+            # Phase 0 formation metrics
+            try:
+                formation = engine.repository.formation_metrics(namespace_id)
+            except Exception:
+                formation = {}
             diagnostics: dict[str, Any] = {
                 "events_ingested": events_ingested,
                 "events_duplicate": events_duplicate,
@@ -774,6 +784,7 @@ def ingest_e2e(work_dir: Path, sample: Sample, args: argparse.Namespace) -> tupl
                 "average_memories_per_sample": len(memories),
                 "extraction_latency_ms": round(ingest_latency_ms, 2),
                 "metrics": metrics_final,
+                "formation_metrics": formation,
                 "rejection_reasons": dict(rejection_counter),
                 "runs_count": len(runs),
                 "decisions_count": len(decisions),
