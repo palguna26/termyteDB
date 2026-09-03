@@ -69,6 +69,8 @@ class RetrievalSettings:
     chunk_vector_weight: float = 0.6
     chunk_lexical_weight: float = 0.4
     reranker_enabled: bool = os.environ.get("TERMYTEDB_RERANKER_ENABLED", "1").strip().lower() not in {"0", "false", "no", "off"}
+    # Optional OpenRouter reranker. Empty keeps local FlashRank as the default.
+    reranking_model: str = os.environ.get("TERMYTEDB_RERANKING_MODEL", "").strip()
     reranker_max_candidates: int = int(os.environ.get("TERMYTEDB_RERANKER_MAX_CANDIDATES", "30") or 30)
     reranker_max_chars: int = int(os.environ.get("TERMYTEDB_RERANKER_MAX_CHARS", "600") or 600)
     diversity_max_per_session: int = 2

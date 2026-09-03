@@ -5,6 +5,7 @@ import pytest
 
 from src.memory.provider import HttpExtractionProvider, OpenRouterExtractionProvider, ProviderError, _message_text, _simple_response_to_extraction, build_extraction_prompt
 from src.models import ExtractionRequest
+from src.storage.repository import _openrouter_rerank
 
 
 def request() -> ExtractionRequest:
@@ -190,3 +191,43 @@ def test_openrouter_retries_unusable_content_then_returns_no_memories(monkeypatc
 
     assert calls == 2
     assert result.response.candidates == []
+
+
+def test_openrouter_reranker_uses_configured_model_and_preserves_result_ids(monkeypatch):
+    captured = {}
+
+    class Response:
+        def read(self):
+            return json.dumps(
+                {
+                    "results": [
+                        {"index": 1, "relevance_score": 0.92},
+                        {"index": 0, "relevance_score": 0.11},
+                    ]
+                }
+            ).encode()
+
+    def fake_urlopen(request, **_kwargs):
+        captured["url"] = request.full_url
+        captured["body"] = json.loads(request.data)
+        return Response()
+
+    monkeypatch.setattr("src.storage.repository.urlopen", fake_urlopen)
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+    scores = _openrouter_rerank(
+        "where does the user live?",
+        [{"id": "first", "text": "The user lives in Delhi."}, {"id": "second", "text": "The user lives in Pune."}],
+        "cohere/rerank-4-pro",
+    )
+
+    assert captured["url"] == "https://openrouter.ai/api/v1/rerank"
+    assert captured["body"]["model"] == "cohere/rerank-4-pro"
+    assert captured["body"]["top_n"] == 2
+    assert scores == {"second": 0.92, "first": 0.11}
+
+
+def test_openrouter_reranker_returns_none_on_transport_failure(monkeypatch):
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+    monkeypatch.setattr("src.storage.repository.urlopen", lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("offline")))
+
+    assert _openrouter_rerank("question", [{"id": "one", "text": "document"}], "cohere/rerank-4-pro") is None

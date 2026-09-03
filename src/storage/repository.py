@@ -3,12 +3,14 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import os
 import re
 import sqlite3
 import threading
 import uuid
 from datetime import UTC, datetime, timedelta
 from typing import Any, cast
+from urllib.request import Request, urlopen
 
 from ..config.settings import RETRIEVAL as _RETRIEVAL_CFG
 from ..core.errors import IdempotencyConflict
@@ -80,6 +82,70 @@ SEARCH_STOP_WORDS = {
 
 _RERANKER_LOCK = threading.Lock()
 _RERANKERS: dict[str, Any] = {}
+
+
+def _configured_openrouter_reranker() -> str | None:
+    """Return the optional remote reranker model without changing local defaults."""
+    value = os.environ.get("TERMYTEDB_RERANKING_MODEL", "").strip()
+    return value or None
+
+
+def _openrouter_rerank(query: str, passages: list[dict[str, str]], model: str) -> dict[str, float] | None:
+    """Call OpenRouter's rerank endpoint and return scores keyed by passage id.
+
+    Any malformed response or transport failure returns ``None``. Callers then
+    use local FlashRank, so remote reranking cannot make search unavailable.
+    """
+    api_key = (
+        os.environ.get("TERMYTEDB_RERANKING_API_KEY")
+        or os.environ.get("OPENROUTER_API_KEY")
+        or os.environ.get("TERMYTEDB_EXTRACTION_API_KEY")
+    )
+    if not api_key or not passages:
+        return None
+    base_url = (
+        os.environ.get("TERMYTEDB_RERANKING_BASE_URL")
+        or os.environ.get("OPENROUTER_BASE_URL")
+        or "https://openrouter.ai/api/v1"
+    ).rstrip("/")
+    try:
+        timeout = max(1.0, float(os.environ.get("TERMYTEDB_RERANKING_TIMEOUT_SECONDS", "30")))
+    except ValueError:
+        timeout = 30.0
+    body = {
+        "model": model,
+        "query": query,
+        "documents": [passage["text"] for passage in passages],
+        "top_n": len(passages),
+    }
+    try:
+        raw = urlopen(
+            Request(
+                f"{base_url}/rerank",
+                data=json.dumps(body).encode("utf-8"),
+                headers={
+                    "authorization": f"Bearer {api_key}",
+                    "content-type": "application/json",
+                    "http-referer": "https://termyte.dev",
+                    "X-OpenRouter-Title": "TermyteDB Memory Reranking",
+                },
+                method="POST",
+            ),
+            timeout=timeout,
+        ).read()
+        payload = json.loads(raw.decode("utf-8"))
+        scores: dict[str, float] = {}
+        for result in payload.get("results", []):
+            index = result.get("index")
+            if not isinstance(index, int) or not 0 <= index < len(passages):
+                return None
+            score = result.get("relevance_score")
+            if not isinstance(score, (int, float)):
+                return None
+            scores[passages[index]["id"]] = float(score)
+        return scores or None
+    except Exception:
+        return None
 
 
 def _cached_reranker(model_name: str) -> Any | None:
@@ -1659,19 +1725,11 @@ class Repository:
         """Cross-encoder rerank using question + memory + contextual chunk text. Configurable via FlashRank."""
         if not _RETRIEVAL_CFG.reranker_enabled or not results:
             return results
-        try:
-            from flashrank import Ranker, RerankRequest  # type: ignore[import-untyped]
-        except ImportError:
-            return results
         # Build chunk text map for richer passages
         chunk_texts: dict[str, str] = {}
         for row in self.db.execute("SELECT chunk_id, contextual_text, raw_text FROM chunks WHERE namespace_id=?", (namespace_id,)).fetchall():
             chunk_texts[str(row["chunk_id"])] = str(row["contextual_text"] or row["raw_text"] or "")
         # Build passages: memory statement + contextual chunk
-        ranker_model = _RETRIEVAL_CFG.reranker_model
-        ranker = _cached_reranker(ranker_model)
-        if ranker is None:
-            return results
         max_candidates = _RETRIEVAL_CFG.reranker_max_candidates
         max_chars = _RETRIEVAL_CFG.reranker_max_chars
         candidates = results[:max_candidates]
@@ -1693,6 +1751,24 @@ class Repository:
                     break
             text = hit.statement if not extra else f"{hit.statement} | {extra}"
             passages.append({"id": str(hit.memory_version_id), "text": text[:max_chars]})
+
+        remote_model = _configured_openrouter_reranker()
+        if remote_model:
+            remote_scores = _openrouter_rerank(query, passages, remote_model)
+            if remote_scores is not None:
+                reranked = sorted(candidates, key=lambda h: (-remote_scores.get(str(h.memory_version_id), 0.0), -h.score))
+                for hit in reranked:
+                    hit.component_scores["reranker"] = remote_scores.get(str(hit.memory_version_id), 0.0)
+                    hit.component_scores["reranker_remote"] = 1.0
+                return reranked + tail
+
+        try:
+            from flashrank import RerankRequest  # type: ignore[import-untyped]
+        except ImportError:
+            return results
+        ranker = _cached_reranker(_RETRIEVAL_CFG.reranker_model)
+        if ranker is None:
+            return results
         try:
             reranked_raw = ranker.rerank(RerankRequest(query=query, passages=passages))
         except Exception:
@@ -1703,6 +1779,7 @@ class Repository:
         # Update component_scores with reranker
         for hit in reranked:
             hit.component_scores["reranker"] = score_by_id.get(str(hit.memory_version_id), 0.0)
+            hit.component_scores["reranker_remote"] = 0.0
         return reranked + tail
 
     def search(self, namespace_id: str, query: str, limit: int, historical: bool = False, *, internal: bool = False) -> list[SearchResult]:

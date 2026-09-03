@@ -631,6 +631,7 @@ def _run_manifest(args: argparse.Namespace, data_path: Path, dataset_sha256: str
         "embedding_provider": getattr(args, "embedding_provider", None),
         "embedding_model": getattr(args, "embedding_model", None),
         "embedding_dimensions": getattr(args, "embedding_dimensions", None),
+        "reranking_model": _os.environ.get("TERMYTEDB_RERANKING_MODEL") or "ms-marco-MiniLM-L-12-v2",
         "extraction_batch_sessions": int(getattr(args, "extraction_batch_sessions", 4)),
         "single_db": bool(getattr(args, "single_db", False)),
         "no_dense": bool(getattr(args, "no_dense", False)),
@@ -1666,7 +1667,11 @@ def run(args: argparse.Namespace) -> int:
             "extraction_provider": extraction_provider,
             "extraction_model": str(extraction_model) if extraction_model else None,
             "embedding_provider": embed_name,
-            "reranker": "ms-marco-MiniLM-L-12-v2" if not args.no_rerank else None,
+            "reranker": (
+                None
+                if args.no_rerank
+                else os.environ.get("TERMYTEDB_RERANKING_MODEL") or "ms-marco-MiniLM-L-12-v2"
+            ),
             "dense_enabled": not args.no_dense,
             "workers": args.workers,
             "retrieval_limit": _get_retrieval_limit(args),
