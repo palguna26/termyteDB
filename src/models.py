@@ -200,7 +200,10 @@ class ExtractionResponseV3(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     schema_version: Literal["extraction-v3"] = "extraction-v3"
-    memories: list[ExtractionMemoryV3] = Field(default_factory=list, max_length=50)
+    # The processor keeps at most 8-12 records per session.  Matching that
+    # bound in the provider schema prevents smaller models from spending their
+    # whole completion on a long, invalid list and losing the entire session.
+    memories: list[ExtractionMemoryV3] = Field(default_factory=list, max_length=12)
 
 
 class ExtractionRequest(BaseModel):

@@ -161,13 +161,18 @@ def _enforce_session_quality_budget(
             except Exception:
                 return 0
         items_sorted = sorted(items, key=lambda c: (-importance_key(c), -len(str(c.statement))))
-        # Filter low-value 1-2 unless archive mode
+        # Filter low-value 1-2 unless archive mode.  Do not turn a whole
+        # session into an untraceable zero-output extraction just because the
+        # model assigned its only useful fact a conservative importance score.
+        # This matters for short factual assistant answers and expressed
+        # interests: both are often labelled 1-2 by smaller extraction models.
         if not archive_mode:
             filtered = [c for c in items_sorted if importance_key(c) >= 3]
-            # Keep at least 3 if filtered would be too few but original had more
-            if len(filtered) < 3 and len(items_sorted) >= 3:
-                filtered = items_sorted[:3]
-            # But if all are low importance, keep filtered as is (could be empty -> omit chit-chat)
+            # Keep a small grounded coverage floor.  The later per-event cap
+            # and retrieval budget still prevent low-value output from
+            # flooding the answer context.
+            if len(filtered) < 3:
+                filtered = items_sorted[: min(3, len(items_sorted))]
             items_sorted = filtered
         # Cap at 8 per session, allow more only when distinct and high-value
         # For now hard cap 8, but if session has many distinct high-value (importance 5), allow up to 12

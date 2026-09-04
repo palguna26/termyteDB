@@ -828,6 +828,10 @@ class OpenRouterExtractionProvider:
         is_v3 = getattr(request, "extraction_schema", "v2") == "v3"
         system_content = "Return only valid JSON matching the supplied extraction-v3 schema." if is_v3 else "Return only valid JSON matching the supplied memory-list schema."
         response_fmt = _extraction_response_format_v3() if is_v3 else _extraction_response_format()
+        try:
+            extraction_max_tokens = max(512, int(os.environ.get("TERMYTEDB_EXTRACTION_MAX_TOKENS", "3500")))
+        except ValueError:
+            extraction_max_tokens = 3500
         body = {
             "model": self.model,
             "messages": [
@@ -835,7 +839,10 @@ class OpenRouterExtractionProvider:
                 {"role": "user", "content": prompt},
             ],
             "temperature": temperature,
-            "max_tokens": 2500,
+            # gpt-oss can use part of this allowance for reasoning.  The v3
+            # schema caps records at 12, so a modestly larger completion cap
+            # avoids malformed/truncated JSON without permitting memory flood.
+            "max_tokens": extraction_max_tokens,
             "response_format": response_fmt,
             "plugins": [{"id": "response-healing"}],
         }

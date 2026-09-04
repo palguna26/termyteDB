@@ -2,7 +2,7 @@ import pytest
 from uuid import uuid4
 
 from src import TermyteDB
-from src.memory.processor import _prune_event_candidates
+from src.memory.processor import _enforce_session_quality_budget, _prune_event_candidates
 from src.memory.provider import FakeExtractionProvider, ProviderError, ProviderResult
 from src.models import EvidenceSpan, ExtractionCandidate, ExtractionResponse
 from src.retrieval.context import pack_evidence
@@ -95,6 +95,48 @@ def test_event_candidate_pruning_keeps_distinct_memories_and_caps_noise(monkeypa
         "User prefers SQLite for local projects.",
         "User works in Bengaluru.",
     ]
+
+
+def test_v3_quality_budget_keeps_small_low_importance_session():
+    event_id = uuid4()
+
+    def candidate(statement: str) -> ExtractionCandidate:
+        return ExtractionCandidate(
+            kind="fact",
+            subject="assistant fact",
+            statement=statement,
+            evidence=[EvidenceSpan(event_id=event_id, start_offset=0, end_offset=5, excerpt="hello")],
+            confidence=0.9,
+            importance=0.2,
+            durability="permanent",
+            v3_type="assistant_knowledge",
+            v3_lifecycle="stable",
+            v3_importance_int=1,
+        )
+
+    kept = _enforce_session_quality_budget(
+        [candidate("Assistant states that the Chiefs played 12 games at Arrowhead Stadium.")],
+        {str(event_id): "answer-session"},
+        {event_id: "assistant: The Chiefs played 12 games at Arrowhead Stadium."},
+    )
+
+    assert [item.statement for item in kept] == [
+        "Assistant states that the Chiefs played 12 games at Arrowhead Stadium."
+    ]
+
+
+def test_v3_response_schema_caps_provider_output():
+    from src.models import ExtractionMemoryV3, ExtractionResponseV3
+
+    memory = ExtractionMemoryV3(
+        statement="A grounded memory.",
+        source_events=["e1"],
+        type="fact",
+        importance=3,
+        lifecycle="stable",
+    )
+    with pytest.raises(ValueError):
+        ExtractionResponseV3(memories=[memory] * 13)
 
 
 def test_batch_is_one_extraction_call_and_indexes_chunks_and_memories(tmp_path):
