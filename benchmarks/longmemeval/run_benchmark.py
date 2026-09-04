@@ -257,8 +257,9 @@ def shared_embedder() -> GuardedEmbedder:
 
 def shared_product_embedder(args: argparse.Namespace) -> GuardedEmbedder:
     global _product_embedder, _product_embedder_key
-    provider_name = getattr(args, "embedding_provider", None) or os.environ.get("TERMYTEDB_EMBEDDING_PROVIDER", "local")
+    configured_provider = getattr(args, "embedding_provider", None) or os.environ.get("TERMYTEDB_EMBEDDING_PROVIDER")
     model_name = getattr(args, "embedding_model", None) or os.environ.get("TERMYTEDB_EMBEDDING_MODEL")
+    provider_name = configured_provider or ("openrouter" if model_name else "local")
     dimensions = getattr(args, "embedding_dimensions", None)
     if dimensions is None and provider_name == "openrouter":
         dimensions = int(os.environ.get("TERMYTEDB_EMBEDDING_DIMENSIONS", "1536"))
@@ -269,7 +270,13 @@ def shared_product_embedder(args: argparse.Namespace) -> GuardedEmbedder:
                 if provider_name == "openrouter":
                     from src.retrieval.embedding import OpenAICompatibleEmbeddingProvider  # noqa: E402
 
-                    _product_embedder = GuardedEmbedder(OpenAICompatibleEmbeddingProvider(model_name, dimensions=dimensions), pace_remote=True)
+                    try:
+                        remote = OpenAICompatibleEmbeddingProvider(model_name, dimensions=dimensions)
+                    except (ValueError, TypeError) as exc:
+                        _BENCHMARK_LOGGER.warning("OpenRouter embeddings unavailable; falling back to FastEmbed: %s", exc)
+                        _product_embedder = shared_embedder()
+                    else:
+                        _product_embedder = GuardedEmbedder(remote, pace_remote=True)
                 else:
                     _product_embedder = shared_embedder()
                 _product_embedder_key = key
@@ -414,7 +421,15 @@ def _ensure_namespace(db: Database, namespace_id: str) -> None:
         )
 
 
-def ingest_sample(work_dir: Path, sample: Sample, *, skip_embeddings: bool = False, single_db: bool = False) -> Path:
+def ingest_sample(
+    work_dir: Path,
+    sample: Sample,
+    *,
+    skip_embeddings: bool = False,
+    single_db: bool = False,
+    embedding_provider: Any | None = None,
+) -> Path:
+    embedding_provider = embedding_provider or shared_product_embedder(argparse.Namespace())
     if single_db:
         database_path = work_dir / "single.sqlite"
         # Serialize writes to the single file to avoid WAL contention
@@ -426,16 +441,16 @@ def ingest_sample(work_dir: Path, sample: Sample, *, skip_embeddings: bool = Fal
                 if existing == 0:
                     insert_atoms(db, verbatim_atoms(sample, namespace_id=sample.question_id))
                     if not skip_embeddings:
-                        index_atom_embeddings(db, shared_embedder(), batch_size=64)
+                        index_atom_embeddings(db, embedding_provider, batch_size=64)
                 elif not skip_embeddings:
                     missing = db.execute(
                         """SELECT COUNT(*) FROM atoms a
                            LEFT JOIN atom_embeddings e ON e.atom_id=a.atom_id AND e.provider=?
                            WHERE e.atom_id IS NULL AND a.namespace_id = ?""",
-                        (shared_embedder().name, sample.question_id),
+                        (embedding_provider.name, sample.question_id),
                     ).fetchone()[0]
                     if missing:
-                        index_atom_embeddings(db, shared_embedder(), batch_size=64)
+                        index_atom_embeddings(db, embedding_provider, batch_size=64)
             finally:
                 db.close()
         return database_path
@@ -447,23 +462,23 @@ def ingest_sample(work_dir: Path, sample: Sample, *, skip_embeddings: bool = Fal
         if existing == 0:
             insert_atoms(db, verbatim_atoms(sample))
             if not skip_embeddings:
-                index_atom_embeddings(db, shared_embedder(), batch_size=64)
+                index_atom_embeddings(db, embedding_provider, batch_size=64)
         elif not skip_embeddings:
             missing = db.execute(
                 """SELECT COUNT(*) FROM atoms a
                    LEFT JOIN atom_embeddings e ON e.atom_id=a.atom_id AND e.provider=?
                    WHERE e.atom_id IS NULL""",
-                (shared_embedder().name,),
+                (embedding_provider.name,),
             ).fetchone()[0]
             if missing:
-                index_atom_embeddings(db, shared_embedder(), batch_size=64)
+                index_atom_embeddings(db, embedding_provider, batch_size=64)
     finally:
         db.close()
     return database_path
 
 
-def shared_dense(db: Database, query: str, limit: int, namespace_id: str | None = None) -> list[AtomHit]:
-    return dense_search_atoms(db, query, limit, provider=shared_embedder(), namespace_id=namespace_id)
+def shared_dense(db: Database, query: str, limit: int, provider: Any, namespace_id: str | None = None) -> list[AtomHit]:
+    return dense_search_atoms(db, query, limit, provider=provider, namespace_id=namespace_id)
 
 
 # ---------------------------------------------------------------------------
@@ -1010,7 +1025,14 @@ def retrieve_session_ranking(database_path: Path, sample: Sample, args: argparse
         if args.no_dense:
             hits = search_atoms(db, sample.question, limit, vector_search=lambda *_: [], namespace_id=ns)
         else:
-            hits = search_atoms(db, sample.question, limit, vector_search=lambda query, lim: shared_dense(db, query, lim, namespace_id=ns), namespace_id=ns)
+            provider = shared_product_embedder(args)
+            hits = search_atoms(
+                db,
+                sample.question,
+                limit,
+                vector_search=lambda query, lim: shared_dense(db, query, lim, provider=provider, namespace_id=ns),
+                namespace_id=ns,
+            )
         ranked = hits
         abstained = False
         if not args.no_rerank:
@@ -1252,7 +1274,14 @@ def evaluate_sample(args: argparse.Namespace, sample: Sample, budget: OpenRouter
     ingest_target = sample
     if getattr(args, "baseline", "system") == "oracle":
         ingest_target = replace(sample, sessions=tuple(s for s in sample.sessions if s[0] in sample.answer_session_ids))
-    database_path = ingest_sample(Path(args.work_dir), ingest_target, skip_embeddings=args.no_dense, single_db=getattr(args, "single_db", False))
+    provider = shared_product_embedder(args)
+    database_path = ingest_sample(
+        Path(args.work_dir),
+        ingest_target,
+        skip_embeddings=args.no_dense,
+        single_db=getattr(args, "single_db", False),
+        embedding_provider=provider,
+    )
     outcome = retrieve_session_ranking(database_path, sample, args)
     trace: dict[str, Any] = {
         "status": "completed",
