@@ -23,6 +23,25 @@ def count_tokens(text: str, *, model: str | None = None) -> int:
         return len(re.findall(r"\w+|[^\w\s]", text))
 
 
+def tokenizer_mode(*, model: str | None = None) -> str:
+    """Report whether token counts are exact (tiktoken) or approximate."""
+    try:
+        import tiktoken  # type: ignore[import-not-found]
+
+        try:
+            tiktoken.encoding_for_model(model or "gpt-4o-mini")
+        except KeyError:
+            tiktoken.get_encoding("o200k_base")
+        return "exact"
+    except Exception:
+        return "approximate"
+
+
+def count_words(text: str) -> int:
+    """Whitespace word count, tracked separately from token counts."""
+    return len(text.split()) if text.strip() else 0
+
+
 def truncate_to_tokens(text: str, budget: int, *, model: str | None = None) -> str:
     if count_tokens(text, model=model) <= budget:
         return text
@@ -205,11 +224,16 @@ def pack_evidence(
         exact_tokens = count_tokens(text, model=tokenizer_model)
     # In benchmark mode, missing evidence returns exactly `insufficient information` for stable abstention scoring.
     # The API layer maps abstained=True to that string; raw text here keeps structured data.
+    # packed_words and packed_tokens are tracked separately: words are whitespace
+    # splits, tokens use the configured model tokenizer (exact or approximate).
+    final_text = text if selected else "insufficient information"
     return {
         "memories": selected,
-        "token_count": exact_tokens,
+        "token_count": exact_tokens if selected else count_tokens(final_text, model=tokenizer_model),
+        "word_count": count_words(final_text),
+        "tokenizer": tokenizer_mode(model=tokenizer_model),
         "abstained": not bool(selected),
-        "text": text if selected else "insufficient information",
+        "text": final_text,
         "deduplicated_sessions": len(seen_sessions),
     }
 

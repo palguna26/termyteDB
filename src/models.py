@@ -123,6 +123,91 @@ def temporal_recency_score(valid_from: datetime | None, now: datetime | None = N
     return max(0.0, min(0.02, 0.02 * (1.0 - min(age_days, 90.0) / 90.0)))
 
 
+TemporalIntent = Literal["latest", "historical", "earliest", "before", "after", "around", "none"]
+
+
+class TemporalQuery(BaseModel):
+    """Explicit temporal representation for date-aware retrieval.
+
+    ``reference_date`` is the benchmark ``question_date`` (never the machine
+    clock) so "current" means valid at question time.  Dates influence ranking,
+    not hard-filtering, unless the query clearly requires it.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    reference_date: datetime | None = None
+    intent: TemporalIntent = "none"
+    target_date: datetime | None = None
+    date_range_start: datetime | None = None
+    date_range_end: datetime | None = None
+
+
+def temporal_valid_at_score(
+    valid_from: datetime | None,
+    valid_until: datetime | None,
+    recorded_at: datetime | None,
+    query: TemporalQuery,
+) -> float:
+    """Score how well a memory's temporal block matches a temporal query."""
+    if query.intent == "none":
+        return 0.0
+    ref = query.reference_date or utc_now()
+    if query.intent == "latest":
+        # Prefer facts valid at the question date.
+        try:
+            if valid_from and valid_from > ref:
+                return -0.03
+            if valid_until and valid_until <= ref:
+                return -0.02
+            if valid_from:
+                age_days = max(0.0, (ref - valid_from).total_seconds() / 86400)
+                return max(0.0, 0.05 * (1.0 - min(age_days, 365.0) / 365.0))
+            return 0.02
+        except Exception:
+            return 0.0
+    if query.intent == "historical":
+        # Include expired historical versions.
+        if valid_until is not None:
+            return 0.03
+        return 0.01
+    if query.intent == "earliest":
+        return 0.0
+    if query.intent in {"around", "before", "after"}:
+        anchor = valid_from or recorded_at
+        if anchor is None:
+            return -0.01 if query.intent == "around" else 0.0
+        try:
+            anchor_naive = anchor.replace(tzinfo=None) if anchor.tzinfo else anchor
+        except Exception:
+            return 0.0
+        if query.intent == "around" and query.date_range_start and query.date_range_end:
+            try:
+                start = query.date_range_start.replace(tzinfo=None) if query.date_range_start.tzinfo else query.date_range_start
+                end = query.date_range_end.replace(tzinfo=None) if query.date_range_end.tzinfo else query.date_range_end
+                if start <= anchor_naive < end:
+                    return 0.08
+                gap = min(abs((anchor_naive - start).days), abs((anchor_naive - end).days))
+                if gap <= 90:
+                    return 0.04 * (1.0 - gap / 90.0)
+            except Exception:
+                return 0.0
+            return 0.0
+        if query.intent == "before" and query.target_date:
+            try:
+                target = query.target_date.replace(tzinfo=None) if query.target_date.tzinfo else query.target_date
+                return 0.05 if anchor_naive < target else -0.02
+            except Exception:
+                return 0.0
+        if query.intent == "after" and query.target_date:
+            try:
+                target = query.target_date.replace(tzinfo=None) if query.target_date.tzinfo else query.target_date
+                return 0.05 if anchor_naive >= target else -0.02
+            except Exception:
+                return 0.0
+    return 0.0
+
+
 class EvidenceSpan(BaseModel):
     model_config = ConfigDict(extra="forbid")
 

@@ -91,12 +91,53 @@ def payload_text(payload: dict[str, Any], event_type: str | None = None, *, incl
     return "\n".join(parts)
 
 
+PREFERENCE_POSITIVE_RE = re.compile(r"(?i)\b(prefer|prefers|preferred|like|likes|liked|love|loves|loved|favourite|favorite|enjoy|enjoys)\b")
+PREFERENCE_NEGATIVE_RE = re.compile(r"(?i)\b(dislike|dislikes|disliked|hate|hates|hated|avoid|avoids|avoided|detest|loathe|no longer)\b")
+PREFERENCE_UPDATE_RE = re.compile(r"(?i)\b(no longer|used to|previously|instead|switched|changed to|now prefer|now like)\b")
+EXPLICIT_PREFERENCE_RE = re.compile(
+    r"(?i)\b(I\s+(?:prefer|like|love|enjoy|dislike|hate|avoid)|my\s+(?:favorite|favourite)|user\s+(?:prefers|likes|loves|dislikes|hates|avoids))\b"
+)
+
+
+def preference_polarity(statement: str) -> str:
+    """Classify a preference statement as positive, negative, update, or none."""
+    text = statement.casefold()
+    if PREFERENCE_UPDATE_RE.search(statement) or "no longer" in text:
+        return "update"
+    if PREFERENCE_NEGATIVE_RE.search(statement):
+        return "negative"
+    if PREFERENCE_POSITIVE_RE.search(statement):
+        return "positive"
+    return "none"
+
+
+def is_explicit_preference(text: str) -> bool:
+    """Require explicit preference language; mere product mentions are not preferences."""
+    return bool(EXPLICIT_PREFERENCE_RE.search(text))
+
+
 RULES = (
     (
         "fact",
         re.compile(
             r"(?im)^(?:the|this|service|repository|version|file|branch)\s+[^.!?\n,;]{1,160}\s+(?:is|runs on|uses|requires|contains)\s+[^.!?\n,;]{1,240}(?:[.!?]|[,;](?=\s|$)|$)"
         ),
+    ),
+    # --- Preference-specific rules (Phase 3) ---
+    # "I prefer X over Y" — keep both choices in one statement.
+    (
+        "fact",
+        re.compile(r"(?im)\bI\s+prefer\s+[^.!?\n]{2,160}\s+over\s+[^.!?\n]{2,160}(?:[.!?]|$)"),
+    ),
+    # Negative / update preferences: "I no longer use X", "I avoid Y", "I hate Z".
+    (
+        "fact",
+        re.compile(r"(?im)\bI\s+(?:no longer\s+(?:use|like|prefer|love)|avoid|avoids|avoided|dislike|dislikes|disliked|hate|hates|hated)\b[^.!?\n]{2,200}(?:[.!?]|$)"),
+    ),
+    # Preference updates: "I used to like X but now prefer Y".
+    (
+        "fact",
+        re.compile(r"(?im)\bI\s+used to\s+(?:like|love|prefer|use)\b[^.!?\n]{2,120}\s+but\s+now\b[^.!?\n]{2,160}(?:[.!?]|$)"),
     ),
     # --- Generic personal-fact fallback (conversational memory) ---
     # Captures first-person and possessive facts that the original service-oriented
@@ -105,7 +146,7 @@ RULES = (
     (
         "fact",
         re.compile(
-            r"(?im)\bI\s+(?:graduated\s+with|have|has|had|am|was|were|live\s+in|lived\s+in|work\s+as|work\s+in|own|owns|like|liked|love|loved|prefer|preferred)\b[^.!?\n,;]{2,200}(?:[.!?]|[,;](?=\s|$)|$)"
+            r"(?im)\bI\s+(?:graduated\s+with|have|has|had|am|was|were|live\s+in|lived\s+in|work\s+as|work\s+in|own|owns|like|liked|love|loved|prefer|preferred|dislike|disliked|hate|hated|avoid|avoided|enjoy|enjoyed)\b[^.!?\n,;]{2,200}(?:[.!?]|[,;](?=\s|$)|$)"
         ),
     ),
     (
@@ -113,6 +154,10 @@ RULES = (
         re.compile(
             r"(?im)\bI\s+(?:used to live in|used to work as|now live in|now work as|moved to|moved from|used to|live in|work as|work in)\b[^.!?\n,;]{2,200}(?:[.!?]|[,;](?=\s|$)|$)"
         ),
+    ),
+    (
+        "fact",
+        re.compile(r"(?im)\bMy\s+(?:favorite|favourite)\b[^.!?\n]{2,200}(?:[.!?]|$)"),
     ),
     (
         "fact",
@@ -149,7 +194,15 @@ def _subject_key(kind: str, statement: str, body: str) -> str:
     if kind == "fact":
         if any(token in text for token in ("live in", "lived in", "moved to", "moved from", "move to", "move from")):
             return "fact:user location"
-        if any(token in text for token in ("prefer", "favorite", "favoured", "favourite", "like ", "love ")):
+        if any(
+            token in text
+            for token in (
+                "prefer", "favorite", "favoured", "favourite", "like ", "love ", "dislike", "hate ", "hates ",
+                "avoid", "enjoy", "no longer",
+            )
+        ):
+            # Keep one stable slot per preference topic so updates supersede
+            # correctly; polarity lives in the statement text for scoring.
             return "fact:user preference"
         if any(token in text for token in ("work as", "work in", "job", "role ", "employed")):
             return "fact:user work"

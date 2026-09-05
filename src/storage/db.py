@@ -491,7 +491,19 @@ MIGRATIONS: tuple[str, ...] = (
     );
     CREATE INDEX chunk_events_event_idx ON chunk_events(namespace_id, event_id, chunk_id);
     CREATE INDEX chunk_events_session_idx ON chunk_events(namespace_id, session_id, chunk_id);
+    """,
     """
+    -- Phase 5 retrieval indexes: namespace+provider, namespace+session,
+    -- namespace+valid dates, and evidence mappings for batched lookups.
+    CREATE INDEX IF NOT EXISTS memory_versions_namespace_valid_idx ON memory_versions(namespace_id, valid_from, valid_until);
+    CREATE INDEX IF NOT EXISTS memory_versions_namespace_recorded_idx ON memory_versions(namespace_id, recorded_at);
+    CREATE INDEX IF NOT EXISTS memory_embeddings_provider_ns_idx ON memory_embeddings(namespace_id, provider);
+    CREATE INDEX IF NOT EXISTS events_namespace_session_idx ON events(namespace_id, session_id, stream_id);
+    CREATE INDEX IF NOT EXISTS events_namespace_stream_idx ON events(namespace_id, stream_id, occurred_at);
+    CREATE INDEX IF NOT EXISTS evidence_refs_version_idx ON evidence_refs(memory_version_id, namespace_id);
+    CREATE INDEX IF NOT EXISTS atoms_namespace_invalid_idx ON atoms(namespace_id, invalid_at);
+    CREATE INDEX IF NOT EXISTS chunks_namespace_session_ord_idx ON chunks(namespace_id, session_id, ordinal);
+    """,
 )
 
 

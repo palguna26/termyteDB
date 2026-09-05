@@ -88,16 +88,38 @@ STAGE_DEFINITIONS: dict[str, dict[str, str]] = {
         ),
     },
     "preferences": {
-        "role": "You are a PREFERENCE extractor. Extract user likes, dislikes, habits, and preferred ways of working. Look for 'prefer', 'like', 'love', 'always', 'usually' signals. Output kind='fact' with subject containing 'preference' or appropriate kind.",
+        "role": (
+            "You are a PREFERENCE extractor. Extract user likes, dislikes, habits, and preferred ways of working. "
+            "Store the preferred choice and, when explicitly stated, the rejected or replaced choice. "
+            "Preserve confidence and source evidence. Distinguish: 'I like X' (direct), 'I prefer X over Y' "
+            "(store X as preferred and Y as rejected), 'I used X before' (historical, not current), "
+            "'I no longer use X' (negative/update with supersede intent), 'I am considering X' (hypothetical, "
+            "low confidence or ignore). Output kind='fact' with subject containing 'preference'."
+        ),
         "few_shot": (
             "Few-shot examples for PREFERENCES:\n"
             "Example 1 - Input: <event id='e1'>I moved to Pune and now prefer working from cafes.</event>\n"
             "Output: {\"candidates\":[{\"kind\":\"fact\",\"subject\":\"user preference\",\"statement\":\"User prefers working from cafes.\",\"evidence\":[{\"event_id\":\"e1\",\"start_offset\":22,\"end_offset\":47,\"excerpt\":\"prefer working from cafes\"}],\"confidence\":0.97,\"durability\":\"permanent\",\"intent\":\"insert\",\"source_stage\":\"preferences\"}]}\n"
             "Example 2 - Input: <event id='e1'>I hate early morning meetings; I do my best work late at night.</event>\n"
             "Output: {\"candidates\":[{\"kind\":\"fact\",\"subject\":\"user preference\",\"statement\":\"User prefers working late at night and dislikes early morning meetings.\",\"evidence\":[{\"event_id\":\"e1\",\"start_offset\":0,\"end_offset\":58,\"excerpt\":\"I hate early morning meetings; I do my best work late at night.\"}],\"confidence\":0.94,\"durability\":\"permanent\",\"intent\":\"insert\"}]}\n"
+            "Example 3 - Preference over alternative: <event id='e1'>I prefer Sony over Canon for photography.</event>\n"
+            "Output: {\"candidates\":[{\"kind\":\"fact\",\"subject\":\"user preference\",\"statement\":\"User prefers Sony over Canon for photography.\",\"evidence\":[{\"event_id\":\"e1\",\"start_offset\":0,\"end_offset\":44,\"excerpt\":\"I prefer Sony over Canon for photography.\"}],\"confidence\":0.97,\"durability\":\"permanent\",\"intent\":\"insert\"}]}\n"
+            "Note: keep both the preferred (Sony) and rejected (Canon) choice in one statement.\n"
+            "Example 4 - Preference update: <event id='e1'>I used to like Canon but now prefer Sony.</event>\n"
+            "Output: {\"candidates\":[{\"kind\":\"fact\",\"subject\":\"user preference\",\"statement\":\"User now prefers Sony (previously liked Canon).\",\"evidence\":[{\"event_id\":\"e1\",\"start_offset\":0,\"end_offset\":42,\"excerpt\":\"I used to like Canon but now prefer Sony.\"}],\"confidence\":0.93,\"durability\":\"permanent\",\"intent\":\"supersede\",\"source_stage\":\"preferences\"}]}\n"
+            "Example 5 - Negative preference: <event id='e1'>I no longer use Canon; I avoid heavy lenses.</event>\n"
+            "Output: {\"candidates\":[{\"kind\":\"fact\",\"subject\":\"user preference\",\"statement\":\"User no longer uses Canon and avoids heavy lenses.\",\"evidence\":[{\"event_id\":\"e1\",\"start_offset\":0,\"end_offset\":45,\"excerpt\":\"I no longer use Canon; I avoid heavy lenses.\"}],\"confidence\":0.92,\"durability\":\"permanent\",\"intent\":\"supersede\"}]}\n"
+            "Example 6 - Multiple preferences in one session: <event id='e1'>I like tea in the morning and coffee after lunch.</event>\n"
+            "Output: {\"candidates\":[{\"kind\":\"fact\",\"subject\":\"user preference\",\"statement\":\"User likes tea in the morning.\",\"evidence\":[{\"event_id\":\"e1\",\"start_offset\":0,\"end_offset\":26,\"excerpt\":\"I like tea in the morning\"}],\"confidence\":0.95,\"durability\":\"permanent\",\"intent\":\"insert\"},"
+            "{\"kind\":\"fact\",\"subject\":\"user preference\",\"statement\":\"User likes coffee after lunch.\",\"evidence\":[{\"event_id\":\"e1\",\"start_offset\":27,\"end_offset\":50,\"excerpt\":\"coffee after lunch\"}],\"confidence\":0.94,\"durability\":\"permanent\",\"intent\":\"insert\"}]}\n"
             "Negative Example - Input: <event id='e1'>The weather is nice today.</event>\n"
             "Output: {\"candidates\":[]}  // No preference expressed.\n"
-            "Rule: Do NOT infer preferences from neutral statements. Require explicit preference language.\n"
+            "Negative Example - Mere mention: <event id='e1'>I saw a Sony camera in the shop.</event>\n"
+            "Output: {\"candidates\":[]}  // Mention is not a preference. Do NOT treat every product/tool/activity mention as a preference.\n"
+            "Negative Example - Considering: <event id='e1'>I am considering Sony vs Canon.</event>\n"
+            "Output: {\"candidates\":[]}  // Deliberation, not a preference. Require explicit commitment.\n"
+            "Rule: Do NOT infer preferences from neutral statements or mere mentions. Require explicit preference language "
+            "(prefer/like/love/favorite/dislike/hate/avoid). For updates, use intent supersede/update and keep old and new values.\n"
         ),
     },
     "events": {
@@ -221,7 +243,13 @@ def build_extraction_prompt(request: ExtractionRequest) -> str:
     return (
         "Extract useful long-term memories from the conversation. Return at most 3 short, standalone memories per event, choosing the most useful facts. "
         "Keep user preferences, assistant facts, decisions, corrections, concrete events, tasks, relationships, and changes. "
-        "Always write preferences explicitly, for example 'User prefers X' or 'User dislikes Y'. Omit greetings, small talk, and repeated paraphrases. "
+        "Always write preferences explicitly, for example 'User prefers X' or 'User dislikes Y'. "
+        "For 'prefer X over Y', keep both choices: 'User prefers X over Y'. "
+        "For updates ('used to like X, now prefer Y' / 'no longer use X'), write the current value and note the prior value. "
+        "Distinguish direct preference ('I like X'), comparative ('I prefer X over Y'), historical ('I used X before'), "
+        "negative/update ('I no longer use X'), and deliberation ('I am considering X' — omit unless an explicit choice is made). "
+        "Do NOT treat every product, tool, or activity mention as a preference; require explicit like/prefer/love/favorite/dislike/hate/avoid language. "
+        "Omit greetings, small talk, and repeated paraphrases. "
         "For every memory, cite the event label where it came from. Do not invent labels. "
         "TermyteDB handles chunks, roles, dates, evidence spans, identity, and updates; do not return them. "
         "Return only JSON in exactly this shape: {\"schema_version\":\"extraction-v2\",\"memories\":[{\"memory\":\"short standalone fact\",\"source_event\":\"e1\"}]}. "

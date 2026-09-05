@@ -281,8 +281,19 @@ class TermyteDB:
     def cancel_job(self, namespace_id: str, job_id: str) -> bool:
         return self.repository.cancel_job(namespace_id, job_id)
 
-    def search(self, namespace_id: str, query: str, limit: int = 10, historical: bool = False) -> list[SearchResult]:
-        results = self.repository.search(namespace_id, query, limit, historical)
+    def search(
+        self,
+        namespace_id: str,
+        query: str,
+        limit: int = 10,
+        historical: bool = False,
+        *,
+        reference_date: str | None = None,
+    ) -> list[SearchResult]:
+        from datetime import datetime as _datetime
+
+        ref: str | _datetime | None = reference_date
+        results = self.repository.search(namespace_id, query, limit, historical, reference_date=ref)  # type: ignore[arg-type]
         log(
             self.logger,
             logging.INFO,

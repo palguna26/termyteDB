@@ -56,7 +56,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
 from src.retrieval.embedding import FastEmbedProvider  # noqa: E402
-from src.retrieval.retrieval import AtomHit, dense_search_atoms, search_atoms  # noqa: E402
+from src.retrieval.retrieval import AtomHit, aggregate_atom_sessions, dense_search_atoms, pack_atoms_token_aware, search_atoms_with_stages  # noqa: E402
 from src.storage.db import Database  # noqa: E402
 
 DEFAULT_DATA_PATH = ROOT / "benchmarks" / "longmemeval" / "longmemeval_s_cleaned.json"
@@ -822,9 +822,9 @@ def retrieve_e2e_session_ranking(database_path: Path, sample: Sample, args: argp
     started = time.perf_counter()
     try:
         limit = max(args.recall_k * 10, 50)
-        # Repository.search hybrid retrieval
+        # Repository.search hybrid retrieval with question_date as reference.
         memory_search_started = time.perf_counter()
-        search_results = engine.search(ns, sample.question, limit=limit)
+        search_results = engine.search(ns, sample.question, limit=limit, reference_date=sample.question_date)
         memory_search_ms = (time.perf_counter() - memory_search_started) * 1000
         # Repository.search owns product reranking.  Do not instantiate a
         # second FlashRank model in the runner.
@@ -915,6 +915,42 @@ def retrieve_e2e_session_ranking(database_path: Path, sample: Sample, args: argp
             if primary_session and primary_session not in seen:
                 seen.add(primary_session)
                 session_order.append(primary_session)
+        # Phase 4: session-level aggregation — score sessions by best hit,
+        # supporting count (diminishing returns), and query-term coverage so a
+        # single strong session cannot starve independent sessions on
+        # multi-session queries.  Single-session queries keep ranked precision.
+        _is_multi_q = bool(re.search(r"\b(across|between|each|all|every|multiple|over time|throughout|compare)\b", sample.question.casefold()))
+        if _is_multi_q and session_order:
+            import math as _math
+
+            _sess_hits: dict[str, list[float]] = {}
+            _sess_texts: dict[str, list[str]] = {}
+            for _det in retrieved_memories_detailed:
+                _ps = str(_det.get("primary_session") or "")
+                if not _ps:
+                    for _es in _det.get("evidence_sessions", []) or []:
+                        _ps = str(_es)
+                        break
+                if not _ps:
+                    continue
+                try:
+                    _sc = float(_det.get("score", 0.0) or 0.0)
+                except Exception:
+                    _sc = 0.0
+                _sess_hits.setdefault(_ps, []).append(_sc)
+                _sess_texts.setdefault(_ps, []).append(str(_det.get("statement", "")))
+            _qterms = [t.casefold() for t in re.findall(r"[\w./:-]+", sample.question) if len(t) > 2]
+            def _sess_score(_sid: str) -> float:
+                _scores = sorted(_sess_hits.get(_sid, [0.0]), reverse=True)
+                _best = _scores[0] if _scores else 0.0
+                _second = _scores[1] if len(_scores) > 1 else 0.0
+                _breadth = 0.05 * _math.log1p(len(_scores))
+                _cov = 0.0
+                if _qterms:
+                    _joined = " ".join(_sess_texts.get(_sid, [])[:3]).casefold()
+                    _cov = 0.10 * sum(t in _joined for t in _qterms) / max(1, len(_qterms))
+                return _best + 0.5 * _second + _breadth + _cov
+            session_order = sorted(session_order, key=lambda s: (-_sess_score(s), s))
 
         # Use the shared compact context builder: top memories, up to two
         # source chunks each, temporal metadata, and a hard prompt budget.
@@ -988,14 +1024,20 @@ def retrieve_e2e_session_ranking(database_path: Path, sample: Sample, args: argp
             for m in all_mems
         ]
 
+        from src.retrieval.context import count_tokens as _count_tokens, count_words as _count_words, tokenizer_mode as _tokenizer_mode  # noqa: E402
+
+        _tok_model = getattr(args, "answer_model", None)
+        _tok_name = _tokenizer_mode(model=_tok_model)
         return {
             "session_order": session_order,
             "best_rank": best_rank,
             "ndcg": ndcg,
             "abstained": abstained,
             "packed": packed_text,
-            "packed_words": len(packed_text.split()),
-            "packed_tokens": __import__("src.retrieval.context", fromlist=["count_tokens"]).count_tokens(packed_text, model=getattr(args, "answer_model", None)),
+            "packed_words": _count_words(packed_text),
+            "packed_tokens": _count_tokens(packed_text, model=_tok_model),
+            "tokenizer": _tok_name,
+            "tokenizer_exact": _tok_name == "exact",
             "latency_ms": round(latency_ms, 2),
             "candidate_count": len(search_results) + len(raw_sessions),
             "retrieval_stages_ms": {
@@ -1014,40 +1056,97 @@ def retrieve_e2e_session_ranking(database_path: Path, sample: Sample, args: argp
 
 
 def retrieve_session_ranking(database_path: Path, sample: Sample, args: argparse.Namespace) -> dict[str, Any]:
+    from src.retrieval.context import count_tokens, count_words, tokenizer_mode  # noqa: E402
+
     db = Database(database_path)
     started = time.perf_counter()
     try:
         if getattr(args, "baseline", "system") == "full-history":
             order = [session_id for session_id, _, _ in sample.sessions]
-            return {"session_order": order, "best_rank": next((i for i, sid in enumerate(order[:args.recall_k], 1) if sid in sample.answer_session_ids), None), "ndcg": 1.0 if sample.answer_session_ids else 0.0, "abstained": False, "packed": "\n".join(t["content"] for _, _, turns in sample.sessions for t in turns), "packed_words": sample.raw_words, "latency_ms": 0.0, "candidate_count": len(order)}
+            full_text = "\n".join(t["content"] for _, _, turns in sample.sessions for t in turns)
+            return {
+                "session_order": order,
+                "best_rank": next((i for i, sid in enumerate(order[:args.recall_k], 1) if sid in sample.answer_session_ids), None),
+                "ndcg": 1.0 if sample.answer_session_ids else 0.0,
+                "abstained": False,
+                "packed": full_text,
+                "packed_words": count_words(full_text),
+                "packed_tokens": count_tokens(full_text, model=getattr(args, "answer_model", None)),
+                "tokenizer": tokenizer_mode(model=getattr(args, "answer_model", None)),
+                "latency_ms": 0.0,
+                "candidate_count": len(order),
+                "retrieval_stages_ms": {},
+            }
         limit = max(args.recall_k * 10, 50)
         ns = sample.question_id if getattr(args, "single_db", False) else None
+        # Phase 2: question_date is the temporal reference — never the machine clock.
+        reference_date = getattr(sample, "question_date", "") or ""
         if args.no_dense:
-            hits = search_atoms(db, sample.question, limit, vector_search=lambda *_: [], namespace_id=ns)
+            hits, atom_stages = search_atoms_with_stages(
+                db, sample.question, limit,
+                vector_search=lambda *_: [], namespace_id=ns, reference_date=reference_date,
+            )
         else:
             provider = shared_product_embedder(args)
-            hits = search_atoms(
+            hits, atom_stages = search_atoms_with_stages(
                 db,
                 sample.question,
                 limit,
                 vector_search=lambda query, lim: shared_dense(db, query, lim, provider=provider, namespace_id=ns),
                 namespace_id=ns,
+                reference_date=reference_date,
             )
         ranked = hits
         abstained = False
+        rerank_started = time.perf_counter()
         if not args.no_rerank:
             reranked = rerank_hits(sample.question, hits, args.abstain_threshold)
             abstained = reranked is None
             ranked = reranked if reranked is not None else []
-        latency_ms = (time.perf_counter() - started) * 1000
-        session_order: list[str] = []
-        seen: set[str] = set()
-        for hit in ranked:
-            if hit.session_id not in seen:
-                seen.add(hit.session_id)
-                session_order.append(str(hit.session_id))
+        rerank_ms = (time.perf_counter() - rerank_started) * 1000
+        # Phase 4: session-level aggregation with coverage/diversity rules.
+        agg_started = time.perf_counter()
         retrieval_limit = _get_retrieval_limit(args)
-        packed = "" if abstained else "\n".join(hit.fact for hit in ranked[:retrieval_limit])
+        session_order = aggregate_atom_sessions(ranked, sample.question, limit=args.recall_k)
+        # Preserve ranked hits for packing: order hits by session rank, then score.
+        if session_order:
+            session_rank = {sid: idx for idx, sid in enumerate(session_order)}
+            ranked_for_pack = sorted(ranked, key=lambda h: (session_rank.get(str(h.session_id), 9999), -h.score))
+        else:
+            ranked_for_pack = list(ranked)
+        agg_ms = (time.perf_counter() - agg_started) * 1000
+        # Phase 1: token-aware packing with hard 1,200-token cap applied after
+        # rendering all headers, dates, roles, and evidence text.
+        pack_started = time.perf_counter()
+        token_budget = max(200, int(getattr(args, "answer_context_tokens", 1200)))
+        tokenizer_model = getattr(args, "answer_model", None)
+        if abstained:
+            packed_text = ""
+            packed_tokens = 0
+            packed_words = 0
+            tokenizer_name = tokenizer_mode(model=tokenizer_model)
+        else:
+            packed_result = pack_atoms_token_aware(
+                ranked_for_pack[:retrieval_limit],
+                token_budget=token_budget,
+                tokenizer_model=tokenizer_model,
+            )
+            packed_text = str(packed_result["text"])
+            packed_tokens = int(packed_result["token_count"])
+            packed_words = int(packed_result["word_count"])
+            tokenizer_name = str(packed_result["tokenizer"])
+        pack_ms = (time.perf_counter() - pack_started) * 1000
+        total_ms = (time.perf_counter() - started) * 1000
+        stages_ms = {
+            "fts": round(float(atom_stages.get("fts_ms", 0.0)), 2),
+            "dense": round(float(atom_stages.get("dense_ms", 0.0)), 2),
+            "rrf_merge": round(float(atom_stages.get("rrf_ms", 0.0)), 2),
+            "temporal_rescore": round(float(atom_stages.get("temporal_ms", 0.0)), 2),
+            "reranker": round(rerank_ms, 2),
+            "session_aggregation": round(agg_ms, 2),
+            "context_pack": round(pack_ms, 2),
+            "total": round(total_ms, 2),
+        }
         oracle = {str(value).strip() for value in sample.answer_session_ids}
         best_rank: int | None = None
         for position, session_id in enumerate(session_order[: args.recall_k], 1):
@@ -1060,9 +1159,13 @@ def retrieve_session_ranking(database_path: Path, sample: Sample, args: argparse
             "best_rank": best_rank,
             "ndcg": dcg / idcg if idcg else 0.0,
             "abstained": abstained,
-            "packed": packed,
-            "packed_words": len(packed.split()),
-            "latency_ms": round(latency_ms, 2),
+            "packed": packed_text,
+            "packed_words": packed_words,
+            "packed_tokens": packed_tokens,
+            "tokenizer": tokenizer_name,
+            "tokenizer_exact": tokenizer_name == "exact",
+            "latency_ms": round(total_ms, 2),
+            "retrieval_stages_ms": stages_ms,
             "candidate_count": len(hits),
         }
     finally:
@@ -1296,8 +1399,11 @@ def evaluate_sample(args: argparse.Namespace, sample: Sample, budget: OpenRouter
         "recall": {str(k): int(outcome["best_rank"] is not None and outcome["best_rank"] <= k) for k in (5, 10, args.recall_k)},
         "packed_words": outcome["packed_words"],
         "packed_tokens": outcome.get("packed_tokens", outcome["packed_words"]),
+        "tokenizer": outcome.get("tokenizer", "approximate"),
+        "tokenizer_exact": outcome.get("tokenizer_exact", False),
         "raw_words": sample.raw_words,
         "retrieval_latency_ms": outcome["latency_ms"],
+        "retrieval_stages_ms": outcome.get("retrieval_stages_ms", {}),
         "candidate_count": outcome["candidate_count"],
         "retrieved_memory_count": outcome["candidate_count"],
         "session_order": outcome["session_order"],

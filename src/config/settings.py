@@ -76,6 +76,21 @@ class RetrievalSettings:
     diversity_max_per_session: int = 2
     fts_weight_identifiers: float = 1.5
     vector_weight_conceptual: float = 1.5
+    # Phase 2: temporal scoring (dates influence ranking, not hard filters).
+    temporal_boost_latest: float = float(os.environ.get("TERMYTEDB_TEMPORAL_BOOST_LATEST", "0.05") or 0.05)
+    temporal_boost_historical: float = float(os.environ.get("TERMYTEDB_TEMPORAL_BOOST_HISTORICAL", "0.03") or 0.03)
+    temporal_boost_in_range: float = float(os.environ.get("TERMYTEDB_TEMPORAL_BOOST_IN_RANGE", "0.08") or 0.08)
+    temporal_penalty_future: float = float(os.environ.get("TERMYTEDB_TEMPORAL_PENALTY_FUTURE", "0.03") or 0.03)
+    # Phase 3: preference signals.
+    preference_boost_positive: float = float(os.environ.get("TERMYTEDB_PREFERENCE_BOOST", "0.04") or 0.04)
+    preference_boost_update: float = float(os.environ.get("TERMYTEDB_PREFERENCE_UPDATE_BOOST", "0.02") or 0.02)
+    # Phase 4: multi-session aggregation.
+    multi_session_reserve: float = float(os.environ.get("TERMYTEDB_MULTI_SESSION_RESERVE", "0.4") or 0.4)
+    multi_session_max_per_session: int = int(os.environ.get("TERMYTEDB_MULTI_SESSION_MAX_PER_SESSION", "3") or 3)
+    multi_session_evidence_share: float = float(os.environ.get("TERMYTEDB_MULTI_SESSION_EVIDENCE_SHARE", "0.5") or 0.5)
+    # Phase 5: latency controls.
+    candidate_overfetch_cap: int = int(os.environ.get("TERMYTEDB_CANDIDATE_OVERFETCH_CAP", "100") or 100)
+    chunk_search_enabled_when_no_dense: bool = os.environ.get("TERMYTEDB_CHUNK_NO_DENSE", "1").strip().lower() not in {"0", "false", "no", "off"}
 
 
 @dataclass(frozen=True)
